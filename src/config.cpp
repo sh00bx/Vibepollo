@@ -936,6 +936,7 @@ namespace config {
     false,  // enable
     "auto",  // provider
     0,  // fps_limit
+    0,  // fps_offset
     false,  // disable_vsync
     true  // auto_virtual_framegen
   };
@@ -1773,6 +1774,7 @@ namespace config {
       frame_limiter.provider = "auto";
     }
     int_between_f(vars, "frame_limiter_fps_limit", frame_limiter.fps_limit, {0, 1000});
+    int_between_f(vars, "frame_limiter_fps_offset", frame_limiter.fps_offset, {0, 1000});
     bool_f(vars, "frame_limiter_disable_vsync", frame_limiter.disable_vsync);
     bool_f(vars, "rtss_disable_vsync_ullm", frame_limiter.disable_vsync);
     bool_f(vars, "frame_limiter_auto_virtual_framegen", frame_limiter.auto_virtual_framegen);
@@ -2371,6 +2373,7 @@ namespace config {
         "frame_limiter_provider",
         "frame_limiter_fps_limit",
         "frame_limiter_auto_virtual_framegen",
+        "frame_limiter_fps_offset",
         "rtss_frame_limit_type",
         "frame_limiter_disable_vsync",
 
