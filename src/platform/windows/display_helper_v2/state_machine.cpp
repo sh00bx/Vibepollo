@@ -496,21 +496,29 @@ namespace display_helper::v2 {
       return;
     }
 
-    if (verification_result_callback_) {
-      verification_result_callback_(completed.success);
-    }
-
     if (completed.success) {
       recovery_armed_ = true;
       system_.arm_heartbeat();
       system_.refresh_shell();
+      // Settle HDR (the off->on "blank" workaround) to completion BEFORE releasing
+      // the capture-start gate below. The previous order released the gate first,
+      // which let this ~1s off->on toggle run under a live encoder: capture started,
+      // then the toggle dropped the virtual display to SDR and back, tripping two
+      // capture reinits and sending an HDR-mode false->true flip that faults strict
+      // HDR decoders (webOS Aurora "decoder reported error" -> disconnect). Running
+      // it here, before the gate, means capture only begins once HDR has settled.
+      // blank_hdr_states() is synchronous by design (see win_platform_workarounds).
       system_.blank_hdr_states(std::chrono::milliseconds(1000));
+    }
 
+    if (verification_result_callback_) {
+      verification_result_callback_(completed.success);
+    }
+
+    if (completed.success && current_request_.virtual_layout.has_value()) {
       // For virtual displays, enter monitoring state to handle device crashes
-      if (current_request_.virtual_layout.has_value()) {
-        transition(State::VirtualDisplayMonitoring, ApplyAction::Apply, ApplyStatus::Ok);
-        return;
-      }
+      transition(State::VirtualDisplayMonitoring, ApplyAction::Apply, ApplyStatus::Ok);
+      return;
     }
 
     transition(State::Waiting, ApplyAction::Apply, completed.success ? std::make_optional(ApplyStatus::Ok) : std::nullopt);
