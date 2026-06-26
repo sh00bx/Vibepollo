@@ -42,14 +42,21 @@ namespace display_helper::v2 {
   }  // namespace
 
   void WinPlatformWorkarounds::blank_hdr_states(std::chrono::milliseconds delay) {
-    std::thread([delay]() {
-      try {
-        auto api = std::make_shared<display_device::WinApiLayer>();
-        display_device::WinDisplayDevice display(api);
-        display_device::win_utils::blankHdrStates(display, delay);
-      } catch (...) {
-      }
-    }).detach();
+    // Runs SYNCHRONOUSLY (no detached thread): the caller
+    // (StateMachine::handle_verification_completed) must finish this HDR
+    // off->on "blank" settle BEFORE it releases the capture-start gate, so the
+    // toggle can never run under a live encoder. Doing it asynchronously let the
+    // gate open first, then this ~1s off->on dropped the virtual display to SDR
+    // and back mid-stream, tripping two capture reinits and sending an HDR-mode
+    // false->true flip that faults strict HDR decoders (webOS Aurora "decoder
+    // reported error" -> disconnect). The work is bounded (DisplayConfig calls +
+    // the delay) and the host's capture gate budget (6s) comfortably covers it.
+    try {
+      auto api = std::make_shared<display_device::WinApiLayer>();
+      display_device::WinDisplayDevice display(api);
+      display_device::win_utils::blankHdrStates(display, delay);
+    } catch (...) {
+    }
   }
 
   void WinPlatformWorkarounds::refresh_shell() {
