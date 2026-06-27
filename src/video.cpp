@@ -3031,6 +3031,36 @@ namespace video {
     const bool rtx_hdr_stream = config.rtx_hdr_active;
     hdr_display = hdr_display || rtx_hdr_stream;
 #endif
+
+    // Consistency-preserving HDR settle (never commit an SDR encoder under an HDR request).
+    // When the client requested HDR but the display currently reports SDR, it is almost always a
+    // transient state while Windows finishes applying HDR / the display mode to a freshly
+    // (re)created virtual display: capture can be (re)initialized a few hundred ms before the DXGI
+    // output colorspace flips to G2084_P2020. Committing an SDR encode device here would (a) emit
+    // "HDR mode: false" to the client, breaking its HDR decoder, and (b) trigger a client reconnect
+    // that restarts the whole display apply -- a multi-second HDR<->SDR oscillation at stream start.
+    // Re-poll the live DXGI colorspace (is_hdr() re-reads GetDesc1 each call) so the encode device
+    // and hdr_info we build match the client's request. Because we never signal SDR, the client does
+    // not reconnect, so the display settles quickly and this wait is typically short. SDR clients
+    // (dynamicRange == 0) and RTX-HDR (hdr_display already forced true above) are never affected.
+    if (config.dynamicRange && !hdr_display) {
+      const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+      int settle_ms = 0;
+      while (std::chrono::steady_clock::now() < settle_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        settle_ms += 50;
+        if (disp.is_hdr()) {
+          hdr_display = true;
+          break;
+        }
+      }
+      if (hdr_display) {
+        BOOST_LOG(info) << "HDR display settled after " << settle_ms << " ms; committing HDR encode device.";
+      } else {
+        BOOST_LOG(warning) << "HDR requested but display stayed SDR after " << settle_ms << " ms; proceeding with SDR.";
+      }
+    }
+
     auto colorspace = colorspace_from_client_config(config, hdr_display);
 
     platf::pix_fmt_e pix_fmt;
