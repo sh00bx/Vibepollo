@@ -3,3 +3,18 @@ Dockerfile text eol=lf
 *.dockerfile text eol=lf
 *flatpak-lint-*.json text eol=lf
 *.sh text eol=lf
+
+# Signed virtual-display driver package: the catalog (.cat) hashes the exact
+# bytes of the .inf/.dll it was generated from. Git EOL normalization or text
+# munging on these files silently desyncs them from the catalog, which makes
+# pnputil reject the package (0xE000024B "hash for the file is not present in
+# the catalog"). Keep every packaged driver artifact byte-exact.
+src_assets/windows/drivers/sunshine/SunshineVirtualDisplayDriver.inf -text
+src_assets/windows/drivers/sunshine/*.cat binary
+src_assets/windows/drivers/sunshine/*.cer binary
+src_assets/windows/drivers/sunshine/*.dll binary
+src_assets/windows/drivers/sunshine/*.exe binary
+src_assets/windows/drivers/sudovda/sudovda.inf -text
+src_assets/windows/drivers/sudovda/*.cat binary
+src_assets/windows/drivers/sudovda/*.dll binary
+src_assets/windows/drivers/sudovda/*.exe binary
