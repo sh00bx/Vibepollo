@@ -355,6 +355,47 @@ function Assert-DriverVer {
     }
 }
 
+function Test-CatalogContainsFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$CatalogPath,
+        [Parameter(Mandatory = $true)][string]$FilePath
+    )
+
+    # A catalog stores each member file's flat SHA1/SHA256 digest as a
+    # contiguous octet string, so scanning the catalog bytes for the file's
+    # hash is a trust-independent way to confirm the catalog actually covers
+    # the file (validated against the shipping SudoVDA package). This avoids
+    # relying on a trusted signing chain while building.
+    $catalogBytes = [System.IO.File]::ReadAllBytes($CatalogPath)
+    foreach ($algorithm in @('SHA1', 'SHA256')) {
+        $hash = (Get-FileHash -Algorithm $algorithm -LiteralPath $FilePath).Hash
+        $needle = [byte[]]::new($hash.Length / 2)
+        for ($i = 0; $i -lt $needle.Length; $i++) {
+            $needle[$i] = [Convert]::ToByte($hash.Substring($i * 2, 2), 16)
+        }
+        $limit = $catalogBytes.Length - $needle.Length
+        for ($i = 0; $i -le $limit; $i++) {
+            $matched = $true
+            for ($j = 0; $j -lt $needle.Length; $j++) {
+                if ($catalogBytes[$i + $j] -ne $needle[$j]) { $matched = $false; break }
+            }
+            if ($matched) { return $true }
+        }
+    }
+    return $false
+}
+
+function Assert-CatalogCoversInf {
+    param(
+        [Parameter(Mandatory = $true)][string]$CatalogPath,
+        [Parameter(Mandatory = $true)][string]$InfPath
+    )
+
+    if (-not (Test-CatalogContainsFile -CatalogPath $CatalogPath -FilePath $InfPath)) {
+        throw "[SunshineVirtualDisplay] Catalog '$CatalogPath' does not contain the hash of INF '$InfPath'. The catalog is stale relative to the INF -- regenerate it with Inf2Cat after any INF change (e.g. a DriverVer bump) and commit the matched pair. Otherwise pnputil rejects the package at install time with 0xE000024B ('hash for the file is not present in the specified catalog file')."
+    }
+}
+
 function Invoke-Cmd {
     param([Parameter(Mandatory = $true)][string]$Command)
 
@@ -689,6 +730,14 @@ if ($expectedPackageVulkanLayerDll) {
 if ($expectedPackageVulkanLayerJson) {
     Assert-SameFile -Expected $expectedPackageVulkanLayerJson -Actual $packageVulkanLayerJson
 }
+
+# Fail loudly if the catalog does not actually cover the shipped INF. The
+# installer's own -ValidateOnly below only checks the catalog *signature*, so a
+# catalog left stale after an INF edit (e.g. a DriverVer bump committed without
+# regenerating the .cat) would pass validation here and only fail later at
+# install time inside pnputil. This guards both -Build (post-Inf2Cat) and
+# -ValidateOnly (pre-committed assets).
+Assert-CatalogCoversInf -CatalogPath $packageCat -InfPath $packageInf
 
 $validateArgs = @('-NoLogo', '-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $packageInstaller, '-ValidateOnly')
 if ($SkipSigning) {
