@@ -2017,7 +2017,18 @@ namespace stream {
             }
             pacing_bps = session_floor_bps;
           }
+        } else if (session->config.monitor.bitrate > 0) {
+          // No explicit cap configured: derive the pacing target from the negotiated
+          // stream bitrate (~1.3x) so the pacer actually shapes the per-frame burst.
+          // The legacy fallback below (~80% of 1 Gbps) collapses to a no-op on any
+          // sub-gigabit link (e.g. WiFi), where the unpaced burst is then amplified by
+          // 802.11 AMPDU aggregation into 30-60 ms client-side inter-arrival jitter.
+          // AP1 is therefore active by default now. To restore the legacy "blast" path
+          // (preferable on a clean wired gigabit link, where spreading only adds tail
+          // latency), set pacing_max_bitrate_kbps to a value at or above the link rate.
+          pacing_bps = (size_t) session->config.monitor.bitrate * 1000ull * 13 / 10;
         } else {
+          // Negotiated bitrate unknown (should not happen post-negotiation): keep legacy.
           pacing_bps = (size_t) (std::giga::num * 80 / 100);  // 80% of 1 Gbps
         }
         //                                          bps    ms    packet      byte
@@ -2040,6 +2051,16 @@ namespace stream {
         // unusually small packet size.
         // Generic Segmentation Offload on Linux can't do more than 64.
         send_batch_size = std::min<size_t>(64, send_batch_size);
+
+        // When the pacer is actually shaping (a low packets/ms target, i.e. a real
+        // bitrate cap or the auto-derived WiFi default above), cap the batch to ~1 ms
+        // of packets as well. Otherwise a full ~64-packet / ~64 KB batch is handed to
+        // the kernel in a single send_batch() and segmented back-to-back by GSO/USO —
+        // one ~64 KB burst that feeds exactly the AMPDU aggregation the pacer is trying
+        // to smooth. With this cap each batch is one pacing group, so the sleep gate
+        // runs between every group and the on-wire cadence is ~1 ms-grained instead of
+        // per-burst. No-op on the legacy ~1 Gbps fallback (its packets/ms exceeds 64).
+        send_batch_size = std::min<size_t>(send_batch_size, std::max<size_t>(1, ratecontrol_packets_in_1ms));
 
         // Don't ignore the last ratecontrol group of the previous frame
         auto ratecontrol_frame_start = std::max(ratecontrol_next_frame_start, std::chrono::steady_clock::now());
