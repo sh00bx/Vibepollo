@@ -23,9 +23,11 @@
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <vector>
 
 // platform includes
 #include <windows.h>
+#include <tlhelp32.h>
 
 // local includes
 #include "src/config.h"
@@ -42,6 +44,9 @@ namespace ctm_bridge {
 
     // Poll interval for the supervisor loop, in 100ms steps (5s total).
     constexpr int kTickSteps = 50;
+
+    // How long to wait for an orphaned agent to exit after TerminateProcess.
+    constexpr DWORD kAgentForceKillWaitMs = 2000;
 
     /**
      * @brief The single tracked agent instance.
@@ -85,6 +90,74 @@ namespace ctm_bridge {
       return args;
     }
 
+    /**
+     * @brief Terminate any ctm-usbip.exe instance not managed by this process.
+     *
+     * Mirrors display_helper_integration::kill_all_helper_processes. The agent is
+     * launched jobless (use_job=false -> CREATE_BREAKAWAY_FROM_JOB) and is only
+     * cleaned up on the graceful shutdown path (stop_watchdog), so a crashed or
+     * force-killed sunshine.exe orphans it. On the next launch a fresh static
+     * ProcessHandler has no knowledge of that orphan and start()s a SECOND
+     * ctm-usbip.exe; the two collide on the same USB/IP port and controller
+     * passthrough silently dies until a manual taskkill. Vibepollo is the sole
+     * supervisor of this binary (it replaced the old `ctmagent` autostart), so
+     * reaping every instance before we launch our own enforces the singleton.
+     *
+     * Called once at supervisor start, before any owned instance exists, so there
+     * is nothing of ours to spare; any live ctm-usbip.exe at that point is an
+     * orphan from a prior run.
+     */
+    void reap_orphan_agents() {
+      HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+      if (snapshot == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        BOOST_LOG(error) << "CTM bridge: failed to snapshot processes for orphan cleanup (winerr=" << err << ").";
+        return;
+      }
+
+      PROCESSENTRY32W entry {};
+      entry.dwSize = sizeof(entry);
+      std::vector<DWORD> targets;
+
+      if (Process32FirstW(snapshot, &entry)) {
+        do {
+          if (_wcsicmp(entry.szExeFile, L"ctm-usbip.exe") == 0) {
+            targets.push_back(entry.th32ProcessID);
+          }
+        } while (Process32NextW(snapshot, &entry));
+      } else {
+        DWORD err = GetLastError();
+        if (err != ERROR_NO_MORE_FILES) {
+          BOOST_LOG(warning) << "CTM bridge: process enumeration failed during orphan cleanup (winerr=" << err << ").";
+        }
+      }
+
+      CloseHandle(snapshot);
+
+      for (DWORD pid : targets) {
+        HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+        if (!h) {
+          DWORD err = GetLastError();
+          BOOST_LOG(warning) << "CTM bridge: unable to open orphaned agent (pid=" << pid
+                             << ", winerr=" << err << ") for termination.";
+          continue;
+        }
+
+        if (WaitForSingleObject(h, 0) == WAIT_TIMEOUT) {
+          BOOST_LOG(warning) << "CTM bridge: terminating orphaned ctm-usbip.exe (pid=" << pid << ").";
+          if (!TerminateProcess(h, 1)) {
+            DWORD err = GetLastError();
+            BOOST_LOG(error) << "CTM bridge: TerminateProcess failed for pid=" << pid << " (winerr=" << err << ").";
+          } else if (WaitForSingleObject(h, kAgentForceKillWaitMs) != WAIT_OBJECT_0) {
+            BOOST_LOG(warning) << "CTM bridge: orphaned agent pid=" << pid
+                               << " did not exit within " << kAgentForceKillWaitMs << " ms.";
+          }
+        }
+
+        CloseHandle(h);
+      }
+    }
+
     void watchdog_proc(std::stop_token st) {
       using namespace std::chrono_literals;
       bool warned_missing = false;
@@ -119,6 +192,9 @@ namespace ctm_bridge {
     if (g_running) {
       return;
     }
+    // Reap any agent orphaned by a previous unclean shutdown before launching our
+    // own, otherwise the new instance collides with the orphan on the USB/IP port.
+    reap_orphan_agents();
     g_running = true;
     g_thread = std::jthread(watchdog_proc);
     BOOST_LOG(info) << "CTM bridge supervisor started.";
