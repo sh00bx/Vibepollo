@@ -271,9 +271,11 @@ namespace config {
     int lan_encryption_mode;
     int wan_encryption_mode;
 
-    // Cap the RTP send pacer (kbps). 0 = legacy ~80% of 1 Gbps assumption, which
-    // collapses to a no-op on a slower WiFi link. Set to ~1.3x stream bitrate when
-    // streaming over WiFi to spread the per-frame burst across the full frame slot.
+    // Cap the RTP send pacer (kbps). 0 = auto-derive the pacer from the negotiated
+    // stream bitrate (~1.3x, FEC-adjusted) so it shapes the per-frame burst by default
+    // — the right setting for WiFi. Set to a value at/above the link rate to restore the
+    // legacy "blast" path (preferable on a clean wired gigabit link). The old ~80%-of-
+    // 1Gbps fallback now only applies when the negotiated bitrate is unknown.
     int pacing_max_bitrate_kbps;
 
     // Limit the packetsize to avoid fragmentation on a low MTU link. 0 = off.

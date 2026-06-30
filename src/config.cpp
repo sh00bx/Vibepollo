@@ -974,7 +974,7 @@ namespace config {
     ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
 
-    0,  // pacing_max_bitrate_kbps (0 = legacy 1 Gbps Ethernet assumption)
+    0,  // pacing_max_bitrate_kbps (0 = auto-derive pacer from negotiated bitrate; see config.h)
     0,  // packetsize (0 = off)
   };
 
