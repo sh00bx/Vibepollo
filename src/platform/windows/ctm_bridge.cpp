@@ -16,6 +16,7 @@
  */
 
 // standard includes
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <mutex>
@@ -47,6 +48,9 @@ namespace ctm_bridge {
 
     // How long to wait for an orphaned agent to exit after TerminateProcess.
     constexpr DWORD kAgentForceKillWaitMs = 2000;
+
+    // Max poll backoff (100ms steps) after consecutive agent launch failures (~60s).
+    constexpr int kMaxBackoffSteps = 600;
 
     /**
      * @brief The single tracked agent instance.
@@ -161,7 +165,9 @@ namespace ctm_bridge {
     void watchdog_proc(std::stop_token st) {
       using namespace std::chrono_literals;
       bool warned_missing = false;
+      int fail_streak = 0;  // consecutive genuine launch failures, drives backoff
       while (!st.stop_requested()) {
+        int wait_steps = kTickSteps;
         if (config::ctm.enable) {
           auto exe = resolve_exe();
           if (exe && std::filesystem::exists(*exe)) {
@@ -169,6 +175,27 @@ namespace ctm_bridge {
             // Idempotent: no-op while alive, relaunch after a crash.
             const bool allow_system_fallback = platf::is_running_as_system();
             agent_proc().start(exe->wstring(), build_args(), allow_system_fallback);
+            // start() returns false BOTH when the agent is already alive (the happy
+            // steady state) AND on a genuine launch failure, so discriminate on whether
+            // a process actually exists. A real failure (e.g. CreateProcess fails on a
+            // present-but-broken binary) gets capped exponential backoff so we don't
+            // respawn-spam every 5s — but we never give up, so it self-heals once the
+            // dependency is fixed.
+            if (agent_proc().get_process_handle() != nullptr) {
+              if (fail_streak > 0) {
+                BOOST_LOG(info) << "CTM bridge: ctm-usbip.exe running again after "
+                                << fail_streak << " failed launch attempt(s).";
+              }
+              fail_streak = 0;
+            } else {
+              if (fail_streak == 0) {
+                BOOST_LOG(warning) << "CTM bridge: ctm-usbip.exe failed to launch; "
+                                      "backing off (will keep retrying).";
+              }
+              ++fail_streak;
+              const int mult = 1 << std::min(fail_streak - 1, 4);  // 5s,10s,20s,40s,... capped
+              wait_steps = std::min(kTickSteps * mult, kMaxBackoffSteps);
+            }
           } else if (!warned_missing) {
             BOOST_LOG(warning) << "CTM bridge enabled but ctm-usbip.exe not found"
                                << (exe ? (" at: " + platf::to_utf8(exe->wstring())) : std::string {})
@@ -176,11 +203,15 @@ namespace ctm_bridge {
             warned_missing = true;
           }
         } else {
-          // Disabled at runtime: ensure no managed instance lingers.
+          // Disabled at runtime: ensure no managed instance lingers, and wait for it to
+          // actually exit so we don't leave a half-torn-down USB/IP device behind.
           agent_proc().terminate();
+          DWORD exit_code = 0;
+          agent_proc().wait_for(exit_code, kAgentForceKillWaitMs);
+          fail_streak = 0;
         }
 
-        for (int i = 0; i < kTickSteps && !st.stop_requested(); ++i) {
+        for (int i = 0; i < wait_steps && !st.stop_requested(); ++i) {
           std::this_thread::sleep_for(100ms);
         }
       }
@@ -214,7 +245,11 @@ namespace ctm_bridge {
     if (local.joinable()) {
       local.join();
     }
+    // Terminate then wait for full teardown so the USB/IP driver stack is not left
+    // half-torn-down and a subsequent start can't overlap a still-exiting instance.
     agent_proc().terminate();
+    DWORD exit_code = 0;
+    agent_proc().wait_for(exit_code, kAgentForceKillWaitMs);
     BOOST_LOG(info) << "CTM bridge supervisor stopped.";
   }
 }  // namespace ctm_bridge
