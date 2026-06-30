@@ -2022,14 +2022,21 @@ namespace stream {
           }
         } else if (session->config.monitor.bitrate > 0) {
           // No explicit cap configured: derive the pacing target from the negotiated
-          // stream bitrate (~1.3x) so the pacer actually shapes the per-frame burst.
-          // The legacy fallback below (~80% of 1 Gbps) collapses to a no-op on any
-          // sub-gigabit link (e.g. WiFi), where the unpaced burst is then amplified by
-          // 802.11 AMPDU aggregation into 30-60 ms client-side inter-arrival jitter.
-          // AP1 is therefore active by default now. To restore the legacy "blast" path
-          // (preferable on a clean wired gigabit link, where spreading only adds tail
-          // latency), set pacing_max_bitrate_kbps to a value at or above the link rate.
-          pacing_bps = (size_t) session->config.monitor.bitrate * 1000ull * 13 / 10;
+          // stream bitrate so the pacer actually shapes the per-frame burst. The legacy
+          // fallback below (~80% of 1 Gbps) collapses to a no-op on any sub-gigabit link
+          // (e.g. WiFi), where the unpaced burst is then amplified by 802.11 AMPDU
+          // aggregation into 30-60 ms client-side inter-arrival jitter. AP1 is therefore
+          // active by default now. To restore the legacy "blast" path (preferable on a
+          // clean wired gigabit link, where spreading only adds tail latency), set
+          // pacing_max_bitrate_kbps to a value at or above the link rate.
+          //
+          // monitor.bitrate is the FEC-stripped video rate, but the pacer meters the
+          // data+parity shards actually put on the wire. Fold this frame's FEC overhead
+          // back in so the 1.3x stays headroom over real on-wire traffic: without it,
+          // 1.3x over video is only ~1.08x over on-wire at 20% FEC (each frame drains
+          // ~15.4 of the 16.6 ms slot). fecPercentage is this frame's actual value
+          // (0 when FEC is disabled for this frame -> reduces cleanly to 1.3x video).
+          pacing_bps = (size_t) session->config.monitor.bitrate * 1000ull * 13 / 10 * (100 + fecPercentage) / 100;
         } else {
           // Negotiated bitrate unknown (should not happen post-negotiation): keep legacy.
           pacing_bps = (size_t) (std::giga::num * 80 / 100);  // 80% of 1 Gbps
