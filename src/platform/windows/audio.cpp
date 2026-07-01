@@ -281,6 +281,68 @@ namespace platf::audio {
   };
 
   audio_client_t make_audio_client(device_t &device, const format_t &format) {
+    // --- Attempt IAudioClient3 low-latency capture (minimum shared engine period) ---
+    // The default WASAPI shared-mode engine period is ~10ms, which bounds how quickly
+    // loopback-captured samples become available. IAudioClient3::InitializeSharedAudioStream
+    // at the minimum period lowers that, mirroring the proven render-silence technique in
+    // ds5-usbip/ds5_av_capture.cpp (there applied via a render stream; here directly to the
+    // capture client). NEEDS A/B: engine-period support, whether loopback honours
+    // IAudioClient3, and whether AUTOCONVERTPCM is accepted by InitializeSharedAudioStream
+    // are all driver-dependent. ANY failure falls through cleanly to the plain IAudioClient
+    // path below (a fresh client is re-activated there, since a failed Initialize* poisons
+    // a client per MSDN).
+    {
+      IAudioClient3 *raw_ac3 = nullptr;
+      auto st3 = device->Activate(IID_IAudioClient3, CLSCTX_ALL, nullptr, (void **) &raw_ac3);
+      if (SUCCEEDED(st3) && raw_ac3) {
+        audio_client_t ac3(raw_ac3);  // take ownership (IAudioClient3 is-a IAudioClient)
+
+        WAVEFORMATEXTENSIBLE capture_waveformat =
+          create_waveformat(sample_format_e::f32, format.channel_count, format.capture_waveformat_channel_mask);
+
+        bool prepared = true;
+        {
+          wave_format_t mixer_waveformat;
+          if (SUCCEEDED(ac3->GetMixFormat(&mixer_waveformat))) {
+            // Prefer the native channel layout of the captured device when counts match
+            // (same as the fallback path below).
+            if (mixer_waveformat->nChannels == format.channel_count &&
+                mixer_waveformat->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+                mixer_waveformat->cbSize >= 22) {
+              auto waveformatext_pointer = reinterpret_cast<const WAVEFORMATEXTENSIBLE *>(mixer_waveformat.get());
+              capture_waveformat.dwChannelMask = waveformatext_pointer->dwChannelMask;
+            }
+          } else {
+            prepared = false;
+          }
+        }
+
+        UINT32 default_period = 0, fundamental_period = 0, min_period = 0, max_period = 0;
+        if (prepared &&
+            SUCCEEDED(raw_ac3->GetSharedModeEnginePeriod(
+              (LPWAVEFORMATEX) &capture_waveformat,
+              &default_period, &fundamental_period, &min_period, &max_period))) {
+          auto st_init = raw_ac3->InitializeSharedAudioStream(
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+              AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            min_period,
+            (LPWAVEFORMATEX) &capture_waveformat,
+            nullptr
+          );
+          if (SUCCEEDED(st_init)) {
+            BOOST_LOG(info) << "Audio capture: IAudioClient3 low-latency engine period "sv
+                            << (min_period * 1000.0 / SAMPLE_RATE) << " ms (shared default "sv
+                            << (default_period * 1000.0 / SAMPLE_RATE) << " ms) for ["sv << format.name << ']';
+            BOOST_LOG(info) << "Audio capture format is "sv << logging::bracket(waveformat_to_pretty_string(capture_waveformat));
+            return ac3;
+          }
+          BOOST_LOG(info) << "Audio capture: IAudioClient3 low-latency init failed [0x"sv
+                          << util::hex(st_init).to_string_view() << "], falling back to default period."sv;
+        }
+        // ac3 released here on fall-through.
+      }
+    }
+
     audio_client_t audio_client;
     auto status = device->Activate(
       IID_IAudioClient,
