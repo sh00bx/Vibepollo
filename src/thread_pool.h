@@ -28,6 +28,10 @@ namespace thread_pool_util {
 
     std::atomic_bool _continue;
 
+    // Priority applied to each worker thread in _main(). Left at normal for the generic
+    // HTTP-route pools; the global input-injection task_pool raises it (see start()).
+    platf::thread_priority_e _priority = platf::thread_priority_e::normal;
+
   public:
     ThreadPool():
         _continue {false} {
@@ -75,7 +79,8 @@ namespace thread_pool_util {
       return future;
     }
 
-    void start(int threads) {
+    void start(int threads, platf::thread_priority_e priority = platf::thread_priority_e::normal) {
+      _priority = priority;
       _continue.store(true, std::memory_order_release);
 
       _thread.resize(threads);
@@ -101,6 +106,9 @@ namespace thread_pool_util {
   public:
     void _main() {
       platf::set_thread_name("TaskPool::worker");
+      if (_priority != platf::thread_priority_e::normal) {
+        platf::adjust_thread_priority(_priority);
+      }
       while (_continue.load(std::memory_order_acquire)) {
         if (auto task = this->pop()) {
           (*task)->run();
