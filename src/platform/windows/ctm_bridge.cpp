@@ -52,6 +52,10 @@ namespace ctm_bridge {
     // Max poll backoff (100ms steps) after consecutive agent launch failures (~60s).
     constexpr int kMaxBackoffSteps = 600;
 
+    // An agent that exits sooner than this after launch is treated as a launch failure
+    // (crash loop), so the same backoff applies instead of respawning every tick.
+    constexpr auto kAgentStableWindow = std::chrono::seconds(30);
+
     /**
      * @brief The single tracked agent instance.
      *
@@ -69,9 +73,9 @@ namespace ctm_bridge {
      * @brief Resolve the ctm-usbip.exe path: explicit config override, else
      *        "<install>/tools/ctm-usbip.exe" next to the running executable.
      */
-    std::optional<std::filesystem::path> resolve_exe() {
-      if (!config::ctm.exe_path.empty()) {
-        return std::filesystem::path(platf::from_utf8(config::ctm.exe_path));
+    std::optional<std::filesystem::path> resolve_exe(const std::string &exe_path) {
+      if (!exe_path.empty()) {
+        return std::filesystem::path(platf::from_utf8(exe_path));
       }
       wchar_t module_path[MAX_PATH] = {};
       if (!GetModuleFileNameW(nullptr, module_path, _countof(module_path))) {
@@ -86,9 +90,9 @@ namespace ctm_bridge {
     /**
      * @brief Build the agent command line: "agent <port> [--enet]".
      */
-    std::wstring build_args() {
-      std::wstring args = L"agent " + std::to_wstring(config::ctm.port);
-      if (config::ctm.enet) {
+    std::wstring build_args(int port, bool enet) {
+      std::wstring args = L"agent " + std::to_wstring(port);
+      if (enet) {
         args += L" --enet";
       }
       return args;
@@ -107,9 +111,11 @@ namespace ctm_bridge {
      * supervisor of this binary (it replaced the old `ctmagent` autostart), so
      * reaping every instance before we launch our own enforces the singleton.
      *
-     * Called once at supervisor start, before any owned instance exists, so there
-     * is nothing of ours to spare; any live ctm-usbip.exe at that point is an
-     * orphan from a prior run.
+     * Called on the supervisor's first enabled tick, and again after each runtime
+     * disable->enable toggle, before any owned instance exists, so there is nothing of
+     * ours to spare; any live ctm-usbip.exe at that point is an orphan from a prior run.
+     * It is never called while the feature is disabled, so an externally-managed
+     * ctm-usbip.exe is left alone when ctm.enable is false.
      */
     void reap_orphan_agents() {
       HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -139,12 +145,39 @@ namespace ctm_bridge {
       CloseHandle(snapshot);
 
       for (DWORD pid : targets) {
-        HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+        HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if (!h) {
           DWORD err = GetLastError();
           BOOST_LOG(warning) << "CTM bridge: unable to open orphaned agent (pid=" << pid
                              << ", winerr=" << err << ") for termination.";
           continue;
+        }
+
+        // Re-verify the image name on the opened handle before terminating. The snapshot
+        // above is a point-in-time list of PIDs; PIDs are recycled and Sunshine runs as
+        // SYSTEM, so between snapshot and here this PID may already belong to an unrelated
+        // (possibly critical) process. Guard against that TOCTOU race.
+        {
+          wchar_t image_path[MAX_PATH];
+          DWORD image_len = _countof(image_path);
+          if (!QueryFullProcessImageNameW(h, 0, image_path, &image_len)) {
+            BOOST_LOG(warning) << "CTM bridge: could not verify image name for pid=" << pid
+                               << " (winerr=" << GetLastError() << "); skipping termination.";
+            CloseHandle(h);
+            continue;
+          }
+          const wchar_t *leaf = image_path;
+          for (DWORD i = 0; i < image_len; ++i) {
+            if (image_path[i] == L'\\' || image_path[i] == L'/') {
+              leaf = image_path + i + 1;
+            }
+          }
+          if (_wcsicmp(leaf, L"ctm-usbip.exe") != 0) {
+            BOOST_LOG(warning) << "CTM bridge: pid=" << pid << " is no longer ctm-usbip.exe (now "
+                               << platf::to_utf8(image_path) << "); skipping (PID recycled).";
+            CloseHandle(h);
+            continue;
+          }
         }
 
         if (WaitForSingleObject(h, 0) == WAIT_TIMEOUT) {
@@ -165,34 +198,87 @@ namespace ctm_bridge {
     void watchdog_proc(std::stop_token st) {
       using namespace std::chrono_literals;
       bool warned_missing = false;
-      int fail_streak = 0;  // consecutive genuine launch failures, drives backoff
+      int fail_streak = 0;  // consecutive launch failures (incl. crash-loops), drives backoff
+      bool need_reap = true;  // reap orphans on the first enabled tick + after each disable->enable
+      std::optional<std::chrono::steady_clock::time_point> launch_time;  // set of the last fresh launch
       while (!st.stop_requested()) {
+        // Snapshot the config this tick needs under the lock: config::ctm (incl. a
+        // std::string) is rewritten by apply_config on the confighttp hot-reload thread,
+        // so an unsynchronized read here would be a torn read (UB).
+        bool enable;
+        std::string exe_path;
+        int port;
+        bool enet;
+        {
+          std::lock_guard<std::mutex> lk(config::ctm_mutex);
+          enable = config::ctm.enable;
+          exe_path = config::ctm.exe_path;
+          port = config::ctm.port;
+          enet = config::ctm.enet;
+        }
+
         int wait_steps = kTickSteps;
-        if (config::ctm.enable) {
-          auto exe = resolve_exe();
+        if (enable) {
+          // Reap orphans only while enabled (never disturb an externally-managed agent
+          // when the feature is off) and again on each disable->enable toggle, so the
+          // port-collision singleton guard is re-armed on re-enable.
+          if (need_reap) {
+            reap_orphan_agents();
+            need_reap = false;
+          }
+          auto exe = resolve_exe(exe_path);
           if (exe && std::filesystem::exists(*exe)) {
             warned_missing = false;
-            // Idempotent: no-op while alive, relaunch after a crash.
-            const bool allow_system_fallback = platf::is_running_as_system();
-            agent_proc().start(exe->wstring(), build_args(), allow_system_fallback);
-            // start() returns false BOTH when the agent is already alive (the happy
-            // steady state) AND on a genuine launch failure, so discriminate on whether
-            // a process actually exists. A real failure (e.g. CreateProcess fails on a
-            // present-but-broken binary) gets capped exponential backoff so we don't
-            // respawn-spam every 5s — but we never give up, so it self-heals once the
-            // dependency is fixed.
-            if (agent_proc().get_process_handle() != nullptr) {
-              if (fail_streak > 0) {
-                BOOST_LOG(info) << "CTM bridge: ctm-usbip.exe running again after "
+
+            // Crash-loop guard: if the agent we launched has already exited, decide
+            // whether that counts as a failure (exited within the stability window)
+            // BEFORE relaunching. Otherwise a binary that launches then immediately dies
+            // (missing DLL, bound USB/IP port) respawns every tick forever with only a
+            // debug log and never backs off.
+            HANDLE cur = agent_proc().get_process_handle();
+            if (cur != nullptr && launch_time) {
+              if (WaitForSingleObject(cur, 0) == WAIT_OBJECT_0) {
+                DWORD code = 0;
+                GetExitCodeProcess(cur, &code);
+                const auto alive = std::chrono::steady_clock::now() - *launch_time;
+                if (alive < kAgentStableWindow) {
+                  if (fail_streak == 0) {
+                    BOOST_LOG(warning) << "CTM bridge: ctm-usbip.exe exited after "
+                                       << std::chrono::duration_cast<std::chrono::seconds>(alive).count()
+                                       << "s (exit code " << code << "); backing off (will keep retrying).";
+                  }
+                  ++fail_streak;
+                }
+                launch_time.reset();
+              } else if (fail_streak > 0 &&
+                         std::chrono::steady_clock::now() - *launch_time >= kAgentStableWindow) {
+                // The relaunched agent has now survived the stability window; clear backoff.
+                BOOST_LOG(info) << "CTM bridge: ctm-usbip.exe stable again after "
                                 << fail_streak << " failed launch attempt(s).";
+                fail_streak = 0;
               }
-              fail_streak = 0;
-            } else {
+            }
+
+            // Idempotent: no-op while alive, relaunch after a crash. start() returns
+            // true only on an actual fresh launch.
+            const bool allow_system_fallback = platf::is_running_as_system();
+            if (agent_proc().start(exe->wstring(), build_args(port, enet), allow_system_fallback)) {
+              launch_time = std::chrono::steady_clock::now();
+            }
+
+            // A genuine CreateProcess failure leaves no live handle (present-but-broken
+            // binary). Cap exponential backoff so we don't respawn-spam, but never give
+            // up, so it self-heals once the dependency is fixed.
+            if (agent_proc().get_process_handle() == nullptr) {
               if (fail_streak == 0) {
                 BOOST_LOG(warning) << "CTM bridge: ctm-usbip.exe failed to launch; "
                                       "backing off (will keep retrying).";
               }
               ++fail_streak;
+              launch_time.reset();
+            }
+
+            if (fail_streak > 0) {
               const int mult = 1 << std::min(fail_streak - 1, 4);  // 5s,10s,20s,40s,... capped
               wait_steps = std::min(kTickSteps * mult, kMaxBackoffSteps);
             }
@@ -209,6 +295,8 @@ namespace ctm_bridge {
           DWORD exit_code = 0;
           agent_proc().wait_for(exit_code, kAgentForceKillWaitMs);
           fail_streak = 0;
+          launch_time.reset();
+          need_reap = true;  // a subsequent re-enable should reap any orphan first
         }
 
         for (int i = 0; i < wait_steps && !st.stop_requested(); ++i) {
@@ -223,9 +311,10 @@ namespace ctm_bridge {
     if (g_running) {
       return;
     }
-    // Reap any agent orphaned by a previous unclean shutdown before launching our
-    // own, otherwise the new instance collides with the orphan on the USB/IP port.
-    reap_orphan_agents();
+    // Orphan reaping is deferred to the supervisor's first ENABLED tick (see
+    // watchdog_proc): reaping here would kill an externally-managed ctm-usbip.exe even
+    // when the feature is disabled, and would not re-run on a runtime disable->enable
+    // toggle.
     g_running = true;
     g_thread = std::jthread(watchdog_proc);
     BOOST_LOG(info) << "CTM bridge supervisor started.";
