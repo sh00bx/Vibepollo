@@ -8,6 +8,7 @@
 #include <array>
 #include <bitset>
 #include <chrono>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -458,6 +459,10 @@ namespace config {
   extern rtss_t rtss;
   extern lossless_scaling_t lossless_scaling;
   extern ctm_t ctm;
+  // Guards writes to config::ctm (in apply_config, on the confighttp hot-reload thread)
+  // against reads from the CTM bridge supervisor thread. config::ctm holds a std::string,
+  // so an unsynchronized concurrent read during hot-reload is a torn read (UB).
+  extern std::mutex ctm_mutex;
   extern sunshine_t sunshine;
 
   int parse(int argc, char *argv[]);
