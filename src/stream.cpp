@@ -1698,7 +1698,13 @@ namespace stream {
         break;
       }
 
-      server->iterate(150ms);
+      // 15ms (was 150ms): this timeout is the idle-input worst case for draining
+      // feedback_queue (ViGEm rumble/LED) at the top of the loop, since inbound client
+      // packets are the only thing that wakes enet_host_service early. Nothing in the
+      // loop assumes a fixed 150ms cadence (the termination-grace checks use wall-clock
+      // timestamps recomputed each iteration), so a shorter poll only tightens feedback
+      // latency at a negligible idle-wakeup cost.
+      server->iterate(15ms);
     }
 
     // Let all remaining connections know the server is shutting down

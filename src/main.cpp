@@ -366,7 +366,10 @@ int main(int argc, char *argv[]) {
 
 #endif
 
-  task_pool.start(1);
+  // The single task_pool worker injects all keyboard/mouse/gamepad input synchronously
+  // (see input.cpp). Run it at high priority so it isn't preempted by the above-normal
+  // capture/encode threads; kept below critical to avoid starving encode.
+  task_pool.start(1, platf::thread_priority_e::high);
 
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
   // create tray thread and detach it if enabled in config
