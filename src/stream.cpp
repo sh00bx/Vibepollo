@@ -2044,8 +2044,10 @@ namespace stream {
         //                                          bps    ms    packet      byte
         size_t ratecontrol_packets_in_1ms = pacing_bps / 1000 / blocksize / 8;
         if (ratecontrol_packets_in_1ms == 0) {
-          // Floor at one packet/ms so the inner pacing loop never divides by zero
-          // and we still send something on absurdly low bitrate caps.
+          // Floor at one packet so the group/batch sizing below (which uses this whole
+          // packet count) stays sane on absurdly low bitrate caps. The actual pacing
+          // rate is derived from bytes (see the due-time computation) so this floor no
+          // longer affects the effective wire rate.
           ratecontrol_packets_in_1ms = 1;
         }
 
@@ -2177,9 +2179,16 @@ namespace stream {
               // to account for the last send_batch() of the previous frame.
               if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms ||
                   ratecontrol_frame_packets_sent == 0) {
+                // Pace by BYTES actually put on the wire, not by an integer packets/ms
+                // count. ratecontrol_packets_in_1ms floors pacing_bps down to whole
+                // packets/ms; below ~30-40 Mbps that discards the fractional packet and
+                // paces SLOWER than the encoder produces, so the pacing debt drifts
+                // later every frame until the frame mailbox overflows and drops all
+                // queued frames. Deriving the due time straight from bytes keeps the
+                // effective rate at exactly pacing_bps for any blocksize/bitrate.
                 auto due = ratecontrol_frame_start +
-                           std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                             ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+                           std::chrono::nanoseconds(
+                             (std::uint64_t) ratecontrol_frame_packets_sent * blocksize * 8 * std::nano::den / pacing_bps);
 
                 auto now = std::chrono::steady_clock::now();
                 if (now < due) {
@@ -2226,10 +2235,10 @@ namespace stream {
             }
           }
 
-          // remember this in case the next frame comes immediately
+          // remember this in case the next frame comes immediately (bytes-based, see above)
           ratecontrol_next_frame_start = ratecontrol_frame_start +
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                                           ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+                                         std::chrono::nanoseconds(
+                                           (std::uint64_t) ratecontrol_frame_packets_sent * blocksize * 8 * std::nano::den / pacing_bps);
           ratecontrol_frame_packets_logger.collect_and_log((double) ratecontrol_frame_packets_sent);
 
           frame_network_latency_logger.second_point_now_and_log();
