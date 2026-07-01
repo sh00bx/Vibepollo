@@ -1758,7 +1758,20 @@ namespace platf {
 
     auto const max_bufs_per_msg = send_info.payload_buffers.size() + (send_info.headers ? 1 : 0);
 
-    std::vector<WSABUF> bufs((send_info.headers ? send_info.block_count : 1) * max_bufs_per_msg);
+    // Avoid a per-call heap allocation (this runs ~660x/s). The common case fits a
+    // small stack array (block_count is capped at 64, so the headers path needs at
+    // most 128 WSABUFs); fall back to the heap only if the batch is unusually large.
+    const size_t bufs_needed = (send_info.headers ? send_info.block_count : 1) * max_bufs_per_msg;
+    constexpr size_t kStackBufs = 128;
+    WSABUF stack_bufs[kStackBufs];
+    std::vector<WSABUF> heap_bufs;
+    WSABUF *bufs;
+    if (bufs_needed <= kStackBufs) {
+      bufs = stack_bufs;
+    } else {
+      heap_bufs.resize(bufs_needed);
+      bufs = heap_bufs.data();
+    }
     DWORD bufcount = 0;
     if (send_info.headers) {
       // Interleave buffers for headers and payloads
@@ -1784,7 +1797,7 @@ namespace platf {
       }
     }
 
-    msg.lpBuffers = bufs.data();
+    msg.lpBuffers = bufs;
     msg.dwBufferCount = bufcount;
     msg.dwFlags = 0;
 
