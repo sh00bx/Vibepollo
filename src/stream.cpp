@@ -2296,6 +2296,7 @@ namespace stream {
     // Audio traffic is sent on this thread
     platf::set_thread_name("stream::audioBroadcast");
     platf::adjust_thread_priority(platf::thread_priority_e::high);
+    platf::associate_audio_mmcss();
 
     while (auto packet = packets->pop()) {
       if (shutdown_event->peek()) {
