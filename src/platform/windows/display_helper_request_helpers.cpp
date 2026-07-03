@@ -733,6 +733,11 @@ namespace display_helper_integration::helpers {
       return std::nullopt;
     }
 
+    // The HDR off->on "blank" workaround only makes sense when the session will
+    // actually stream HDR; SDR sessions on an HDR-capable desktop would pay the
+    // ~1s blank (and a visible flash) for nothing.
+    builder.set_hdr_toggle_flag(session.enable_hdr);
+
     SessionMonitorPositionHelper monitor_helper(video_config, session);
     monitor_helper.configure(builder);
 
