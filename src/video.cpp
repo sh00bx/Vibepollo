@@ -4111,7 +4111,8 @@ namespace video {
     const encoder_t &encoder,
     const config_t &config,
     hdr_latch_t *hdr_latch,
-    bool deferred_avcodec);
+    bool deferred_avcodec,
+    bool probing);
 
   void abandon_quarantined_session(
     std::unique_ptr<encode_session_t> &session,
@@ -5052,7 +5053,8 @@ namespace video {
     const encoder_t &encoder,
     const config_t &config,
     hdr_latch_t *hdr_latch = nullptr,
-    bool deferred_avcodec = false) {
+    bool deferred_avcodec = false,
+    bool probing = false) {
     std::unique_ptr<platf::encode_device_t> result;
 
 #ifdef _WIN32
@@ -5104,7 +5106,10 @@ namespace video {
     // (dynamicRange == 0), prefer_sdr_10bit clients (10-bit SDR: the display never flips to HDR,
     // matching video_colorspace.cpp) and RTX-HDR (hdr_display already forced true above) are never
     // affected.
-    if (config.dynamicRange && !hdr_display && !config.prefer_sdr_10bit) {
+    // Probing only validates encoder capability (10-bit HDR probes encode fine against an
+    // SDR desktop), so it must not pay the settle wait: 2s per HDR probe adds multiple
+    // seconds to service start and every reprobe.
+    if (config.dynamicRange && !hdr_display && !config.prefer_sdr_10bit && !probing) {
       const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
       int settle_ms = 0;
       while (std::chrono::steady_clock::now() < settle_deadline) {
@@ -5826,7 +5831,8 @@ namespace video {
         } else
 #endif
         {
-          auto encode_device = make_encode_device(*disp, encoder, config);
+          // probing = true: encoder validation must not pay the 2s HDR settle wait.
+          auto encode_device = make_encode_device(*disp, encoder, config, nullptr, false, true);
           if (encode_device) {
             session = make_encode_session(
               disp.get(), encoder, config, disp->width, disp->height,

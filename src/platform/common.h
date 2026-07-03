@@ -722,6 +722,12 @@ namespace platf {
   void adjust_thread_priority(thread_priority_e priority);
 
   /**
+   * @brief Register the current thread with the OS multimedia scheduler.
+   * @note Windows: MMCSS "Pro Audio" task, lasts until the thread exits. No-op elsewhere.
+   */
+  void associate_audio_mmcss();
+
+  /**
    * @brief Name the current thread for use with development tools.
    * @note On Linux this will be truncated after 15 characters.
    */

@@ -95,6 +95,7 @@ namespace audio {
     // Encoding takes place on this thread
     platf::set_thread_name("audio::encode");
     platf::adjust_thread_priority(platf::thread_priority_e::high);
+    platf::associate_audio_mmcss();
 
     opus_t opus {opus_multistream_encoder_create(
       stream.sampleRate,

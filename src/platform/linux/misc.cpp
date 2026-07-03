@@ -552,6 +552,10 @@ namespace platf {
     pthread_setname_np(pthread_self(), name.c_str());
   }
 
+  void associate_audio_mmcss() {
+    // MMCSS is Windows-only
+  }
+
   void enable_mouse_keys() {
     // Unimplemented
   }

@@ -264,7 +264,9 @@ namespace safe {
       }
 
       if (_queue.size() == _max_elements) {
-        _queue.clear();
+        // Drop only the oldest element: clearing the whole queue on a transient
+        // consumer stall turns a one-element hiccup into a multi-frame A/V gap.
+        _queue.erase(std::begin(_queue));
       }
 
       _queue.emplace_back(std::forward<Args>(args)...);

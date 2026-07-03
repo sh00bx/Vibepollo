@@ -33,6 +33,7 @@
 #include <UserEnv.h>
 #include <WinSock2.h>
 #include <Windows.h>
+#include <avrt.h>
 #include <WinUser.h>
 #include <setupapi.h>
 #include <wlanapi.h>
@@ -1499,6 +1500,13 @@ namespace platf {
     HRESULT hr = SetThreadDescription(GetCurrentThread(), wname.c_str());
     if (FAILED(hr)) {
       BOOST_LOG(error) << "SetThreadDescription failed: " << hr;
+    }
+  }
+
+  void associate_audio_mmcss() {
+    DWORD task_index = 0;
+    if (!AvSetMmThreadCharacteristics("Pro Audio", &task_index)) {
+      BOOST_LOG(warning) << "Couldn't associate thread with Pro Audio MMCSS task [0x"sv << util::hex(GetLastError()).to_string_view() << ']';
     }
   }
 
