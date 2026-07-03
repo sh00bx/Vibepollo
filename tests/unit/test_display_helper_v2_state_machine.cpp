@@ -365,6 +365,7 @@ TEST(DisplayHelperV2StateMachine, ApplyTransitionsAndVerifies) {
   StateMachineHarness harness;
   display_helper::v2::ApplyRequest request;
   request.configuration = display_device::SingleDisplayConfiguration {};
+  request.hdr_blank = true;
 
   harness.state_machine.handle_message(display_helper::v2::ApplyCommand {request, harness.cancellation.current_generation()});
   EXPECT_EQ(harness.state_machine.state(), display_helper::v2::State::InProgress);
@@ -391,6 +392,27 @@ TEST(DisplayHelperV2StateMachine, ApplyTransitionsAndVerifies) {
   EXPECT_EQ(harness.workarounds.last_delay, std::chrono::milliseconds(1000));
   ASSERT_TRUE(harness.apply_result.has_value());
   EXPECT_EQ(harness.apply_result, display_helper::v2::ApplyStatus::Ok);
+}
+
+TEST(DisplayHelperV2StateMachine, SkipsHdrBlankWithoutFlag) {
+  StateMachineHarness harness;
+  display_helper::v2::ApplyRequest request;
+  request.configuration = display_device::SingleDisplayConfiguration {};
+
+  harness.state_machine.handle_message(display_helper::v2::ApplyCommand {request, harness.cancellation.current_generation()});
+  ASSERT_TRUE(harness.dispatcher.apply_completion);
+
+  display_helper::v2::ApplyOutcome outcome;
+  outcome.status = display_helper::v2::ApplyStatus::Ok;
+  harness.dispatcher.apply_completion(outcome);
+  harness.drain_messages();
+  ASSERT_TRUE(harness.dispatcher.verification_completion);
+
+  harness.dispatcher.verification_completion(true);
+  harness.drain_messages();
+
+  EXPECT_EQ(harness.workarounds.blank_calls, 0);
+  EXPECT_EQ(harness.workarounds.refresh_calls, 1);
 }
 
 TEST(DisplayHelperV2StateMachine, ApplyRetriesOnRetryable) {
