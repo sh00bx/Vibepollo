@@ -508,7 +508,15 @@ namespace display_helper::v2 {
       // HDR decoders (webOS Aurora "decoder reported error" -> disconnect). Running
       // it here, before the gate, means capture only begins once HDR has settled.
       // blank_hdr_states() is synchronous by design (see win_platform_workarounds).
-      system_.blank_hdr_states(std::chrono::milliseconds(1000));
+      // Gated on the wa_hdr_toggle flag from the APPLY payload (only set for HDR
+      // sessions) and one-shot per request: event-driven re-applies of
+      // current_request_ (display change, monitoring restart) verify under a live
+      // encoder, where the off->on toggle is exactly the reinit hazard the
+      // pre-gate ordering above exists to prevent.
+      if (current_request_.hdr_blank) {
+        system_.blank_hdr_states(std::chrono::milliseconds(1000));
+        current_request_.hdr_blank = false;
+      }
     }
 
     if (verification_result_callback_) {
