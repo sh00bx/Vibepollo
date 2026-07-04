@@ -740,6 +740,12 @@ namespace nvhttp {
                     continue;
                   }
 
+                  // Don't re-arm the HDR off->on "blank" workaround for this mid-session
+                  // apply: the capture reinit raised below plus the HDR settle wait in
+                  // make_encode_device already re-establish HDR on the recreated display,
+                  // and the blank would toggle HDR under the live encoder.
+                  request->attach_hdr_toggle_flag = false;
+
                   if (display_helper_integration::apply(*request)) {
                     BOOST_LOG(info) << "Virtual display recovery: re-applied session display configuration (including exclusivity) after recreation.";
                     applied = true;
