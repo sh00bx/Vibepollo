@@ -1681,14 +1681,16 @@ namespace input {
       }
 
       // Pop off the first entry, which we will send
-      entry = input->input_queue.front();
+      entry = std::move(input->input_queue.front());
       payload = (PNV_INPUT_HEADER) entry.data();
       input->input_queue.pop_front();
 
       // Try to batch with remaining items on the queue
       auto i = input->input_queue.begin();
       while (i != input->input_queue.end()) {
-        auto batchable_entry = *i;
+        // batch() only reads src and writes into dest (which points into 'entry'),
+        // so scanning by reference avoids copying every queued entry under the lock.
+        auto &batchable_entry = *i;
         auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
 
         auto batch_result = batch(payload, batchable_payload);
