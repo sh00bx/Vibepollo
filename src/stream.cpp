@@ -1593,6 +1593,9 @@ namespace stream {
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     constexpr auto pending_peer_termination_grace = std::chrono::seconds(1);
     std::optional<std::chrono::steady_clock::time_point> process_terminated_since;
+    // While gamepad feedback (ViGEm rumble/LED) was recently flowing, poll at 1ms
+    // instead of 15ms; see the comment at the iterate() call below.
+    auto feedback_active_until = std::chrono::steady_clock::time_point::min();
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       const bool process_running = proc::proc.running() != 0;
       bool has_session_awaiting_peer = false;
@@ -1671,6 +1674,7 @@ namespace stream {
               auto feedback_msg = feedback_queue->pop();
 
               send_feedback_msg(session, *feedback_msg);
+              feedback_active_until = now + 500ms;
             }
 
             auto &hdr_queue = session->control.hdr_queue;
@@ -1704,7 +1708,15 @@ namespace stream {
       // loop assumes a fixed 150ms cadence (the termination-grace checks use wall-clock
       // timestamps recomputed each iteration), so a shorter poll only tightens feedback
       // latency at a negligible idle-wakeup cost.
-      server->iterate(15ms);
+      //
+      // A message raised by the ViGEm callback thread right after the drain above still
+      // waits out the whole poll (enet_host_service has no cross-thread wake, and a junk
+      // wake datagram wouldn't make it return early - it drops unparseable packets and
+      // keeps waiting out its deadline). Games update rumble continuously during an
+      // effect, so while feedback flowed within the last 500ms, poll at 1ms: only the
+      // first message of a burst pays up to 15ms, the rest of the effect is drained
+      // within ~1ms, and an idle controller costs nothing.
+      server->iterate(std::chrono::steady_clock::now() < feedback_active_until ? 1ms : 15ms);
     }
 
     // Let all remaining connections know the server is shutting down
