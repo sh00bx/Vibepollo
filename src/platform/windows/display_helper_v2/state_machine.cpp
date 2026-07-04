@@ -512,7 +512,11 @@ namespace display_helper::v2 {
       // sessions) and one-shot per request: event-driven re-applies of
       // current_request_ (display change, monitoring restart) verify under a live
       // encoder, where the off->on toggle is exactly the reinit hazard the
-      // pre-gate ordering above exists to prevent.
+      // pre-gate ordering above exists to prevent. Note the one-shot only covers
+      // re-applies of the SAME request: a fresh mid-session APPLY (e.g. virtual
+      // display recovery) replaces current_request_ and would re-arm hdr_blank
+      // here, so those senders must clear wa_hdr_toggle themselves (the VDD
+      // recovery paths in nvhttp.cpp/webrtc_stream.cpp do).
       if (current_request_.hdr_blank) {
         system_.blank_hdr_states(std::chrono::milliseconds(1000));
         current_request_.hdr_blank = false;
