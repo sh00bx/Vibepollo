@@ -636,7 +636,8 @@ namespace platf::audio {
 
       REFERENCE_TIME default_latency;
       audio_client->GetDevicePeriod(&default_latency, nullptr);
-      default_latency_ms = default_latency / 1000;
+      // REFERENCE_TIME is in 100ns units, so 10000 units per millisecond
+      default_latency_ms = std::max<DWORD>(3, default_latency / 10000);
       continuous_audio = continuous;
 
       std::uint32_t frames;
@@ -803,7 +804,7 @@ namespace platf::audio {
     audio_notification_t endpt_notification;
     std::optional<std::function<void()>> default_endpt_changed_cb;
 
-    REFERENCE_TIME default_latency_ms;
+    DWORD default_latency_ms;
 
     util::buffer_t<float> sample_buf;
     float *sample_buf_pos;
