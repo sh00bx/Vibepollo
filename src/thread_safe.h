@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 // local includes
@@ -251,8 +252,18 @@ namespace safe {
   public:
     using status_t = util::optional_t<T>;
 
+    enum class overflow_e {
+      drop_oldest,  ///< Drop only the front element. For queues of independent elements (audio, feedback).
+      drain_to_newest,  ///< Drop the whole backlog. For queues whose elements depend on their predecessors (video frames).
+    };
+
     queue_t(std::uint32_t max_elements = 32):
         _max_elements {max_elements} {
+    }
+
+    void set_overflow_policy(overflow_e policy) {
+      std::lock_guard lg {_lock};
+      _overflow_policy = policy;
     }
 
     template<class... Args>
@@ -264,9 +275,16 @@ namespace safe {
       }
 
       if (_queue.size() == _max_elements) {
-        // Drop only the oldest element: clearing the whole queue on a transient
-        // consumer stall turns a one-element hiccup into a multi-frame A/V gap.
-        _queue.erase(std::begin(_queue));
+        if (_overflow_policy == overflow_e::drain_to_newest) {
+          // A stale backlog of dependent elements (encoded frames) is useless to
+          // the consumer and only delays recovery: drop all of it, keep the newest.
+          _queue.clear();
+        } else {
+          // Drop only the oldest element: clearing the whole queue on a transient
+          // consumer stall turns a one-element hiccup into a multi-frame A/V gap.
+          _queue.erase(std::begin(_queue));
+        }
+        _overflowed = true;
       }
 
       _queue.emplace_back(std::forward<Args>(args)...);
@@ -276,6 +294,14 @@ namespace safe {
 
     bool peek() {
       return _continue && !_queue.empty();
+    }
+
+    /**
+     * @brief Check and clear whether raise() dropped elements due to overflow since the last call.
+     */
+    bool consume_overflow() {
+      std::lock_guard lg {_lock};
+      return std::exchange(_overflowed, false);
     }
 
     template<class Rep, class Period>
@@ -345,6 +371,8 @@ namespace safe {
   private:
     bool _continue {true};
     std::uint32_t _max_elements;
+    overflow_e _overflow_policy {overflow_e::drop_oldest};
+    bool _overflowed {false};
 
     std::mutex _lock;
     std::condition_variable _cv;
