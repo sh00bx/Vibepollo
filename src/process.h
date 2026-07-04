@@ -266,7 +266,11 @@ namespace proc {
     bool placebo {};
 
 #ifdef _WIN32
-    bool _deferred_launch {false};
+    std::atomic<bool> _deferred_launch {false};
+    // True while the detached deferred-launch worker spawned by running() is in flight
+    std::atomic<bool> _deferred_launch_active {false};
+    // One-shot failure signal from the deferred-launch worker back to running()
+    std::atomic<bool> _deferred_launch_failed {false};
     bool _lossless_should_start_support {false};
     playnite_launcher::lossless::lossless_scaling_app_metadata _lossless_metadata {};
 #endif
