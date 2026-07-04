@@ -2994,6 +2994,14 @@ namespace video {
       }
       ++loop_stats.encoded;
 
+      if (packets->consume_overflow()) {
+        // The packet queue overflowed and drained its stale backlog (see
+        // start_broadcast); the client is missing references, so re-key
+        // immediately instead of waiting for its IDR request round trip.
+        BOOST_LOG(debug) << "Video packet queue overflowed; requesting an IDR frame to recover"sv;
+        idr_events->raise(true);
+      }
+
       if (placeholder_input) {
         bootstrap_state.placeholder_encoded = true;
       }
@@ -3410,6 +3418,14 @@ namespace video {
             ctx->shutdown_event->raise(true);
 
             continue;
+          }
+
+          if (ctx->packets->consume_overflow()) {
+            // The packet queue overflowed and drained its stale backlog (see
+            // start_broadcast); the client is missing references, so re-key
+            // immediately instead of waiting for its IDR request round trip.
+            BOOST_LOG(debug) << "Video packet queue overflowed; requesting an IDR frame to recover"sv;
+            ctx->idr_events->raise(true);
           }
 
           if (placeholder_input) {
