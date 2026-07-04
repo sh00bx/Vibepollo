@@ -2398,6 +2398,14 @@ namespace stream {
     video_packets->reset();
     audio_packets->reset();
 
+    // Encoded frames depend on their predecessors, so after a consumer stall a
+    // stale backlog is useless to the client and only delays the recovery IDR
+    // behind up to 31 frames drained at pacer speed. Drain to the newest frame
+    // on overflow instead; the encoder re-keys immediately when it happens (see
+    // the consume_overflow() checks in video.cpp). Audio keeps drop-oldest:
+    // its elements are independent, so single-element drops recover cleanly.
+    video_packets->set_overflow_policy(safe::queue_t<video::packet_t>::overflow_e::drain_to_newest);
+
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
     auto control_port = net::map_port(CONTROL_PORT);
     auto video_port = net::map_port(VIDEO_STREAM_PORT);
