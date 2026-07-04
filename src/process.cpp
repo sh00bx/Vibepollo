@@ -1244,6 +1244,9 @@ namespace proc {
     _virtual_display_active = false;
     _virtual_display_guid = GUID {};
     _deferred_launch = false;
+    // Drop any failure signal left over from a cancelled deferred-launch worker
+    // so it can't terminate this fresh session.
+    _deferred_launch_failed = false;
     _lossless_should_start_support = false;
     _lossless_metadata = {};
 #endif
@@ -2121,6 +2124,15 @@ namespace proc {
 #endif
 
 #ifdef _WIN32
+    if (_deferred_launch_active) {
+      // A deferred-launch worker is still running; report the app as alive so
+      // the session outlives the launch.
+      return _app_id;
+    }
+    if (_deferred_launch_failed.exchange(false)) {
+      BOOST_LOG(error) << "Deferred launch failed; terminating session.";
+      return 0;
+    }
     if (_deferred_launch) {
       if (platf::is_running_as_system()) {
         HANDLE user_token = platf::dxgi::retrieve_users_token(false);
@@ -2129,63 +2141,81 @@ namespace proc {
         }
         CloseHandle(user_token);
       }
-      std::optional<int> rtss_warmup_limit;
-      if (_lossless_metadata.enabled && _lossless_metadata.rtss_limit && *_lossless_metadata.rtss_limit > 0) {
-        rtss_warmup_limit = *_lossless_metadata.rtss_limit;
+
+      // Run the rest of the deferred launch (frame-limiter prep, an up-to-3s
+      // RTSS warmup wait and the user's prep commands, which can block for an
+      // unbounded time) on a detached worker: running() is polled every 15ms
+      // by the critical-priority control thread, which must keep servicing
+      // ENet input/feedback while the launch completes. The exchange() makes
+      // sure a concurrent running() caller can't start a second worker.
+      if (_deferred_launch_active.exchange(true)) {
+        return _app_id;
       }
-      const bool wants_frame_limit = config::frame_limiter.enable ||
-                                     _app.frame_generation_enabled ||
-                                     _app.gen1_framegen_fix ||
-                                     _app.gen2_framegen_fix ||
-                                     (rtss_warmup_limit && *rtss_warmup_limit > 0);
-      if (wants_frame_limit) {
-        bool warmup_uses_virtual =
-          _app.virtual_screen ||
-          config::video.virtual_display_mode != config::video_t::virtual_display_mode_e::disabled;
-        if (_app.virtual_display_mode_override) {
-          warmup_uses_virtual = *_app.virtual_display_mode_override != config::video_t::virtual_display_mode_e::disabled;
+      std::thread([this]() {
+        std::optional<int> rtss_warmup_limit;
+        if (_lossless_metadata.enabled && _lossless_metadata.rtss_limit && *_lossless_metadata.rtss_limit > 0) {
+          rtss_warmup_limit = *_lossless_metadata.rtss_limit;
         }
-        if (_app.output_name_override && !_app.output_name_override->empty() && !VDISPLAY::is_virtual_display_selection(*_app.output_name_override)) {
-          warmup_uses_virtual = false;
-        }
-        const auto warmup_policy = framegen::make_stream_start_policy({
-          .fps = 0,
-          .frame_generation_enabled = _app.frame_generation_enabled,
-          .gen1_framegen_fix = _app.gen1_framegen_fix,
-          .gen2_framegen_fix = _app.gen2_framegen_fix,
-          .lossless_scaling_framegen = _app.lossless_scaling_framegen,
-          .lossless_rtss_limit = rtss_warmup_limit,
-          .frame_generation_provider = _app.frame_generation_provider,
-          .uses_virtual_display = warmup_uses_virtual,
-          .capture_mode = config::video.capture,
-          .auto_capture_uses_wgc = platf::dxgi::should_use_wgc_default(),
-          .auto_virtual_framegen_limiter = config::frame_limiter.auto_virtual_framegen,
-        });
-        platf::frame_limiter_prepare_launch(warmup_policy);
-        const bool provider_auto = config::frame_limiter.provider.empty() ||
-                                   boost::iequals(config::frame_limiter.provider, "auto");
-        const bool provider_rtss = boost::iequals(config::frame_limiter.provider, "rtss");
-        const bool should_wait_rtss = platf::rtss_is_configured() && (provider_auto || provider_rtss || _app.frame_generation_enabled || _app.gen1_framegen_fix || _app.gen2_framegen_fix);
-        if (should_wait_rtss) {
-          const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-          bool running = false;
-          while (std::chrono::steady_clock::now() < deadline) {
-            if (platf::rtss_get_status().process_running) {
-              running = true;
-              break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const bool wants_frame_limit = config::frame_limiter.enable ||
+                                       _app.frame_generation_enabled ||
+                                       _app.gen1_framegen_fix ||
+                                       _app.gen2_framegen_fix ||
+                                       (rtss_warmup_limit && *rtss_warmup_limit > 0);
+        if (wants_frame_limit) {
+          bool warmup_uses_virtual =
+            _app.virtual_screen ||
+            config::video.virtual_display_mode != config::video_t::virtual_display_mode_e::disabled;
+          if (_app.virtual_display_mode_override) {
+            warmup_uses_virtual = *_app.virtual_display_mode_override != config::video_t::virtual_display_mode_e::disabled;
           }
-          BOOST_LOG(info) << "RTSS warmup " << (running ? "complete" : "timeout") << " after deferred login.";
+          if (_app.output_name_override && !_app.output_name_override->empty() && !VDISPLAY::is_virtual_display_selection(*_app.output_name_override)) {
+            warmup_uses_virtual = false;
+          }
+          const auto warmup_policy = framegen::make_stream_start_policy({
+            .fps = 0,
+            .frame_generation_enabled = _app.frame_generation_enabled,
+            .gen1_framegen_fix = _app.gen1_framegen_fix,
+            .gen2_framegen_fix = _app.gen2_framegen_fix,
+            .lossless_scaling_framegen = _app.lossless_scaling_framegen,
+            .lossless_rtss_limit = rtss_warmup_limit,
+            .frame_generation_provider = _app.frame_generation_provider,
+            .uses_virtual_display = warmup_uses_virtual,
+            .capture_mode = config::video.capture,
+            .auto_capture_uses_wgc = platf::dxgi::should_use_wgc_default(),
+            .auto_virtual_framegen_limiter = config::frame_limiter.auto_virtual_framegen,
+          });
+          platf::frame_limiter_prepare_launch(warmup_policy);
+          const bool provider_auto = config::frame_limiter.provider.empty() ||
+                                     boost::iequals(config::frame_limiter.provider, "auto");
+          const bool provider_rtss = boost::iequals(config::frame_limiter.provider, "rtss");
+          const bool should_wait_rtss = platf::rtss_is_configured() && (provider_auto || provider_rtss || _app.frame_generation_enabled || _app.gen1_framegen_fix || _app.gen2_framegen_fix);
+          if (should_wait_rtss) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            bool running = false;
+            while (std::chrono::steady_clock::now() < deadline) {
+              if (platf::rtss_get_status().process_running) {
+                running = true;
+                break;
+              }
+              std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            BOOST_LOG(info) << "RTSS warmup " << (running ? "complete" : "timeout") << " after deferred login.";
+          }
         }
-      }
-      BOOST_LOG(info) << "User session detected; resuming deferred launch for app '" << _app.name << "'.";
-      _deferred_launch = false;
-      int err = launch_app_commands();
-      if (err != 0) {
-        BOOST_LOG(error) << "Deferred launch failed; terminating session.";
-        return 0;
-      }
+        // terminate() clears _deferred_launch to cancel a pending deferred
+        // launch; don't launch into a torn-down session.
+        if (!_deferred_launch.exchange(false)) {
+          _deferred_launch_active = false;
+          return;
+        }
+        BOOST_LOG(info) << "User session detected; resuming deferred launch for app '" << _app.name << "'.";
+        if (launch_app_commands() != 0) {
+          _deferred_launch_failed = true;
+        }
+        _deferred_launch_active = false;
+      }).detach();
+
+      return _app_id;
     }
 #endif
 
