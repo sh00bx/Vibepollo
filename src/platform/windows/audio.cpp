@@ -634,8 +634,14 @@ namespace platf::audio {
         return -1;
       }
 
-      REFERENCE_TIME default_latency;
-      audio_client->GetDevicePeriod(&default_latency, nullptr);
+      REFERENCE_TIME default_latency {};
+      status = audio_client->GetDevicePeriod(&default_latency, nullptr);
+      if (FAILED(status) || default_latency <= 0) {
+        // Only bounds the capture event wait below; assume the documented
+        // WASAPI shared-mode default period instead of failing the device.
+        BOOST_LOG(warning) << "Couldn't get audio device period, assuming 10ms [0x"sv << util::hex(status).to_string_view() << ']';
+        default_latency = 100000;  // 10ms in 100ns units
+      }
       // REFERENCE_TIME is in 100ns units, so 10000 units per millisecond
       default_latency_ms = std::max<DWORD>(3, default_latency / 10000);
       continuous_audio = continuous;
