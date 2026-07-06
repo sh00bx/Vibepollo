@@ -949,6 +949,13 @@ namespace proc {
   proc_t &proc_t::operator=(proc_t &&other) noexcept {
     if (this != &other) {
       std::scoped_lock lk(_apps_mutex, other._apps_mutex);
+      {
+        // Invalidate any in-flight deferred-launch worker before replacing the
+        // state it snapshots (see running()). Deliberately not copied from
+        // 'other': the worker belongs to *this* object's lifetime.
+        std::lock_guard lg {_deferred_mutex};
+        ++_session_generation;
+      }
 #ifdef _WIN32
       stop_lossless_scaling_support();
 #endif
@@ -1223,6 +1230,15 @@ namespace proc {
 #endif
   }
   int proc_t::execute(const ctx_t &app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    {
+      // Invalidate any in-flight deferred-launch worker from a previous session
+      // BEFORE mutating the state it snapshots (see running()): the worker
+      // validates this generation under the same lock, so once we've bumped it
+      // here, a stale worker can no longer read _app/_lossless_metadata or
+      // consume this session's _deferred_launch flag.
+      std::lock_guard lg {_deferred_mutex};
+      ++_session_generation;
+    }
 #ifdef _WIN32
     std::optional<std::filesystem::path> resolved_lossless_exe_path;
     std::string resolved_lossless_exe_utf8;
@@ -1767,14 +1783,19 @@ namespace proc {
     return launch_app_commands();
   }
 
-  int proc_t::launch_app_commands() {
+  int proc_t::launch_app_commands(bool terminate_on_failure) {
     std::error_code ec;
     _app_prep_begin = std::begin(_app.prep_cmds);
     _app_prep_it = _app_prep_begin;
 
-    // Executed when returning from function on failure
+    // Executed when returning from function on failure. The deferred-launch
+    // worker opts out (see running()): terminate() from that detached thread
+    // could tear down a successor session it doesn't own; the worker signals
+    // running() instead, which terminates from its usual calling context.
     auto fg = util::fail_guard([&]() {
-      terminate();
+      if (terminate_on_failure) {
+        terminate();
+      }
     });
 
 #ifdef _WIN32
@@ -2111,6 +2132,10 @@ namespace proc {
     }
     if (_deferred_launch_failed.exchange(false)) {
       BOOST_LOG(error) << "Deferred launch failed; terminating session.";
+      // The worker no longer runs teardown itself (launch_app_commands with
+      // terminate_on_failure=false), so run the cleanup it used to trigger
+      // here, from running()'s usual calling context.
+      terminate();
       return 0;
     }
     if (_deferred_launch) {
@@ -2128,37 +2153,89 @@ namespace proc {
       // by the critical-priority control thread, which must keep servicing
       // ENet input/feedback while the launch completes. The exchange() makes
       // sure a concurrent running() caller can't start a second worker.
+      //
+      // The worker is coordinated with terminate()/execute() through
+      // _session_generation: both bump it under _deferred_mutex BEFORE they
+      // mutate session state, and the worker validates its captured value
+      // under the same lock before snapshotting the launch state and again
+      // before committing the launch, abandoning silently once it goes stale.
+      // It reads no members outside those validated regions and never runs
+      // teardown itself: a stale worker must not touch a successor session.
       if (_deferred_launch_active.exchange(true)) {
         return _app_id;
       }
-      std::thread([this]() {
+      std::uint64_t worker_generation;
+      {
+        std::lock_guard lg {_deferred_mutex};
+        if (!_deferred_launch) {
+          // terminate() cancelled the launch between the check above and here.
+          _deferred_launch_active = false;
+          return 0;
+        }
+        worker_generation = _session_generation;
+      }
+      std::thread([this, worker_generation]() {
+        auto generation_current = [&]() {
+          std::lock_guard lg {_deferred_mutex};
+          return _session_generation == worker_generation;
+        };
+
+        // Snapshot everything the warmup needs while validating the
+        // generation: a matching value under the lock means no
+        // terminate()/execute() has begun mutating _app/_lossless_metadata
+        // since this worker spawned, so the copies cannot tear.
         std::optional<int> rtss_warmup_limit;
-        if (_lossless_metadata.enabled && _lossless_metadata.rtss_limit && *_lossless_metadata.rtss_limit > 0) {
-          rtss_warmup_limit = *_lossless_metadata.rtss_limit;
+        std::string app_name;
+        bool frame_generation_enabled;
+        bool gen1_framegen_fix;
+        bool gen2_framegen_fix;
+        bool lossless_scaling_framegen;
+        std::string frame_generation_provider;
+        bool virtual_screen;
+        std::optional<config::video_t::virtual_display_mode_e> virtual_display_mode_override;
+        std::optional<std::string> output_name_override;
+        {
+          std::lock_guard lg {_deferred_mutex};
+          if (_session_generation != worker_generation) {
+            _deferred_launch_active = false;
+            return;
+          }
+          if (_lossless_metadata.enabled && _lossless_metadata.rtss_limit && *_lossless_metadata.rtss_limit > 0) {
+            rtss_warmup_limit = *_lossless_metadata.rtss_limit;
+          }
+          app_name = _app.name;
+          frame_generation_enabled = _app.frame_generation_enabled;
+          gen1_framegen_fix = _app.gen1_framegen_fix;
+          gen2_framegen_fix = _app.gen2_framegen_fix;
+          lossless_scaling_framegen = _app.lossless_scaling_framegen;
+          frame_generation_provider = _app.frame_generation_provider;
+          virtual_screen = _app.virtual_screen;
+          virtual_display_mode_override = _app.virtual_display_mode_override;
+          output_name_override = _app.output_name_override;
         }
         const bool wants_frame_limit = config::frame_limiter.enable ||
-                                       _app.frame_generation_enabled ||
-                                       _app.gen1_framegen_fix ||
-                                       _app.gen2_framegen_fix ||
+                                       frame_generation_enabled ||
+                                       gen1_framegen_fix ||
+                                       gen2_framegen_fix ||
                                        (rtss_warmup_limit && *rtss_warmup_limit > 0);
         if (wants_frame_limit) {
           bool warmup_uses_virtual =
-            _app.virtual_screen ||
+            virtual_screen ||
             config::video.virtual_display_mode != config::video_t::virtual_display_mode_e::disabled;
-          if (_app.virtual_display_mode_override) {
-            warmup_uses_virtual = *_app.virtual_display_mode_override != config::video_t::virtual_display_mode_e::disabled;
+          if (virtual_display_mode_override) {
+            warmup_uses_virtual = *virtual_display_mode_override != config::video_t::virtual_display_mode_e::disabled;
           }
-          if (_app.output_name_override && !_app.output_name_override->empty() && !VDISPLAY::is_virtual_display_selection(*_app.output_name_override)) {
+          if (output_name_override && !output_name_override->empty() && !VDISPLAY::is_virtual_display_selection(*output_name_override)) {
             warmup_uses_virtual = false;
           }
           const auto warmup_policy = framegen::make_stream_start_policy({
             .fps = 0,
-            .frame_generation_enabled = _app.frame_generation_enabled,
-            .gen1_framegen_fix = _app.gen1_framegen_fix,
-            .gen2_framegen_fix = _app.gen2_framegen_fix,
-            .lossless_scaling_framegen = _app.lossless_scaling_framegen,
+            .frame_generation_enabled = frame_generation_enabled,
+            .gen1_framegen_fix = gen1_framegen_fix,
+            .gen2_framegen_fix = gen2_framegen_fix,
+            .lossless_scaling_framegen = lossless_scaling_framegen,
             .lossless_rtss_limit = rtss_warmup_limit,
-            .frame_generation_provider = _app.frame_generation_provider,
+            .frame_generation_provider = frame_generation_provider,
             .uses_virtual_display = warmup_uses_virtual,
             .capture_mode = config::video.capture,
             .auto_capture_uses_wgc = platf::dxgi::should_use_wgc_default(),
@@ -2168,11 +2245,17 @@ namespace proc {
           const bool provider_auto = config::frame_limiter.provider.empty() ||
                                      boost::iequals(config::frame_limiter.provider, "auto");
           const bool provider_rtss = boost::iequals(config::frame_limiter.provider, "rtss");
-          const bool should_wait_rtss = platf::rtss_is_configured() && (provider_auto || provider_rtss || _app.frame_generation_enabled || _app.gen1_framegen_fix || _app.gen2_framegen_fix);
+          const bool should_wait_rtss = platf::rtss_is_configured() && (provider_auto || provider_rtss || frame_generation_enabled || gen1_framegen_fix || gen2_framegen_fix);
           if (should_wait_rtss) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
             bool running = false;
             while (std::chrono::steady_clock::now() < deadline) {
+              if (!generation_current()) {
+                // Session torn down or replaced during the warmup wait: bail
+                // early so a successor's own worker isn't held up behind us.
+                _deferred_launch_active = false;
+                return;
+              }
               if (platf::rtss_get_status().process_running) {
                 running = true;
                 break;
@@ -2182,15 +2265,32 @@ namespace proc {
             BOOST_LOG(info) << "RTSS warmup " << (running ? "complete" : "timeout") << " after deferred login.";
           }
         }
-        // terminate() clears _deferred_launch to cancel a pending deferred
-        // launch; don't launch into a torn-down session.
-        if (!_deferred_launch.exchange(false)) {
-          _deferred_launch_active = false;
-          return;
+        // Commit point: revalidate the generation and consume the deferred
+        // flag atomically with respect to terminate()/execute(). A stale
+        // generation means this session was torn down or replaced - and
+        // _deferred_launch, if set, belongs to a successor session whose own
+        // worker must consume it (the generation check MUST therefore
+        // short-circuit before the exchange). A cleared flag means terminate()
+        // cancelled the launch. Either way, don't launch.
+        {
+          std::lock_guard lg {_deferred_mutex};
+          if (_session_generation != worker_generation || !_deferred_launch.exchange(false)) {
+            _deferred_launch_active = false;
+            return;
+          }
         }
-        BOOST_LOG(info) << "User session detected; resuming deferred launch for app '" << _app.name << "'.";
-        if (launch_app_commands() != 0) {
-          _deferred_launch_failed = true;
+        BOOST_LOG(info) << "User session detected; resuming deferred launch for app '" << app_name << "'.";
+        // No teardown from this thread on failure (the fail-guard's terminate()
+        // would race a terminate()/execute() that may own the state by then):
+        // signal running() instead, and only if the failure still belongs to
+        // this session's generation.
+        if (launch_app_commands(false) != 0) {
+          std::lock_guard lg {_deferred_mutex};
+          if (_session_generation == worker_generation) {
+            _deferred_launch_failed = true;
+          } else {
+            BOOST_LOG(warning) << "Deferred launch failed after its session was already torn down; ignoring.";
+          }
         }
         _deferred_launch_active = false;
       }).detach();
@@ -2416,10 +2516,21 @@ namespace proc {
 
   void proc_t::terminate(bool immediate, bool needs_refresh, bool skip_display_revert) {
     std::error_code ec;
+    {
+      // Cancel any in-flight deferred-launch worker BEFORE tearing down the
+      // state it snapshots (see running()): the worker validates this
+      // generation under the same lock before reading _app/_lossless_metadata
+      // and before committing the launch, so it abandons instead of racing us.
+      std::lock_guard lg {_deferred_mutex};
+      ++_session_generation;
+    }
     const bool had_active_app = _app_id > 0;
     placebo = false;
 #ifdef _WIN32
     _deferred_launch = false;
+    // A failure signal from a worker of this session is moot once the session
+    // is torn down; don't let running() consume it later and re-terminate.
+    _deferred_launch_failed = false;
     _lossless_should_start_support = false;
     stop_lossless_scaling_support();
 #endif
