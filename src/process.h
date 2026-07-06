@@ -11,6 +11,7 @@
 // standard includes
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -247,7 +248,16 @@ namespace proc {
     bp::environment release_env();
 
   private:
-    int launch_app_commands(bool stream_lifecycle_lock_held);
+    /**
+     * @brief Run the launched app's prep commands and start it.
+     * @param stream_lifecycle_lock_held Whether the caller already holds the stream
+     *        lifecycle lock; forwarded to terminate() on the failure path.
+     * @param terminate_on_failure Run terminate() before returning on failure.
+     *        The deferred-launch worker passes false: teardown from a detached
+     *        thread would race a terminate()/execute() that may already own the
+     *        state, so it signals running() instead.
+     */
+    int launch_app_commands(bool stream_lifecycle_lock_held, bool terminate_on_failure = true);
 
     std::atomic<int> _app_id {0};
     std::string _app_name;
@@ -261,6 +271,15 @@ namespace proc {
     std::string _active_client_uuid;
 
     mutable std::mutex _apps_mutex;
+
+    // Guards _session_generation. Mutators of session state (execute(),
+    // terminate(), move-assignment) bump the generation under this lock BEFORE
+    // touching _app/_lossless_metadata/_app_id; the deferred-launch worker
+    // validates its captured generation under the same lock before reading any
+    // of that state and before committing the launch, so a matching value
+    // guarantees the state is stable while the lock is held.
+    std::mutex _deferred_mutex;
+    std::uint64_t _session_generation {0};
 
     // If no command associated with _app_id, yet it's still running
     bool placebo {};
