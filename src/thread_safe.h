@@ -362,6 +362,9 @@ namespace safe {
 
       _continue = true;
       _queue.clear();
+      // Don't leak an unconsumed overflow signal into the next broadcast:
+      // it would trigger one spurious recovery IDR on the first frame.
+      _overflowed = false;
     }
 
     [[nodiscard]] bool running() const {
