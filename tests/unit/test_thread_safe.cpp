@@ -42,6 +42,19 @@ TEST(QueueOverflow, DrainToNewestDropsBacklog) {
   EXPECT_TRUE(q.unsafe().empty());
 }
 
+TEST(QueueOverflow, ResetClearsOverflowFlag) {
+  safe::queue_t<int> q(4);
+  for (int i = 0; i < 5; ++i) {
+    q.raise(i);
+  }
+
+  // reset() (start_broadcast) must not leak the previous broadcast's
+  // unconsumed overflow signal into the next one.
+  q.reset();
+  EXPECT_FALSE(q.consume_overflow());
+  EXPECT_TRUE(q.unsafe().empty());
+}
+
 TEST(QueueOverflow, NoOverflowNoFlag) {
   safe::queue_t<int> q(4);
   q.set_overflow_policy(safe::queue_t<int>::overflow_e::drain_to_newest);
