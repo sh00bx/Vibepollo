@@ -308,6 +308,14 @@ namespace proc {
     std::vector<cmd_t>::const_iterator _app_prep_begin;
 
 #ifdef _WIN32
+    // Wait (bounded) for an in-flight deferred-launch worker to finish before
+    // tearing down / rebuilding the launch state it mutates. terminate() and
+    // execute() call this AFTER bumping _session_generation (so no NEW worker
+    // can commit) and WITHOUT holding _deferred_mutex (the worker takes it in
+    // short scopes). A worker already past its commit point runs
+    // launch_app_commands() on the shared members — proceeding concurrently
+    // would race its _app_prep_it walk / _process assignment.
+    void wait_deferred_worker_idle();
     void start_lossless_scaling_support(std::unordered_set<DWORD> baseline_pids, const playnite_launcher::lossless::lossless_scaling_app_metadata &metadata, std::string install_dir_hint_utf8, DWORD root_pid);
     void stop_lossless_scaling_support();
 
