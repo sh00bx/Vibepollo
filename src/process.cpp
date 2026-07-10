@@ -972,6 +972,7 @@ namespace proc {
         ++_session_generation;
       }
 #ifdef _WIN32
+      wait_deferred_worker_idle();   /* committed worker may still be mid-launch */
       stop_lossless_scaling_support();
 #endif
       _app_id = other._app_id;
@@ -1253,18 +1254,33 @@ namespace proc {
       // consume this session's _deferred_launch flag.
       std::lock_guard lg {_deferred_mutex};
       ++_session_generation;
+#ifdef _WIN32
+      // These MUST be cleared under the same lock as the generation bump: a
+      // running() caller that read the stale _deferred_launch==true and then
+      // captured the generation AFTER our bump would spawn a worker whose
+      // snapshot validation passes (its generation matches the current value)
+      // while this thread concurrently mutates _lossless_metadata's strings —
+      // exactly the torn read the fence exists to prevent. Cleared inside the
+      // locked block, any worker spawned after the bump sees
+      // _deferred_launch==false and exits before touching shared state.
+      _deferred_launch = false;
+      // Drop any failure signal left over from a cancelled deferred-launch
+      // worker so it can't terminate this fresh session.
+      _deferred_launch_failed = false;
+#endif
     }
 #ifdef _WIN32
+    // A worker that committed before the bump may still be inside
+    // launch_app_commands() reading _lossless_metadata and the prep state —
+    // drain it before resetting what it reads (the locked block above only
+    // fences workers that had not committed yet).
+    wait_deferred_worker_idle();
+    _lossless_should_start_support = false;
+    _lossless_metadata = {};
     std::optional<std::filesystem::path> resolved_lossless_exe_path;
     std::string resolved_lossless_exe_utf8;
     _virtual_display_active = false;
     _virtual_display_guid = GUID {};
-    _deferred_launch = false;
-    // Drop any failure signal left over from a cancelled deferred-launch worker
-    // so it can't terminate this fresh session.
-    _deferred_launch_failed = false;
-    _lossless_should_start_support = false;
-    _lossless_metadata = {};
 #endif
     if (_app_id == input_only_app_id) {
       terminate(false, false);
@@ -2534,6 +2550,29 @@ namespace proc {
 #endif
   }
 
+#ifdef _WIN32
+  void proc_t::wait_deferred_worker_idle() {
+    if (!_deferred_launch_active) {
+      return;
+    }
+    // A worker past its commit point is inside launch_app_commands(), reading
+    // and writing _app_prep_it/_app.prep_cmds/_env/_process — the generation
+    // bump only stops workers that have NOT committed yet. Wait for it to
+    // drain rather than tearing down state under its feet. Bounded: prep
+    // commands are unbounded by contract, but blocking a teardown forever on
+    // a wedged command is worse than the (pre-existing) race, so cap and warn.
+    BOOST_LOG(info) << "Waiting for the in-flight deferred-launch worker before touching launch state..."sv;
+    const auto deadline = std::chrono::steady_clock::now() + 15s;
+    while (_deferred_launch_active) {
+      if (std::chrono::steady_clock::now() > deadline) {
+        BOOST_LOG(warning) << "Deferred-launch worker still busy after 15s; proceeding anyway."sv;
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+#endif
+
   void proc_t::terminate(bool immediate, bool needs_refresh, bool skip_display_revert) {
     std::error_code ec;
     {
@@ -2543,14 +2582,25 @@ namespace proc {
       // and before committing the launch, so it abandons instead of racing us.
       std::lock_guard lg {_deferred_mutex};
       ++_session_generation;
+#ifdef _WIN32
+      // Cleared under the SAME lock as the bump: cleared after it, a running()
+      // caller could capture the fresh generation while still seeing the stale
+      // flag and spawn a worker whose commit-gate exchange() wins against this
+      // clear — committing into the teardown.
+      _deferred_launch = false;
+      // A failure signal from a worker of this session is moot once the session
+      // is torn down; don't let running() consume it later and re-terminate.
+      _deferred_launch_failed = false;
+#endif
     }
+#ifdef _WIN32
+    // A worker that committed BEFORE the bump may still be mid-launch on the
+    // shared members this teardown is about to walk/reset.
+    wait_deferred_worker_idle();
+#endif
     const bool had_active_app = _app_id > 0;
     placebo = false;
 #ifdef _WIN32
-    _deferred_launch = false;
-    // A failure signal from a worker of this session is moot once the session
-    // is torn down; don't let running() consume it later and re-terminate.
-    _deferred_launch_failed = false;
     _lossless_should_start_support = false;
     stop_lossless_scaling_support();
 #endif
