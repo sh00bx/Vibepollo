@@ -829,7 +829,7 @@ namespace stream {
       deferred_stream_start_state().reset();
     }
 
-    BOOST_LOG(info) << "Stream-start actions applied after user session became available.";
+    BOOST_LOG(info) << "Deferred stream-start actions applied (frame limiter + platform tuning, off the RTSP thread).";
     platf::frame_limiter_streaming_start(deferred->policy);
     platf::streaming_will_start();
     return true;
@@ -2997,14 +2997,18 @@ namespace stream {
             .auto_capture_uses_wgc = platf::dxgi::should_use_wgc_default(),
             .auto_virtual_framegen_limiter = config::frame_limiter.auto_virtual_framegen,
           });
-          const bool defer_stream_start = platf::is_running_as_system() && !user_session_ready();
-          if (defer_stream_start) {
-            deferred_stream_start_t deferred {.policy = policy};
-            defer_stream_start_actions(std::move(deferred));
+          // Always defer these: frame_limiter_streaming_start (RTSS property
+          // writes, ~600ms) + streaming_will_start (NVIDIA Control Panel +
+          // WLAN mode, ~500ms) ran synchronously inside cmd_announce's
+          // session-start path and stalled the RTSP ANNOUNCE response —
+          // measured 2026-07-12 as the client's entire 850-1400ms "RTSP
+          // handshake" stage. The control-server loop applies deferred
+          // actions within one 1-15ms iterate() tick, off the RTSP thread,
+          // with the existing user-session/teardown guards.
+          deferred_stream_start_t deferred {.policy = policy};
+          defer_stream_start_actions(std::move(deferred));
+          if (platf::is_running_as_system() && !user_session_ready()) {
             BOOST_LOG(info) << "Stream-start actions deferred until user session is ready.";
-          } else {
-            platf::frame_limiter_streaming_start(policy);
-            platf::streaming_will_start();
           }
         } else {
           platf::streaming_will_start();
