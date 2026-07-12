@@ -829,9 +829,23 @@ namespace stream {
       deferred_stream_start_state().reset();
     }
 
-    BOOST_LOG(info) << "Deferred stream-start actions applied (frame limiter + platform tuning, off the RTSP thread).";
-    platf::frame_limiter_streaming_start(deferred->policy);
-    platf::streaming_will_start();
+    // Run the actual work on its own thread: it takes ~1-1.3s (RTSS property
+    // writes + NVIDIA Control Panel), and this function is polled from the
+    // control-server loop — applying inline stalled ENet servicing, which the
+    // client saw as a ~700ms "control stream establishment" stage while its
+    // control connect waited for the next iterate(). start/stop are
+    // serialized inside frame_limiter (transition mutex), and the still-needed
+    // re-check keeps a session that ended meanwhile from acquiring overrides
+    // no teardown would restore.
+    std::thread([deferred = std::move(*deferred)]() mutable {
+      if (!stream_start_actions_still_needed()) {
+        BOOST_LOG(debug) << "Stream-start actions skipped; stream ended before the worker ran.";
+        return;
+      }
+      BOOST_LOG(info) << "Deferred stream-start actions applied (frame limiter + platform tuning, off the RTSP thread).";
+      platf::frame_limiter_streaming_start(deferred.policy);
+      platf::streaming_will_start();
+    }).detach();
     return true;
   }
 #endif
