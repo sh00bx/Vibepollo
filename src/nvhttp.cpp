@@ -2741,6 +2741,12 @@ namespace nvhttp {
 
       auto local_endpoint = request->local_endpoint();
 
+      // Status-pool handler: launch() runs config::apply_config_now() on the
+      // blocking pool during every reconnect, wholesale-reassigning the config
+      // globals read below (sunshine_name, server_cmds). Hold the shared apply
+      // gate — same primitive launch itself uses — so we never read mid-apply.
+      auto _apply_gate = config::acquire_apply_read_gate();
+
       pt::ptree tree;
 
       tree.put("root.<xmlattr>.status_code", 200);
@@ -2988,6 +2994,10 @@ namespace nvhttp {
 
     void applist(resp_https_t response, req_https_t request) {
       print_req<SunshineHTTPS>(request);
+
+      // Status-pool handler: see serverinfo — config globals (input, sunshine.
+      // legacy_ordering) are reassigned by launch's apply_config_now().
+      auto _apply_gate = config::acquire_apply_read_gate();
 
       pt::ptree tree;
 
@@ -3385,13 +3395,21 @@ namespace nvhttp {
 
       // The display should be restored in case something fails as there are no other sessions.
       if (no_active_sessions && !launch_session->input_only) {
-        // Mirror resume(): when the preserved virtual display is being reused
-        // (effective resume, allow_display_changes=false), a failed launch must
-        // not revert the display config either — the display outlives the
-        // session on purpose.
+        // Mirror resume()'s display policy in FULL: apply the session display
+        // request only on a normal start (allow_display_changes) or when the
+        // preserved/recreated virtual display needs a refresh. An effective
+        // resume onto a physical display must neither re-apply a display mode
+        // (arming the 6s capture gate eats the latency win this path exists
+        // for) nor — via the fail guard — revert a config it never applied;
+        // and when it DID apply, revert-on-failure follows resume()'s
+        // allow_display_changes semantics.
+        const bool should_apply_display_request =
+          allow_display_changes ||
+          launch_session->virtual_display_recreated_on_demand ||
+          launch_session->virtual_display_needs_resume_apply;
         revert_display_configuration = allow_display_changes;
 
-
+        if (should_apply_display_request) {
 #ifdef _WIN32
         const bool helper_session_available = display_helper_session_available();
         (void) display_helper_integration::disarm_pending_restore(
@@ -3456,6 +3474,17 @@ namespace nvhttp {
         BOOST_LOG(warning) << "Display helper: failed to apply display configuration; continuing with existing display.";
       }
 #endif
+        } else {
+#ifdef _WIN32
+          BOOST_LOG(debug) << "Display helper: skipping launch apply; only deferrals are allowed.";
+#else
+          display_helper_integration::DisplayApplyBuilder noop_builder;
+          noop_builder.set_session(*launch_session);
+          if (!display_helper_integration::apply(noop_builder.build())) {
+            BOOST_LOG(warning) << "Display helper: failed to apply display configuration; continuing with existing display.";
+          }
+#endif
+        }
 
 
         // Probe encoders again before streaming to ensure our chosen

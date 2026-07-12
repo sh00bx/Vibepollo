@@ -92,6 +92,10 @@ namespace platf {
     bool g_prev_rtss_frame_limit_type_set = false;
     std::string g_prev_capture_mode;
     bool g_prev_capture_mode_set = false;
+    // Capture-mode override applied synchronously at session start (see
+    // frame_limiter_streaming_prepare) and not yet claimed by a
+    // frame_limiter_streaming_start.
+    bool g_capture_override_prepared = false;
 
     const char *frame_limiter_owner_to_string(frame_limiter_owner owner) {
       switch (owner) {
@@ -193,6 +197,31 @@ namespace platf {
     }
   }
 
+  void frame_limiter_streaming_prepare(const framegen::stream_start_policy_t &policy) {
+    // The cheap, ordering-critical half of streaming_start: the capture-backend
+    // override MUST be visible before platf::display() reads config::video.capture
+    // (once, at capture creation). streaming_start runs on a deferred worker
+    // behind ~600ms of GPU probes while the client completes the handshake in
+    // ~110ms — applied there, capture init reads the pre-override value and the
+    // ddx/wgc policy is silently dropped for the whole session. This is a few
+    // in-memory writes; call it synchronously from the session-start path.
+    std::scoped_lock lock {g_lifecycle_mutex};
+    if (g_stream_owner_mask != 0 || g_capture_override_prepared) {
+      return;  // overrides already active (reuse) or already prepared
+    }
+    if (policy.requires_virtual_display && policy.effective_wgc_capture && !config::video.capture.starts_with("wgc")) {
+      g_prev_capture_mode = config::video.capture;
+      g_prev_capture_mode_set = true;
+      config::video.capture = "wgc";
+      g_capture_override_prepared = true;
+    } else if (policy.physical_framegen_capture && config::video.capture.empty()) {
+      g_prev_capture_mode = config::video.capture;
+      g_prev_capture_mode_set = true;
+      config::video.capture = "ddx";
+      g_capture_override_prepared = true;
+    }
+  }
+
   void frame_limiter_streaming_start(
     frame_limiter_owner owner,
     const framegen::stream_start_policy_t &policy
@@ -263,7 +292,11 @@ namespace platf {
     }
     g_stream_policy_overrides_active = policy_overrides_enabled;
 
-    if (policy.requires_virtual_display && policy.effective_wgc_capture && !config::video.capture.starts_with("wgc")) {
+    if (g_capture_override_prepared) {
+      // Applied synchronously by frame_limiter_streaming_prepare at session
+      // start; claim it so the final stop restores it.
+      g_capture_override_prepared = false;
+    } else if (policy.requires_virtual_display && policy.effective_wgc_capture && !config::video.capture.starts_with("wgc")) {
       g_prev_capture_mode = config::video.capture;
       g_prev_capture_mode_set = true;
       config::video.capture = "wgc";
@@ -488,6 +521,17 @@ namespace platf {
     std::scoped_lock lock {g_lifecycle_mutex};
     const auto owner_bit = static_cast<std::uint8_t>(owner);
     if ((g_stream_owner_mask & owner_bit) == 0) {
+      // A prepared capture override whose start never ran (stream ended before
+      // the deferred worker claimed it) must still be restored here, or it
+      // leaks into every following session. Only safe once no owner is left.
+      if (g_stream_owner_mask == 0 && g_capture_override_prepared) {
+        if (g_prev_capture_mode_set) {
+          config::video.capture = g_prev_capture_mode;
+          g_prev_capture_mode.clear();
+          g_prev_capture_mode_set = false;
+        }
+        g_capture_override_prepared = false;
+      }
       return;
     }
     g_stream_owner_mask &= static_cast<std::uint8_t>(~owner_bit);
