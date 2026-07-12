@@ -887,17 +887,27 @@ namespace stream {
       deferred_stream_start_state().reset();
     }
 
-    if (!rtsp_stream_start_actions_still_needed()) {
-      BOOST_LOG(debug) << "Stream-start actions skipped because no active RTSP stream remains.";
-      return false;
-    }
-
-    BOOST_LOG(info) << "Stream-start actions applied after user session became available.";
-    platf::frame_limiter_streaming_start(
-      platf::frame_limiter_owner::rtsp,
-      deferred->policy
-    );
-    session::start_shared_platform_if_needed();
+    // Run the actual work on its own thread: it takes ~1-1.3s (RTSS property
+    // writes + NVIDIA Control Panel), and this function is polled from the
+    // control-server loop — applying inline stalled ENet servicing, which the
+    // client saw as a ~700ms "control stream establishment" stage while its
+    // control connect waited for the next iterate(). start/stop are serialized
+    // inside frame_limiter (upstream's g_lifecycle_mutex, which supersedes the
+    // transition mutex this commit originally added), and the still-needed
+    // re-check keeps a session that ended meanwhile from acquiring overrides
+    // no teardown would restore.
+    std::thread([deferred = std::move(*deferred)]() mutable {
+      if (!rtsp_stream_start_actions_still_needed()) {
+        BOOST_LOG(debug) << "Stream-start actions skipped; stream ended before the worker ran.";
+        return;
+      }
+      BOOST_LOG(info) << "Deferred stream-start actions applied (frame limiter + platform tuning, off the RTSP thread).";
+      platf::frame_limiter_streaming_start(
+        platf::frame_limiter_owner::rtsp,
+        deferred.policy
+      );
+      session::start_shared_platform_if_needed();
+    }).detach();
     return true;
   }
 #endif
