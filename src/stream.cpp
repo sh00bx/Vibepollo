@@ -3201,17 +3201,18 @@ namespace stream {
             .auto_virtual_framegen_limiter = config::frame_limiter.virtual_display_limiter_enabled(),
             .virtual_display_refresh_multiplier = config::frame_limiter.fixed_virtual_display_refresh_multiplier(),
           });
-          const bool defer_stream_start = platf::is_running_as_system() && !user_session_ready();
-          if (defer_stream_start) {
-            deferred_stream_start_t deferred {.policy = policy};
-            defer_stream_start_actions(std::move(deferred));
+          // Always defer these: frame_limiter_streaming_start (RTSS property
+          // writes, ~600ms) + streaming_will_start (NVIDIA Control Panel +
+          // WLAN mode, ~500ms) ran synchronously inside cmd_announce's
+          // session-start path and stalled the RTSP ANNOUNCE response —
+          // measured 2026-07-12 as the client's entire 850-1400ms "RTSP
+          // handshake" stage. The control-server loop applies deferred
+          // actions within one 1-15ms iterate() tick, off the RTSP thread,
+          // with the existing user-session/teardown guards.
+          deferred_stream_start_t deferred {.policy = policy};
+          defer_stream_start_actions(std::move(deferred));
+          if (platf::is_running_as_system() && !user_session_ready()) {
             BOOST_LOG(info) << "Stream-start actions deferred until user session is ready.";
-          } else {
-            platf::frame_limiter_streaming_start(
-              platf::frame_limiter_owner::rtsp,
-              policy
-            );
-            session::start_shared_platform_if_needed();
           }
         } else {
           session::start_shared_platform_if_needed();
