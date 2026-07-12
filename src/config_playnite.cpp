@@ -15,12 +15,14 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <filesystem>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -320,9 +322,26 @@ namespace config {
 #endif
 #ifdef _WIN32
     if (config::playnite.auto_sync) {
-      try {
-        platf::playnite::force_sync();
-      } catch (...) {
+      // force_sync() now blocks up to 10s waiting for a fresh library
+      // snapshot (trigger_sync's kManualSyncSnapshotWait), and this apply
+      // path runs inside apply_config_now() on EVERY client launch/reconnect
+      // (per-client runtime overrides) — synchronous, that turns each
+      // connect into a 10s stall whenever Playnite has no snapshot to offer.
+      // Run it detached; skip if a sync is already in flight.
+      static std::atomic<bool> sync_in_flight {false};
+      bool expected = false;
+      if (sync_in_flight.compare_exchange_strong(expected, true)) {
+        try {
+          std::thread([]() {
+            try {
+              platf::playnite::force_sync();
+            } catch (...) {
+            }
+            sync_in_flight.store(false, std::memory_order_release);
+          }).detach();
+        } catch (...) {
+          sync_in_flight.store(false, std::memory_order_release);
+        }
       }
     }
 #endif
