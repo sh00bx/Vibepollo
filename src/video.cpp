@@ -3126,7 +3126,7 @@ namespace video {
         BOOST_LOG(warning) << "HDR requested but display stayed SDR after " << settle_ms << " ms; proceeding with SDR.";
       }
       if (hdr_display && hdr_latch) {
-        *hdr_latch = true;
+        hdr_latch->latched = true;
       }
     }
 
