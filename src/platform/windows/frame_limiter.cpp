@@ -15,6 +15,7 @@
   #include <algorithm>
   #include <array>
   #include <cctype>
+  #include <mutex>
   #include <numeric>
   #include <optional>
   #include <string>
@@ -25,6 +26,12 @@ namespace platf {
   namespace {
 
     frame_limiter_provider g_active_provider = frame_limiter_provider::none;
+    // Serializes streaming_start/streaming_stop. Historically they never
+    // overlapped (start completed synchronously inside the RTSP thread before
+    // a client could trigger teardown); with stream-start actions now applied
+    // from a detached worker, a fast connect->disconnect could interleave stop
+    // with an in-flight start and corrupt the saved-original state.
+    std::mutex g_streaming_transition_mutex;
     unsigned int g_stream_owner_count = 0;
     bool g_nvcp_started = false;
     bool g_gen1_framegen_fix_active = false;
@@ -183,6 +190,7 @@ namespace platf {
   }
 
   void frame_limiter_streaming_start(const framegen::stream_start_policy_t &policy) {
+    std::lock_guard<std::mutex> transition_lock(g_streaming_transition_mutex);
     if (g_stream_owner_count > 0) {
       ++g_stream_owner_count;
       BOOST_LOG(debug) << "Frame limiter start requested while already active; reusing existing overrides (owners=" << g_stream_owner_count << ")";
@@ -438,6 +446,7 @@ namespace platf {
   }
 
   void frame_limiter_streaming_stop(bool keep_rtss_running) {
+    std::lock_guard<std::mutex> transition_lock(g_streaming_transition_mutex);
     if (g_stream_owner_count == 0) {
       return;
     }
