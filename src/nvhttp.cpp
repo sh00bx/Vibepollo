@@ -3193,6 +3193,16 @@ namespace nvhttp {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
 
       bool no_active_sessions = !has_stream_session_activity();
+#ifdef _WIN32
+      // Moonlight reconnects to a paused app via /launch (see the effective-
+      // resume handling below); cancel a scheduled paused-display removal the
+      // same way resume() does, or it fires into the freshly resumed session.
+      // Upstream removed webrtc_stream::cancel_paused_display_cleanup(); the
+      // stream:: entry point now covers the WebRTC path as well.
+      if (no_active_sessions) {
+        stream::cancel_paused_display_cleanup();
+      }
+#endif
       // Runtime overrides are global process state. Do not reapply them while
       // another RTSP/WebRTC session is active, otherwise a second client can mutate
       // active stream limits (e.g. fps/encoding-related settings) mid-session.
@@ -3312,7 +3322,19 @@ namespace nvhttp {
         display_startup_deadline
       );
 #endif
-      const bool allow_display_changes = true;
+      // Moonlight sends /launch (not /resume) when reconnecting to the app it
+      // already has running. Treat that as an effective resume and mirror
+      // resume()'s display policy: with revert-on-disconnect disabled, the
+      // paused-session cleanup deliberately kept the virtual display alive for
+      // exactly this reconnect, but allow_display_changes=true made
+      // prepare_virtual_display_for_session skip its preserve path and destroy
+      // + recreate the display anyway — measured 1.8-5.4s of every reconnect's
+      // launch time. A genuinely fresh launch keeps the old behaviour.
+      const bool same_app_already_running =
+        !is_input_only && current_appid > 0 && current_appid != proc::input_only_app_id &&
+        ((appid > 0 && appid == current_appid) || (!appuuid_str.empty() && appuuid_str == current_app_uuid));
+      const bool allow_display_changes =
+        !same_app_already_running || (config::video.dd.config_revert_on_disconnect && !is_input_only);
       auto launch_session = make_launch_session_from_snapshot(host_audio, is_input_only, args, verified_client, &request_client_identity);
       std::optional<std::string> pending_output_override;
       auto output_override_guard = util::fail_guard([&]() {
@@ -3363,7 +3385,11 @@ namespace nvhttp {
 
       // The display should be restored in case something fails as there are no other sessions.
       if (no_active_sessions && !launch_session->input_only) {
-        revert_display_configuration = true;
+        // Mirror resume(): when the preserved virtual display is being reused
+        // (effective resume, allow_display_changes=false), a failed launch must
+        // not revert the display config either — the display outlives the
+        // session on purpose.
+        revert_display_configuration = allow_display_changes;
 
 
 #ifdef _WIN32
