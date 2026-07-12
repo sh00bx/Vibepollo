@@ -770,11 +770,33 @@ namespace stream {
 #ifdef _WIN32
   struct deferred_stream_start_t {
     framegen::stream_start_policy_t policy;
+    // Stream epoch the payload was created in; teardown bumps the epoch, so a
+    // worker holding a stale payload skips instead of applying overrides on
+    // behalf of a session that already ended (possibly revived by the NEXT
+    // session satisfying the global running-count predicate).
+    uint64_t epoch = 0;
   };
 
   std::mutex &deferred_stream_start_mutex() {
     static std::mutex m;
     return m;
+  }
+
+  // Serializes the deferred worker's start actions (frame limiter + platform
+  // tuning) against last-session teardown's stop actions. The frame limiter has
+  // its own transition mutex, but streaming_will_start()/streaming_will_stop()
+  // mutate unguarded platform globals (WLAN handle, priority class, timer
+  // resolution, DWM MMCSS) — without this lock a disconnect right after connect
+  // can run will_stop concurrently with (or before) the worker's will_start,
+  // leaking system-wide tuning until the next full session cycle.
+  std::mutex &stream_actions_apply_mutex() {
+    static std::mutex m;
+    return m;
+  }
+
+  std::atomic<uint64_t> &stream_actions_epoch() {
+    static std::atomic<uint64_t> e {0};
+    return e;
   }
 
   std::optional<deferred_stream_start_t> &deferred_stream_start_state() {
@@ -836,12 +858,16 @@ namespace stream {
     // writes + NVIDIA Control Panel), and this function is polled from the
     // control-server loop — applying inline stalled ENet servicing, which the
     // client saw as a ~700ms "control stream establishment" stage while its
-    // control connect waited for the next iterate(). start/stop are
-    // serialized inside frame_limiter (transition mutex), and the still-needed
-    // re-check keeps a session that ended meanwhile from acquiring overrides
-    // no teardown would restore.
+    // control connect waited for the next iterate(). The apply mutex + epoch
+    // check (validated UNDER the lock) order the whole start block against
+    // last-session teardown: either we complete before teardown's stop (which
+    // then restores everything we applied), or the bumped epoch tells us our
+    // session is gone and we skip — will_start/will_stop can no longer invert,
+    // and a stale payload can't be revived by the next session's running count.
     std::thread([deferred = std::move(*deferred)]() mutable {
-      if (!stream_start_actions_still_needed()) {
+      std::lock_guard<std::mutex> apply_lock(stream_actions_apply_mutex());
+      if (deferred.epoch != stream_actions_epoch().load(std::memory_order_acquire) ||
+          !stream_start_actions_still_needed()) {
         BOOST_LOG(debug) << "Stream-start actions skipped; stream ended before the worker ran.";
         return;
       }
@@ -2897,11 +2923,22 @@ namespace stream {
 
         // Restore any Windows-only integrations first
 #ifdef _WIN32
-        VDISPLAY::restorePhysicalHdrProfiles();
-        platf::rtss_set_sync_limiter_override(std::nullopt);
-        platf::frame_limiter_streaming_stop(is_paused);
-#endif
+        {
+          // Bump the epoch and run the stop actions under the apply mutex: a
+          // deferred worker either finished its start before us (we restore
+          // what it applied) or sees the bumped epoch and skips. Worst case
+          // this join() waits ~1.3s for an in-flight start — correctness over
+          // teardown speed in the fast connect->disconnect corner.
+          std::lock_guard<std::mutex> apply_lock(stream_actions_apply_mutex());
+          stream_actions_epoch().fetch_add(1, std::memory_order_acq_rel);
+          VDISPLAY::restorePhysicalHdrProfiles();
+          platf::rtss_set_sync_limiter_override(std::nullopt);
+          platf::frame_limiter_streaming_stop(is_paused);
+          platf::streaming_will_stop();
+        }
+#else
         platf::streaming_will_stop();
+#endif
       }
 
       BOOST_LOG(info) << "Session ended"sv;
@@ -3033,7 +3070,14 @@ namespace stream {
           // handshake" stage. The control-server loop applies deferred
           // actions within one 1-15ms iterate() tick, off the RTSP thread,
           // with the existing user-session/teardown guards.
-          deferred_stream_start_t deferred {.policy = policy};
+          // Ordering-critical config writes (capture backend) go in
+          // synchronously — capture init reads config::video.capture long
+          // before the deferred worker gets past its GPU probes.
+          platf::frame_limiter_streaming_prepare(policy);
+          deferred_stream_start_t deferred {
+            .policy = policy,
+            .epoch = stream_actions_epoch().load(std::memory_order_acquire),
+          };
           defer_stream_start_actions(std::move(deferred));
           if (platf::is_running_as_system() && !user_session_ready()) {
             BOOST_LOG(info) << "Stream-start actions deferred until user session is ready.";

@@ -1236,8 +1236,11 @@ namespace proc {
   void proc_t::launch_input_only() {
     _app_id = input_only_app_id;
     _app_name = "Remote Input";
-    _app.uuid = REMOTE_INPUT_UUID;
-    _app.terminate_on_pause = true;
+    {
+      std::scoped_lock lk(_apps_mutex);
+      _app.uuid = REMOTE_INPUT_UUID;
+      _app.terminate_on_pause = true;
+    }
     allow_client_commands = false;
     placebo = true;
 
@@ -1246,6 +1249,7 @@ namespace proc {
 #endif
   }
   int proc_t::execute(const ctx_t &app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    std::uint64_t my_session_generation = 0;
     {
       // Invalidate any in-flight deferred-launch worker from a previous session
       // BEFORE mutating the state it snapshots (see running()): the worker
@@ -1253,7 +1257,7 @@ namespace proc {
       // here, a stale worker can no longer read _app/_lossless_metadata or
       // consume this session's _deferred_launch flag.
       std::lock_guard lg {_deferred_mutex};
-      ++_session_generation;
+      my_session_generation = ++_session_generation;
 #ifdef _WIN32
       // These MUST be cleared under the same lock as the generation bump: a
       // running() caller that read the stale _deferred_launch==true and then
@@ -1291,7 +1295,10 @@ namespace proc {
       terminate(false, false, skip_display_revert);
     }
 
-    _app = app;
+    {
+      std::scoped_lock lk(_apps_mutex);
+      _app = app;
+    }
     _app_id = util::from_view(app.id);
 #ifdef _WIN32
     // A replacement app owns the streaming display configuration. Any
@@ -1810,6 +1817,16 @@ namespace proc {
     };
 
     if (platf::is_running_as_system() && requires_user_session() && !user_session_ready()) {
+      // Set the flag under the same lock as the generation (the invariant the
+      // clears above rely on), and only if no concurrent terminate()/execute()
+      // superseded this session since our bump — an unlocked store landing
+      // after terminate()'s locked clear would resurrect the flag and ghost-
+      // launch the already-torn-down app at the current generation.
+      std::lock_guard lg {_deferred_mutex};
+      if (_session_generation != my_session_generation) {
+        BOOST_LOG(info) << "Deferred-launch flag not set; session superseded during execute().";
+        return 0;
+      }
       BOOST_LOG(info) << "No active user session; deferring app launch until sign-in.";
       _deferred_launch = true;
       return 0;
@@ -2760,7 +2777,10 @@ namespace proc {
     _app_launch_time = {};
     _app_id = -1;
     _app_name.clear();
-    _app = {};
+    {
+      std::scoped_lock lk(_apps_mutex);
+      _app = {};
+    }
     display_name.clear();
     initial_display.clear();
     _launch_session.reset();
@@ -2833,6 +2853,10 @@ namespace proc {
   }
 
   std::string proc_t::get_running_app_uuid() {
+    // Called from the status route pool while execute()/terminate() reassign
+    // _app on the blocking pool — same lock the other cross-thread _app
+    // readers (session snapshot getter) already take.
+    std::scoped_lock lk(_apps_mutex);
     return _app.uuid;
   }
 

@@ -35,6 +35,10 @@ namespace platf {
     rtss_status_t rtss;
   };
 
+  // Synchronous, cheap session-start half: applies the capture-backend override
+  // before capture init can read config::video.capture (the slow RTSS/NVCP work
+  // stays in frame_limiter_streaming_start on the deferred worker).
+  void frame_limiter_streaming_prepare(const framegen::stream_start_policy_t &policy);
   void frame_limiter_streaming_start(const framegen::stream_start_policy_t &policy);
   void frame_limiter_streaming_stop(bool keep_rtss_running = false);
   void frame_limiter_streaming_refresh();

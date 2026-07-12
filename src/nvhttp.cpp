@@ -2220,6 +2220,12 @@ namespace nvhttp {
 
       auto local_endpoint = request->local_endpoint();
 
+      // Status-pool handler: launch() runs config::apply_config_now() on the
+      // blocking pool during every reconnect, wholesale-reassigning the config
+      // globals read below (sunshine_name, server_cmds). Hold the shared apply
+      // gate — same primitive launch itself uses — so we never read mid-apply.
+      auto _apply_gate = config::acquire_apply_read_gate();
+
       pt::ptree tree;
 
       tree.put("root.<xmlattr>.status_code", 200);
@@ -2468,6 +2474,10 @@ namespace nvhttp {
 
     void applist(resp_https_t response, req_https_t request) {
       print_req<SunshineHTTPS>(request);
+
+      // Status-pool handler: see serverinfo — config globals (input, sunshine.
+      // legacy_ordering) are reassigned by launch's apply_config_now().
+      auto _apply_gate = config::acquire_apply_read_gate();
 
       pt::ptree tree;
 
@@ -2791,73 +2801,90 @@ namespace nvhttp {
 
       // The display should be restored in case something fails as there are no other sessions.
       if (no_active_sessions && !launch_session->input_only) {
-        // Mirror resume(): when the preserved virtual display is being reused
-        // (effective resume, allow_display_changes=false), a failed launch must
-        // not revert the display config either — the display outlives the
-        // session on purpose.
+        // Mirror resume()'s display policy in FULL: apply the session display
+        // request only on a normal start (allow_display_changes) or when the
+        // preserved/recreated virtual display needs a refresh. An effective
+        // resume onto a physical display must neither re-apply a display mode
+        // (arming the 6s capture gate eats the latency win this path exists
+        // for) nor — via the fail guard — revert a config it never applied;
+        // and when it DID apply, revert-on-failure follows resume()'s
+        // allow_display_changes semantics.
+        const bool should_apply_display_request =
+          allow_display_changes ||
+          launch_session->virtual_display_recreated_on_demand ||
+          launch_session->virtual_display_needs_resume_apply;
         revert_display_configuration = allow_display_changes;
 
-
+        if (should_apply_display_request) {
 #ifdef _WIN32
-        HANDLE user_token = platf::retrieve_users_token(false);
-        const bool helper_session_available = (user_token != nullptr);
-        if (user_token) {
-          CloseHandle(user_token);
-        }
+          HANDLE user_token = platf::retrieve_users_token(false);
+          const bool helper_session_available = (user_token != nullptr);
+          if (user_token) {
+            CloseHandle(user_token);
+          }
 
+          auto request = display_helper_integration::helpers::build_request_from_session(config::video, *launch_session);
+          if (!request) {
+            BOOST_LOG(warning) << "Display helper: failed to build display configuration request; continuing with existing display.";
+          }
 
-        auto request = display_helper_integration::helpers::build_request_from_session(config::video, *launch_session);
-        if (!request) {
-          BOOST_LOG(warning) << "Display helper: failed to build display configuration request; continuing with existing display.";
-        }
+          if (request) {
+            const bool applied = display_helper_integration::apply(*request);
+            launch_session->display_config_preapplied = applied;
+            if (!applied) {
+              if (helper_session_available) {
+                BOOST_LOG(warning) << "Display helper: failed to apply display configuration; continuing with existing display.";
+              }
+            } else {
+              auto gate_promise = std::make_shared<std::promise<rtsp_stream::launch_session_t::display_helper_gate_status_e>>();
+              launch_session->display_helper_gate = gate_promise->get_future().share();
+              BOOST_LOG(debug) << "Display helper: gating capture start on helper verification (non-blocking session start).";
+              std::thread([gate_promise]() {
+                constexpr auto kVerificationTimeout = std::chrono::seconds(6);
+                const auto status = display_helper_integration::wait_for_apply_verification(kVerificationTimeout);
+                rtsp_stream::launch_session_t::display_helper_gate_status_e gate_status =
+                  rtsp_stream::launch_session_t::display_helper_gate_status_e::proceed_gaveup;
+                if (status == display_helper_integration::ApplyVerificationStatus::Verified) {
+                  gate_status = rtsp_stream::launch_session_t::display_helper_gate_status_e::proceed;
+                } else if (status == display_helper_integration::ApplyVerificationStatus::Failed) {
+                  gate_status = rtsp_stream::launch_session_t::display_helper_gate_status_e::abort_failed;
+                }
+                try {
+                  gate_promise->set_value(gate_status);
+                } catch (...) {
+                  // best-effort: ignore double-satisfaction
+                }
+              }).detach();
+            }
+          }
 
-
-      if (request) {
-        const bool applied = display_helper_integration::apply(*request);
-        launch_session->display_config_preapplied = applied;
-        if (!applied) {
-          if (helper_session_available) {
+          // Apply a per-client HDR profile to physical displays (virtual displays are handled at creation time).
+          if (!launch_session->virtual_display) {
+            const auto active_output = config::get_active_output_name();
+            VDISPLAY::applyHdrProfileToOutput(
+              launch_session->client_name.c_str(),
+              launch_session->hdr_profile ? launch_session->hdr_profile->c_str() : nullptr,
+              active_output.empty() ? nullptr : active_output.c_str()
+            );
+          }
+#else
+          display_helper_integration::DisplayApplyBuilder noop_builder;
+          noop_builder.set_session(*launch_session);
+          if (!display_helper_integration::apply(noop_builder.build())) {
             BOOST_LOG(warning) << "Display helper: failed to apply display configuration; continuing with existing display.";
           }
-        } else {
-          auto gate_promise = std::make_shared<std::promise<rtsp_stream::launch_session_t::display_helper_gate_status_e>>();
-          launch_session->display_helper_gate = gate_promise->get_future().share();
-          BOOST_LOG(debug) << "Display helper: gating capture start on helper verification (non-blocking session start).";
-          std::thread([gate_promise]() {
-            constexpr auto kVerificationTimeout = std::chrono::seconds(6);
-            const auto status = display_helper_integration::wait_for_apply_verification(kVerificationTimeout);
-            rtsp_stream::launch_session_t::display_helper_gate_status_e gate_status =
-              rtsp_stream::launch_session_t::display_helper_gate_status_e::proceed_gaveup;
-            if (status == display_helper_integration::ApplyVerificationStatus::Verified) {
-              gate_status = rtsp_stream::launch_session_t::display_helper_gate_status_e::proceed;
-            } else if (status == display_helper_integration::ApplyVerificationStatus::Failed) {
-              gate_status = rtsp_stream::launch_session_t::display_helper_gate_status_e::abort_failed;
-            }
-            try {
-              gate_promise->set_value(gate_status);
-            } catch (...) {
-              // best-effort: ignore double-satisfaction
-            }
-          }).detach();
-        }
-      }
-
-        // Apply a per-client HDR profile to physical displays (virtual displays are handled at creation time).
-        if (!launch_session->virtual_display) {
-          const auto active_output = config::get_active_output_name();
-          VDISPLAY::applyHdrProfileToOutput(
-            launch_session->client_name.c_str(),
-            launch_session->hdr_profile ? launch_session->hdr_profile->c_str() : nullptr,
-            active_output.empty() ? nullptr : active_output.c_str()
-          );
-        }
-#else
-      display_helper_integration::DisplayApplyBuilder noop_builder;
-      noop_builder.set_session(*launch_session);
-      if (!display_helper_integration::apply(noop_builder.build())) {
-        BOOST_LOG(warning) << "Display helper: failed to apply display configuration; continuing with existing display.";
-      }
 #endif
+        } else {
+#ifdef _WIN32
+          BOOST_LOG(debug) << "Display helper: skipping launch apply; only deferrals are allowed.";
+#else
+          display_helper_integration::DisplayApplyBuilder noop_builder;
+          noop_builder.set_session(*launch_session);
+          if (!display_helper_integration::apply(noop_builder.build())) {
+            BOOST_LOG(warning) << "Display helper: failed to apply display configuration; continuing with existing display.";
+          }
+#endif
+        }
 
 
         // Probe encoders again before streaming to ensure our chosen
