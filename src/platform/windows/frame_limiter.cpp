@@ -93,8 +93,14 @@ namespace platf {
     }
 
     bool has_amd_gpu() {
+      // Only count AMD adapters that could plausibly be the render GPU for games.
+      // Integrated Ryzen graphics (a few hundred MiB of dedicated VRAM) would
+      // otherwise veto the FG-aware "nvidia reflex" RTSS limiter on
+      // NVIDIA-dGPU + AMD-iGPU systems, silently downgrading frame-generation
+      // sessions to a present-blocking limiter that stutters with DLSS-G.
+      constexpr std::uint64_t k_min_dgpu_vram = 2ull * 1024 * 1024 * 1024;
       for (const auto &gpu : enumerate_gpus()) {
-        if (gpu.vendor_id == 0x1002 || gpu.vendor_id == 0x1022) {
+        if ((gpu.vendor_id == 0x1002 || gpu.vendor_id == 0x1022) && gpu.dedicated_video_memory >= k_min_dgpu_vram) {
           return true;
         }
       }
