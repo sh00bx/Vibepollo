@@ -39,6 +39,7 @@
   #include <shobjidl.h>
 
   #include "src/display_helper_integration.h"
+  #include "src/platform/windows/ds5_bridge/ds5_bridge.h"
   #include "src/platform/windows/frame_limiter_nvcp.h"
   #include "src/platform/windows/misc.h"
   #include "src/platform/windows/playnite_integration.h"
@@ -753,6 +754,10 @@ int main(int argc, char *argv[]) {
 #ifdef _WIN32
   // Start Playnite integration (IPC + handlers)
   auto playnite_integration_guard = platf::playnite::start();
+
+  // Supervise the native in-process DS5 bridge provider.
+  // No-op unless config::ds5b.native_bridge is set.
+  ds5_bridge_provider::start_watchdog();
 #endif
 
   std::unique_ptr<platf::deinit_t> mDNS;
@@ -812,6 +817,10 @@ int main(int argc, char *argv[]) {
   rtspThread.join();
 
 #ifdef _WIN32
+  // Stop the native DS5 bridge provider supervisor (and its usbip device)
+  // before CRT teardown, for the same reason as the display-helper watchdog.
+  ds5_bridge_provider::stop_watchdog();
+
   // Full process shutdown cannot leave the paused-session watchdog running.
   // If it survives past main(), CRT teardown can fast-fail while the helper
   // watchdog thread is still unwinding.

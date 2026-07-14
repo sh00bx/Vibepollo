@@ -1,0 +1,71 @@
+/**
+ * @file src/platform/windows/ds5_bridge/bridge_host.h
+ * @brief Host-side CTM-Bridge server: the license-clean in-process replacement
+ *        for the external ctm-usbip.exe agent.
+ *
+ * Speaks the CTMB protocol Aurora's GPL HID-passthrough client already talks:
+ *   - control plane on <port> (default 48054): UDP discovery
+ *     (CTM_DISCOVER_V1 -> CTM_AGENT_V1 port=<port>) + a TCP line protocol
+ *     (BRIDGE_START <kind> <dport> <busid> / BRIDGE_STOP <busid>);
+ *   - one data-plane session per plugged controller on its own <dport>
+ *     (ENet/UDP preferred, TCP fallback), carrying HELLO / HOST_CONFIG /
+ *     INPUT_REPORT / OUTPUT_REPORT / FEATURE_* messages.
+ *
+ * Each session bridges the TV's real DualSense to a virtual USB DualSense
+ * presented to the game by usbip_ds5_device (loopback usbip-win2).
+ *
+ * Phase 1 supports DS5 only (kind "ds5"); other kinds are rejected so the CTM
+ * agent can still handle them if configured. HD-haptic audio (0x36) is Phase 2.
+ */
+#pragma once
+
+#include <atomic>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#include "src/platform/windows/ds5_bridge/usbip_ds5_device.h"
+
+namespace platf::ds5_bridge {
+
+  class bridge_session;
+
+  class bridge_host {
+  public:
+    // Both special members are defined out-of-line (in the .cpp, where
+    // bridge_session is complete) so no TU that merely holds a bridge_host has
+    // to instantiate std::unique_ptr<bridge_session>'s destructor.
+    bridge_host();
+    ~bridge_host();
+
+    bridge_host(const bridge_host &) = delete;
+    bridge_host &operator=(const bridge_host &) = delete;
+
+    /// Start the usbip device + the control plane on @p port. Idempotent.
+    bool start(int port);
+    /// Stop all sessions, the control plane and the usbip device.
+    void stop();
+    bool is_running() const { return running_.load(); }
+
+  private:
+    void control_loop();
+    std::string handle_command(const std::string &line);
+    void stop_session(const std::string &busid);
+
+    std::atomic<bool> running_ {false};
+    std::atomic<bool> stop_ {false};
+    int port_ {48054};
+
+    usbip_ds5_device usbip_;
+
+    uintptr_t tcp_listen_ {~uintptr_t(0)};
+    uintptr_t udp_sock_ {~uintptr_t(0)};
+    std::thread control_thread_;
+
+    std::mutex sessions_mtx_;
+    std::map<std::string, std::unique_ptr<bridge_session>> sessions_;
+  };
+
+}  // namespace platf::ds5_bridge

@@ -151,6 +151,27 @@ const platform = computed(() =>
       v-model="config.enable_input_only_mode"
       class="mb-3"
     />
+
+    <template v-if="platform === 'windows'">
+      <hr />
+
+      <h3 class="text-sm font-medium">{{ $t('config.ds5_bridge_title') }}</h3>
+      <p class="text-[11px] opacity-70 mb-3">{{ $t('config.ds5_bridge_intro') }}</p>
+
+      <ConfigFieldRenderer
+        setting-key="ds5_native_bridge"
+        v-model="config.ds5_native_bridge"
+        class="mb-3"
+      />
+
+      <template v-if="config.ds5_native_bridge">
+        <ConfigFieldRenderer
+          setting-key="ds5_bridge_port"
+          v-model="config.ds5_bridge_port"
+          class="mb-3"
+        />
+      </template>
+    </template>
   </div>
 </template>
 

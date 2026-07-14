@@ -384,6 +384,19 @@ namespace config {
     bool legacy_auto_detect {false};
   };
 
+  // Windows-only: native in-process DS5 bridge provider — a license-clean,
+  // in-tree controller passthrough. Presents a virtual USB DualSense via the
+  // MS-signed usbip-win2 vhci and speaks the CTM-Bridge protocol Aurora's
+  // HID-passthrough client already talks.
+  struct ds5b_t {
+    // Master switch. When true, Vibepollo runs the native DS5 bridge provider
+    // in-process.
+    bool native_bridge {false};
+
+    // Control/discovery port for the provider (TCP+UDP).
+    int port {48054};
+  };
+
   namespace flag {
     enum flag_e : std::size_t {
       PIN_STDIN = 0,  ///< Read PIN from stdin instead of http
@@ -477,6 +490,10 @@ namespace config {
   extern frame_limiter_t frame_limiter;
   extern rtss_t rtss;
   extern lossless_scaling_t lossless_scaling;
+  extern ds5b_t ds5b;
+  // Guards writes to config::ds5b (apply_config) against reads from the native
+  // DS5 bridge supervisor thread.
+  extern std::mutex ds5b_mutex;
   extern sunshine_t sunshine;
 
   int parse(int argc, char *argv[]);

@@ -1038,6 +1038,15 @@ namespace config {
     false  // legacy_auto_detect
   };
 
+  // Windows-only: native DS5 bridge provider defaults (disabled by default —
+  // opt-in).
+  ds5b_t ds5b {
+    false,  // native_bridge
+    48054  // port
+  };
+
+  std::mutex ds5b_mutex;
+
   namespace {
     int default_min_log_level() {
       if (version_compare::is_prerelease_channel(PROJECT_VERSION)) {
@@ -1991,6 +2000,14 @@ namespace config {
     }
     string_f(vars, "lossless_scaling_path", lossless_scaling.exe_path);
     bool_f(vars, "lossless_scaling_legacy_auto_detect", lossless_scaling.legacy_auto_detect);
+
+    // Windows-only: native DS5 bridge provider. Guarded — the native provider
+    // supervisor thread reads these every tick.
+    {
+      std::lock_guard<std::mutex> ds5b_lk(ds5b_mutex);
+      bool_f(vars, "ds5_native_bridge", ds5b.native_bridge);
+      int_between_f(vars, "ds5_bridge_port", ds5b.port, {1, 65535});
+    }
 
     path_f(vars, "pkey", nvhttp.pkey);
     path_f(vars, "cert", nvhttp.cert);

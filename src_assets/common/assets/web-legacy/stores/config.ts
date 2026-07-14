@@ -260,6 +260,14 @@ const defaultGroups = [
     },
   },
   {
+    id: 'ds5',
+    name: 'DS5 Bridge',
+    options: {
+      ds5_native_bridge: false,
+      ds5_bridge_port: 48054,
+    },
+  },
+  {
     id: 'nv',
     name: 'NVIDIA NVENC Encoder',
     options: {
