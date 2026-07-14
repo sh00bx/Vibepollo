@@ -34,6 +34,9 @@ namespace platf {
     std::mutex g_streaming_transition_mutex;
     unsigned int g_stream_owner_count = 0;
     bool g_nvcp_started = false;
+    bool g_rtss_cleanup_needed = false;
+    bool g_nvcp_force_vsync_off = false;
+    bool g_nvcp_apply_smooth_motion = false;
     bool g_gen1_framegen_fix_active = false;
     bool g_gen2_framegen_fix_active = false;
     bool g_stream_policy_overrides_active = false;
@@ -51,6 +54,9 @@ namespace platf {
     bool g_capture_override_prepared = false;
     int g_last_rtss_limit_value = 0;
     int g_last_rtss_limit_denominator = 1;
+    // Integer limit for the NVCP fallback when an RTSS refresh finds the hooks
+    // stalled (upstream 953ccad2); our RTSS path itself keeps the fractional pair.
+    int g_last_effective_limit = 0;
 
     struct rtss_limit_t {
       int value = 0;
@@ -235,6 +241,7 @@ namespace platf {
 
     g_active_provider = frame_limiter_provider::none;
     g_nvcp_started = false;
+    g_rtss_cleanup_needed = false;
     g_gen1_framegen_fix_active = policy.capture_fix_enabled;
     g_gen2_framegen_fix_active = false;
 
@@ -300,6 +307,8 @@ namespace platf {
     }
 
     const bool want_nv_vsync_override = (config::frame_limiter.disable_vsync || policy_overrides_enabled) && nvidia_gpu_present && nvcp_ready;
+    g_nvcp_force_vsync_off = want_nv_vsync_override;
+    g_nvcp_apply_smooth_motion = want_smooth_motion;
 
     bool nvcp_already_invoked = false;
     const bool using_lossless_rtss_limit = policy.lossless_rtss_limit && *policy.lossless_rtss_limit > 0;
@@ -324,6 +333,7 @@ namespace platf {
     }
     g_last_rtss_limit_value = rtss_limit_value;
     g_last_rtss_limit_denominator = rtss_limit_denominator;
+    g_last_effective_limit = effective_limit;
 
     if (using_stream_fps_limit && config::frame_limiter.fps_offset > 0) {
       BOOST_LOG(info) << "Frame limiter FPS offset applied: requested=" << policy.fps
@@ -356,6 +366,11 @@ namespace platf {
         case frame_limiter_provider::none:
           break;
         case frame_limiter_provider::auto_detect:
+          order = {frame_limiter_provider::rtss, frame_limiter_provider::nvidia_control_panel};
+          break;
+        case frame_limiter_provider::rtss:
+          // Preserve an explicit RTSS preference, but allow the NVIDIA driver
+          // to rescue stream startup when RTSS is installed but unresponsive.
           order = {frame_limiter_provider::rtss, frame_limiter_provider::nvidia_control_panel};
           break;
         default:
@@ -391,6 +406,7 @@ namespace platf {
             break;
           }
         } else if (provider == frame_limiter_provider::rtss) {
+          g_rtss_cleanup_needed = true;
           bool ok = rtss_streaming_start(rtss_limit_value, rtss_limit_denominator);
           if (ok) {
             g_active_provider = frame_limiter_provider::rtss;
@@ -402,7 +418,12 @@ namespace platf {
 
         BOOST_LOG(warning) << "Frame limiter provider '" << frame_limiter_provider_to_string(provider)
                            << "' failed to apply limit";
-        if (configured != frame_limiter_provider::auto_detect) {
+        const bool allow_stall_fallback = configured == frame_limiter_provider::rtss &&
+                                          provider == frame_limiter_provider::rtss &&
+                                          rtss_hooks_stalled();
+        if (allow_stall_fallback) {
+          BOOST_LOG(warning) << "RTSS is stalled; falling back to the NVIDIA driver frame limiter";
+        } else if (configured != frame_limiter_provider::auto_detect) {
           break;
         }
       }
@@ -527,7 +548,7 @@ namespace platf {
       g_prev_capture_mode_set = false;
     }
 
-    if (g_active_provider == frame_limiter_provider::rtss) {
+    if (g_rtss_cleanup_needed) {
       rtss_streaming_stop(keep_rtss_running);
     }
 
@@ -539,6 +560,10 @@ namespace platf {
     g_nvcp_started = false;
     g_last_rtss_limit_value = 0;
     g_last_rtss_limit_denominator = 1;
+    g_rtss_cleanup_needed = false;
+    g_nvcp_force_vsync_off = false;
+    g_nvcp_apply_smooth_motion = false;
+    g_last_effective_limit = 0;
   }
 
   void frame_limiter_streaming_refresh() {
@@ -552,6 +577,26 @@ namespace platf {
 
     if (rtss_streaming_refresh(g_last_rtss_limit_value, g_last_rtss_limit_denominator)) {
       BOOST_LOG(info) << "Frame limiter provider 'rtss' refreshed";
+    } else if (rtss_hooks_stalled() && frame_limiter_nvcp::is_available()) {
+      BOOST_LOG(warning) << "RTSS stalled while refreshing the frame limit; falling back to the NVIDIA driver";
+      if (g_nvcp_started) {
+        frame_limiter_nvcp::streaming_stop();
+        g_nvcp_started = false;
+      }
+      if (frame_limiter_nvcp::streaming_start(
+            g_last_effective_limit,
+            true,
+            false,
+            g_nvcp_force_vsync_off,
+            false,
+            g_nvcp_apply_smooth_motion
+          )) {
+        g_active_provider = frame_limiter_provider::nvidia_control_panel;
+        g_nvcp_started = true;
+        BOOST_LOG(info) << "Frame limiter provider 'nvidia-control-panel' applied after RTSS refresh failure";
+      } else {
+        BOOST_LOG(warning) << "NVIDIA driver frame limiter failed after RTSS refresh failure";
+      }
     }
   }
 
