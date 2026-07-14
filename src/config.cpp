@@ -962,6 +962,15 @@ namespace config {
 
   std::mutex ctm_mutex;
 
+  // Windows-only: native DS5 bridge provider defaults (disabled by default —
+  // opt-in; CTM remains the default provider).
+  ds5b_t ds5b {
+    false,  // native_bridge
+    48054  // port
+  };
+
+  std::mutex ds5b_mutex;
+
   namespace {
     int default_min_log_level() {
       if (version_compare::is_prerelease_channel(PROJECT_VERSION)) {
@@ -1795,6 +1804,14 @@ namespace config {
       string_f(vars, "ctm_path", ctm.exe_path);
       int_between_f(vars, "ctm_port", ctm.port, {1, 65535});
       bool_f(vars, "ctm_enet", ctm.enet);
+    }
+
+    // Windows-only: native DS5 bridge provider. Guarded — the native provider
+    // supervisor thread reads these every tick.
+    {
+      std::lock_guard<std::mutex> ds5b_lk(ds5b_mutex);
+      bool_f(vars, "ds5_native_bridge", ds5b.native_bridge);
+      int_between_f(vars, "ds5_bridge_port", ds5b.port, {1, 65535});
     }
 
     path_f(vars, "pkey", nvhttp.pkey);

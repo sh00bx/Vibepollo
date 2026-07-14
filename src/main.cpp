@@ -35,6 +35,7 @@
 
   #include "src/display_helper_integration.h"
   #include "src/platform/windows/ctm_bridge.h"
+  #include "src/platform/windows/ds5_bridge/ds5_bridge.h"
   #include "src/platform/windows/frame_limiter_nvcp.h"
   #include "src/platform/windows/misc.h"
   #include "src/platform/windows/playnite_integration.h"
@@ -652,6 +653,10 @@ int main(int argc, char *argv[]) {
   // Supervise the CTM bridge agent (ctm-usbip.exe) for the service lifetime so it
   // no longer needs a separate autostart. No-op unless config::ctm.enable is set.
   ctm_bridge::start_watchdog();
+
+  // Supervise the native in-process DS5 bridge provider (license-clean CTM
+  // replacement). No-op unless config::ds5b.native_bridge is set and CTM is off.
+  ds5_bridge_provider::start_watchdog();
 #endif
 
   std::unique_ptr<platf::deinit_t> mDNS;
@@ -694,6 +699,9 @@ int main(int argc, char *argv[]) {
   // Stop the CTM bridge supervisor (and terminate the agent) before CRT teardown,
   // for the same reason as the display-helper watchdog below.
   ctm_bridge::stop_watchdog();
+
+  // Stop the native DS5 bridge provider supervisor (and its usbip device) too.
+  ds5_bridge_provider::stop_watchdog();
 
   // Full process shutdown cannot leave the paused-session watchdog running.
   // If it survives past main(), CRT teardown can fast-fail while the helper

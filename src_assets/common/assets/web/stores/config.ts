@@ -266,6 +266,8 @@ const defaultGroups = [
       ctm_path: '',
       ctm_port: 48054,
       ctm_enet: true,
+      ds5_native_bridge: false,
+      ds5_bridge_port: 48054,
     },
   },
   {

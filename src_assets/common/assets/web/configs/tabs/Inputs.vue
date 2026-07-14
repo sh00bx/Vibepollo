@@ -165,6 +165,28 @@ const platform = computed(() =>
         <ConfigFieldRenderer setting-key="ctm_port" v-model="config.ctm_port" class="mb-3" />
         <ConfigFieldRenderer setting-key="ctm_enet" v-model="config.ctm_enet" class="mb-3" />
       </template>
+
+      <hr />
+
+      <h3 class="text-sm font-medium">{{ $t('config.ds5_bridge_title') }}</h3>
+      <p class="text-[11px] opacity-70 mb-3">{{ $t('config.ds5_bridge_intro') }}</p>
+
+      <ConfigFieldRenderer
+        setting-key="ds5_native_bridge"
+        v-model="config.ds5_native_bridge"
+        class="mb-3"
+      />
+
+      <template v-if="config.ds5_native_bridge">
+        <p v-if="config.ctm_enable" class="text-[11px] text-amber-500 mb-3">
+          {{ $t('config.ds5_bridge_conflict') }}
+        </p>
+        <ConfigFieldRenderer
+          setting-key="ds5_bridge_port"
+          v-model="config.ds5_bridge_port"
+          class="mb-3"
+        />
+      </template>
     </template>
   </div>
 </template>

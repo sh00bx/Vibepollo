@@ -368,6 +368,21 @@ namespace config {
     bool enet {true};
   };
 
+  // Windows-only: native in-process DS5 bridge provider — the license-clean
+  // in-tree replacement for the external ctm-usbip.exe agent. Presents a virtual
+  // USB DualSense via the MS-signed usbip-win2 vhci and speaks the CTM-Bridge
+  // protocol Aurora's HID-passthrough client already talks. Mutually exclusive
+  // with ctm_enable (both bind the usbip loopback + control port).
+  struct ds5b_t {
+    // Master switch. When true (and CTM is disabled), Vibepollo runs the native
+    // DS5 bridge provider in-process.
+    bool native_bridge {false};
+
+    // Control/discovery port for the provider (TCP+UDP). Same default as CTM so
+    // the Aurora client needs no reconfiguration.
+    int port {48054};
+  };
+
   namespace flag {
     enum flag_e : std::size_t {
       PIN_STDIN = 0,  ///< Read PIN from stdin instead of http
@@ -466,6 +481,10 @@ namespace config {
   // against reads from the CTM bridge supervisor thread. config::ctm holds a std::string,
   // so an unsynchronized concurrent read during hot-reload is a torn read (UB).
   extern std::mutex ctm_mutex;
+  extern ds5b_t ds5b;
+  // Guards writes to config::ds5b (apply_config) against reads from the native
+  // DS5 bridge supervisor thread.
+  extern std::mutex ds5b_mutex;
   extern sunshine_t sunshine;
 
   int parse(int argc, char *argv[]);
