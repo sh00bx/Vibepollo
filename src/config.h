@@ -395,6 +395,11 @@ namespace config {
 
     // Control/discovery port for the provider (TCP+UDP).
     int port {48054};
+
+    // Phase 2: build paced 0x36 audio/haptic reports from the game's iso-OUT PCM
+    // so the DS5's HD (voice-coil) haptics work over the native provider. Off by
+    // default; opt-in for A/B against CTM. Read when a controller connects.
+    bool native_haptics {false};
   };
 
   namespace flag {

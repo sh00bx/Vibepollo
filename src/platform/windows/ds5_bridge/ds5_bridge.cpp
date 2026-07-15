@@ -31,12 +31,13 @@ namespace ds5_bridge_provider {
       using namespace std::chrono_literals;
       bool started = false;
       while (!st.stop_requested()) {
-        bool enable;
+        bool enable, haptics;
         int port;
         {
           std::lock_guard<std::mutex> lk(config::ds5b_mutex);
           enable = config::ds5b.native_bridge;
           port = config::ds5b.port;
+          haptics = config::ds5b.native_haptics;
         }
 
         // The native provider is the only owner of the usbip loopback
@@ -44,6 +45,7 @@ namespace ds5_bridge_provider {
         // replaced is no longer part of the tree.
         bool want = enable;
 
+        host().set_haptics(haptics);
         if (want && !started) {
           started = host().start(port);
         } else if (!want && started) {
