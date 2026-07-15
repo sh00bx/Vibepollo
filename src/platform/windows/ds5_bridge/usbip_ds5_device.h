@@ -56,6 +56,14 @@ namespace platf::ds5_bridge {
     using feature_cb = std::function<int(uint8_t report_id, uint8_t *out)>;
     feature_cb on_feature;
 
+    // Optional (Phase 2 — HD haptics): called on a server thread with the raw
+    // iso-OUT PCM the game renders to the DS5's audio endpoint (EP 0x01,
+    // 4ch/16-bit/48 kHz interleaved: ch0/1 speaker, ch2/3 voice-coil haptics).
+    // The session turns it into a paced DS5 0x36 report. Unset in Phase 1, where
+    // the iso URB is simply completed and the PCM discarded. Must not block long.
+    using iso_out_cb = std::function<void(const uint8_t *pcm, size_t len)>;
+    iso_out_cb on_iso_out;
+
     std::mutex input_mtx;
     uint8_t input_report[INPUT_REPORT_LEN] {};
     std::atomic<bool> attached {false};
