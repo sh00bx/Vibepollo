@@ -88,15 +88,18 @@ namespace platf::ds5_bridge {
     static constexpr int HAPTIC_BYTES = 64;
     std::mutex hap_mtx_;
     std::array<int8_t, HAPTIC_BYTES> latest_haptic_ {};
-    std::chrono::steady_clock::time_point latest_haptic_ts_ {};
+    std::chrono::steady_clock::time_point latest_haptic_ts_ {};  // last snapshot store
+    std::chrono::steady_clock::time_point last_signal_ts_ {};    // last above-squelch block
     bool have_haptic_ = false;
 
-    // Below this age the last snapshot is sent; above it the coil is zeroed.
-    // Past the grace window (measured from the last fresh frame) the pacer stops
-    // entirely so the DS5 falls quiet instead of humming on idle silence.
-    static constexpr auto HAPTIC_STALE = std::chrono::milliseconds(15);
+    // Continuity vs idle-gating are decoupled: every decimated block updates the
+    // snapshot (so an active effect streams smoothly, no RMS-gate dropouts), while
+    // idle-gating keys off last_signal_ts_ (the last above-squelch block) so the
+    // DS5 still falls quiet after real silence instead of humming. HAPTIC_STALE
+    // only bridges an actual feed stall (game stopped writing audio); it is well
+    // above the ~10.7 ms snapshot cadence so normal jitter never zeroes the coil.
+    static constexpr auto HAPTIC_STALE = std::chrono::milliseconds(35);
     static constexpr auto GRACE = std::chrono::milliseconds(300);
-    std::chrono::steady_clock::time_point last_active_ {};  // pacer thread only
 
     // -- 398-byte 0x36 skeleton + Opus-silence speaker slot ------------------
     std::array<uint8_t, DS5_0X36_LEN> skeleton_ {};
