@@ -357,8 +357,12 @@ namespace platf::ds5_bridge {
                              out_data.data(), (int) out_data.size());
             } else if (is_iso) {
               // Complete the iso URB so the virtual audio endpoint never stalls.
-              // Phase 1 discards the PCM (no HD-haptic capture yet); Phase 2 hooks
-              // the iso-OUT payload here to reconstruct the 0x36 haptic stream.
+              // Phase 2 entry point: an iso-OUT URB carries the game's rendered
+              // audio + voice-coil PCM. Hand the payload to the session (which
+              // builds the DS5 0x36 report); the hook is unset in Phase 1, so the
+              // PCM is simply completed and discarded here.
+              if (direction == DIR_OUT && !out_data.empty() && slot && slot->on_iso_out)
+                slot->on_iso_out(out_data.data(), out_data.size());
               std::vector<uint8_t> in_buf;
               int in_len = 0;
               if (direction == DIR_IN) { in_len = (int) xfer_len; in_buf.assign(in_len, 0); }
