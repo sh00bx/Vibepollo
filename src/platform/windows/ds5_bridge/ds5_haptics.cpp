@@ -61,7 +61,8 @@ namespace platf::ds5_bridge {
   ds5_haptic_builder::ds5_haptic_builder() {
     build_fir();
     build_skeleton();
-    last_active_ = std::chrono::steady_clock::now() - GRACE - std::chrono::seconds(1);
+    // last_signal_ts_ defaults to the epoch and have_haptic_ starts false, so
+    // build_0x36 idle-gates (sends nothing) until the first real signal block.
   }
 
   // Kaiser-windowed sinc low-pass @FIR_FC, unity DC gain (ds5_av_capture.cpp).
@@ -128,17 +129,20 @@ namespace platf::ds5_bridge {
         for (int i = 0; i < HAP_OUT; ++i)
           hrms += (double) decL_[i] * decL_[i] + (double) decR_[i] * decR_[i];
         hrms = std::sqrt(hrms / (HAP_OUT * 2));
-        if (hrms > ACTIVE_RMS) {
-          std::array<int8_t, HAPTIC_BYTES> snap {};
-          for (int i = 0; i < HAP_OUT; ++i) {
-            snap[2 * i] = quantize_one(decL_[i]);
-            snap[2 * i + 1] = quantize_one(decR_[i]);
-          }
-          std::lock_guard<std::mutex> lk(hap_mtx_);
-          latest_haptic_ = snap;
-          latest_haptic_ts_ = std::chrono::steady_clock::now();
-          have_haptic_ = true;
+        // Always publish the block (continuity: an active effect must stream every
+        // ~10.7 ms with no RMS-gate dropouts, or the coil actuation is choppy). The
+        // squelch only decides idle-gating, not whether to store.
+        std::array<int8_t, HAPTIC_BYTES> snap {};
+        for (int i = 0; i < HAP_OUT; ++i) {
+          snap[2 * i] = quantize_one(decL_[i]);
+          snap[2 * i + 1] = quantize_one(decR_[i]);
         }
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lk(hap_mtx_);
+        latest_haptic_ = snap;
+        latest_haptic_ts_ = now;
+        have_haptic_ = true;
+        if (hrms > ACTIVE_RMS) last_signal_ts_ = now;
         dec_n_ = 0;
       }
     }
@@ -205,20 +209,19 @@ namespace platf::ds5_bridge {
     out_seq_++;
     out[10] = pktctr_++;
 
-    bool fresh = false;
+    bool should_send = false;
     {
       std::lock_guard<std::mutex> lk(hap_mtx_);
-      if (have_haptic_ &&
-          (std::chrono::steady_clock::now() - latest_haptic_ts_) <= HAPTIC_STALE) {
+      auto now = std::chrono::steady_clock::now();
+      if (have_haptic_ && (now - latest_haptic_ts_) <= HAPTIC_STALE) {
         for (int i = 0; i < HAPTIC_BYTES; ++i)
           out[OFF_HAPTIC + i] = (uint8_t) latest_haptic_[i];
-        fresh = true;
       }
       // else: the skeleton's zeroed 0x12 payload is copied through -> silence.
+      // Idle-gate on real signal activity (not snapshot freshness): continuous
+      // near-zero blocks during a lull still stop within GRACE, no idle buzz.
+      should_send = have_haptic_ && (now - last_signal_ts_) < GRACE;
     }
-    auto now = std::chrono::steady_clock::now();
-    if (fresh) last_active_ = now;
-    bool should_send = (now - last_active_) < GRACE;
 
     // DS5 BT output CRC: CRC32 over the 0xA2 seed byte + bytes [0 .. len-4).
     const uint8_t seed = PS_OUTPUT_CRC_SEED;

@@ -242,6 +242,10 @@ namespace platf::ds5_bridge {
     // PCM. Enqueues to the outbox (drained on the run/session thread) so the
     // ENet host is only ever serviced from one thread.
     void pacer_run() {
+      // Time-critical so the 10 ms grid is not descheduled by the capture/encoder
+      // threads under heavy game load — an irregular grid makes the coil actuation
+      // choppy (ds5_av_play.c boosts the same loop for the same reason).
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
       using namespace std::chrono;
       auto next = steady_clock::now();
       const auto period = microseconds(10000);  // 100 reports/s
