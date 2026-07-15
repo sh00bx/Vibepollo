@@ -32,12 +32,13 @@ namespace ds5_bridge_provider {
       bool warned_conflict = false;
       bool started = false;
       while (!st.stop_requested()) {
-        bool enable, ctm_enable;
+        bool enable, ctm_enable, haptics;
         int port;
         {
           std::lock_guard<std::mutex> lk(config::ds5b_mutex);
           enable = config::ds5b.native_bridge;
           port = config::ds5b.port;
+          haptics = config::ds5b.native_haptics;
         }
         {
           std::lock_guard<std::mutex> lk(config::ctm_mutex);
@@ -59,6 +60,7 @@ namespace ds5_bridge_provider {
           warned_conflict = false;
         }
 
+        host().set_haptics(haptics);
         if (want && !started) {
           started = host().start(port);
         } else if (!want && started) {

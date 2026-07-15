@@ -966,7 +966,8 @@ namespace config {
   // opt-in; CTM remains the default provider).
   ds5b_t ds5b {
     false,  // native_bridge
-    48054  // port
+    48054,  // port
+    false  // native_haptics
   };
 
   std::mutex ds5b_mutex;
@@ -1812,6 +1813,7 @@ namespace config {
       std::lock_guard<std::mutex> ds5b_lk(ds5b_mutex);
       bool_f(vars, "ds5_native_bridge", ds5b.native_bridge);
       int_between_f(vars, "ds5_bridge_port", ds5b.port, {1, 65535});
+      bool_f(vars, "ds5_native_haptics", ds5b.native_haptics);
     }
 
     path_f(vars, "pkey", nvhttp.pkey);

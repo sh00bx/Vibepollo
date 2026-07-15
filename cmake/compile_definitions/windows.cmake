@@ -167,6 +167,8 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ctm_bridge.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ctmb_protocol.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ds5_reports.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ds5_haptics.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ds5_haptics.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/usbip_ds5_device.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/usbip_ds5_device.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/vhci_attach.h"

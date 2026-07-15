@@ -25,6 +25,7 @@
 #include "src/logging.h"
 #include "src/platform/windows/ds5_bridge/bridge_host.h"
 #include "src/platform/windows/ds5_bridge/ctmb_protocol.h"
+#include "src/platform/windows/ds5_bridge/ds5_haptics.h"
 #include "src/platform/windows/ds5_bridge/ds5_reports.h"
 #include "src/platform/windows/ds5_bridge/vhci_attach.h"
 
@@ -53,8 +54,8 @@ namespace platf::ds5_bridge {
   // ===========================================================================
   class bridge_session {
   public:
-    bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport):
-        usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport) {}
+    bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, bool haptics):
+        usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport), haptics_(haptics) {}
 
     ~bridge_session() { stop(); }
 
@@ -174,13 +175,25 @@ namespace platf::ds5_bridge {
             }
             return 0;
           });
+        // Phase 2: capture the game's iso-OUT PCM and drive a paced 0x36 haptic
+        // stream. Wire the hook before the attach below (which is when the game
+        // starts writing), and start the 10 ms pacer. Off unless configured.
+        if (haptics_) {
+          hap_ = std::make_unique<ds5_haptic_builder>();
+          slot_->on_iso_out = [this](const uint8_t *pcm, size_t len) {
+            if (hap_) hap_->feed_pcm(pcm, len);
+          };
+          pacer_stop_.store(false);
+          pacer_thread_ = std::thread(&bridge_session::pacer_run, this);
+        }
         // Attach off the session thread: `usbip attach` spawns a CLI + two port
         // snapshots (a couple of seconds); the loop must keep servicing ENet in
         // the meantime or the client link would go unpinged.
         std::string busid = slot_->busid;
         attach_thread_ = std::thread([this, busid] { vhci_port_.store(vhci_attach(busid)); });
         BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " up (serial="sv
-                        << serial << ", usbip busid="sv << busid << ")"sv;
+                        << serial << ", usbip busid="sv << busid
+                        << (haptics_ ? ", haptics on"sv : ""sv) << ")"sv;
       }
 
       // Always (re)answer the handshake: the client waits for HOST_CONFIG on every
@@ -217,7 +230,30 @@ namespace platf::ds5_bridge {
       std::deque<std::vector<uint8_t>> pending;
       { std::lock_guard<std::mutex> lk(out_mtx_); pending.swap(outbox_); }
       for (auto &bt : pending) {
-        send_msg(CTMB_MSG_OUTPUT_REPORT, CTMB_FLAG_OK, 0, bt.data(), (uint32_t) bt.size());
+        // 0x36 audio/haptic reports are paced (HOST_CONFIG advertises them); the
+        // TV routes PACED output onto its 10.667 ms raw-ACL injector.
+        uint32_t flags = CTMB_FLAG_OK;
+        if (!bt.empty() && bt[0] == 0x36) flags |= CTMB_FLAG_PACED;
+        send_msg(CTMB_MSG_OUTPUT_REPORT, flags, 0, bt.data(), (uint32_t) bt.size());
+      }
+    }
+
+    // 10 ms grid producing paced 0x36 haptic reports from the game's iso-OUT
+    // PCM. Enqueues to the outbox (drained on the run/session thread) so the
+    // ENet host is only ever serviced from one thread.
+    void pacer_run() {
+      using namespace std::chrono;
+      auto next = steady_clock::now();
+      const auto period = microseconds(10000);  // 100 reports/s
+      uint8_t rep[DS5_0X36_LEN];
+      while (!pacer_stop_.load() && !stop_.load()) {
+        next += period;
+        std::this_thread::sleep_until(next);
+        if (!hap_) continue;
+        if (hap_->build_0x36(rep)) {
+          std::lock_guard<std::mutex> lk(out_mtx_);
+          if (outbox_.size() < 256) outbox_.emplace_back(rep, rep + DS5_0X36_LEN);
+        }
       }
     }
 
@@ -366,6 +402,8 @@ namespace platf::ds5_bridge {
     }
 
     void teardown(SOCKET ls) {
+      pacer_stop_.store(true);
+      if (pacer_thread_.joinable()) pacer_thread_.join();
       if (attach_thread_.joinable()) attach_thread_.join();
       if (slot_) {
         vhci_detach(vhci_port_.load());
@@ -384,6 +422,11 @@ namespace platf::ds5_bridge {
     std::mutex label_mtx_;
     std::string ctmb_busid_;  // guarded by label_mtx_ (relabel from control thread)
     int dport_;
+    bool haptics_ {false};
+
+    std::unique_ptr<ds5_haptic_builder> hap_;   // Phase 2 0x36 builder (if haptics_)
+    std::thread pacer_thread_;
+    std::atomic<bool> pacer_stop_ {false};
 
     std::atomic<bool> stop_ {false};
     bool link_down_ {false};
@@ -540,7 +583,7 @@ namespace platf::ds5_bridge {
                         << busid << " (reconnect; adopted live session on this port)"sv;
         return "OK";
       }
-      auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport);
+      auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, haptics_.load());
       sess->start();
       sessions_[busid] = std::move(sess);
       BOOST_LOG(info) << "ds5-bridge: BRIDGE_START ds5 port="sv << dport << " busid="sv << busid;

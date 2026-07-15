@@ -49,6 +49,10 @@ namespace platf::ds5_bridge {
     void stop();
     bool is_running() const { return running_.load(); }
 
+    /// Phase 2 HD-haptics toggle. Read when a session is created (a fresh
+    /// controller connect), so flipping it takes effect on the next connect.
+    void set_haptics(bool on) { haptics_.store(on); }
+
   private:
     void control_loop();
     std::string handle_command(const std::string &line);
@@ -56,6 +60,7 @@ namespace platf::ds5_bridge {
 
     std::atomic<bool> running_ {false};
     std::atomic<bool> stop_ {false};
+    std::atomic<bool> haptics_ {false};
     int port_ {48054};
 
     usbip_ds5_device usbip_;
