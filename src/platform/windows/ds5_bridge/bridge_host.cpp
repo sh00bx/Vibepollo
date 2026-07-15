@@ -71,7 +71,24 @@ namespace platf::ds5_bridge {
       if (thread_.joinable()) thread_.join();
     }
 
+    /// The data port this session owns — the controller's stable identity across
+    /// reconnects. Set once at construction, never mutated, so read lock-free.
+    int dport() const { return dport_; }
+
+    /// Re-label a live session to the busid the TV issued on this reconnect, so a
+    /// later BRIDGE_STOP resolves. Called from the control thread; guarded because
+    /// the session thread reads the label for logging (see label()).
+    void relabel(const std::string &busid) {
+      std::lock_guard<std::mutex> lk(label_mtx_);
+      ctmb_busid_ = busid;
+    }
+
   private:
+    std::string label() {
+      std::lock_guard<std::mutex> lk(label_mtx_);
+      return ctmb_busid_;
+    }
+
     // ---- outbound message send (transport-agnostic) -----------------------
     void send_msg(uint16_t type, uint32_t flags, uint32_t request_id,
                   const uint8_t *payload, uint32_t len) {
@@ -139,7 +156,7 @@ namespace platf::ds5_bridge {
       ctmb_device_caps_t caps;
       std::memcpy(&caps, payload, sizeof(caps));
       caps.serial[sizeof(caps.serial) - 1] = '\0';
-      std::string serial = caps.serial[0] ? caps.serial : ctmb_busid_;
+      std::string serial = caps.serial[0] ? caps.serial : label();
 
       // First HELLO on this session: register the virtual DualSense (its output +
       // feature callbacks run on a usbip server thread) and attach the vhci once.
@@ -162,7 +179,7 @@ namespace platf::ds5_bridge {
         // the meantime or the client link would go unpinged.
         std::string busid = slot_->busid;
         attach_thread_ = std::thread([this, busid] { vhci_port_.store(vhci_attach(busid)); });
-        BOOST_LOG(info) << "ds5-bridge: session "sv << ctmb_busid_ << " up (serial="sv
+        BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " up (serial="sv
                         << serial << ", usbip busid="sv << busid << ")"sv;
       }
 
@@ -229,7 +246,7 @@ namespace platf::ds5_bridge {
             if (enet_host_service(host_, &ev, 2) > 0 && ev.type == ENET_EVENT_TYPE_CONNECT) {
               peer_ = ev.peer;
               transport_ = ENET;
-              BOOST_LOG(info) << "ds5-bridge: session "sv << ctmb_busid_ << " transport=ENet"sv;
+              BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " transport=ENet"sv;
             }
           }
           if (transport_ == NONE && ls != INVALID_SOCKET) {
@@ -240,7 +257,7 @@ namespace platf::ds5_bridge {
               ioctlsocket(c, FIONBIO, &nb);
               tcp_client_ = c;
               transport_ = TCP;
-              BOOST_LOG(info) << "ds5-bridge: session "sv << ctmb_busid_ << " transport=TCP"sv;
+              BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " transport=TCP"sv;
             }
           }
           if (transport_ == NONE) {
@@ -273,7 +290,7 @@ namespace platf::ds5_bridge {
       rxbuf_.clear();
       transport_ = NONE;
       link_down_ = false;
-      BOOST_LOG(info) << "ds5-bridge: session "sv << ctmb_busid_ << " link dropped; awaiting reconnect"sv;
+      BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " link dropped; awaiting reconnect"sv;
     }
 
     void pump_enet() {
@@ -364,7 +381,8 @@ namespace platf::ds5_bridge {
     enum transport_e { NONE, ENET, TCP };
 
     usbip_ds5_device *usbip_;
-    std::string ctmb_busid_;
+    std::mutex label_mtx_;
+    std::string ctmb_busid_;  // guarded by label_mtx_ (relabel from control thread)
     int dport_;
 
     std::atomic<bool> stop_ {false};
@@ -502,10 +520,25 @@ namespace platf::ds5_bridge {
         return "ERR bad args";
       }
       std::lock_guard<std::mutex> lk(sessions_mtx_);
-      auto it = sessions_.find(busid);
-      if (it != sessions_.end()) {
-        it->second->stop();
-        sessions_.erase(it);
+      // The data port is a controller's stable identity across reconnects: the TV
+      // reuses it but issues a fresh busid each time (ctm-ds5-1 -> ctm-ds5-2 ...).
+      // If a session already owns this dport, adopt it — its ENet host, usbip slot
+      // and vhci attach stay up, so the game never sees a re-plug — and just
+      // relabel it to the incoming busid so a later BRIDGE_STOP resolves. Spinning
+      // up a second session would only race for the same port: enet_host_create
+      // fails and the loser lingers as a zombie TCP-fallback session the
+      // reconnecting peer never reaches.
+      for (auto it = sessions_.begin(); it != sessions_.end(); ++it) {
+        if (it->second->dport() != dport) continue;
+        if (it->first != busid) {
+          auto sess = std::move(it->second);
+          sessions_.erase(it);
+          sess->relabel(busid);
+          sessions_[busid] = std::move(sess);
+        }
+        BOOST_LOG(info) << "ds5-bridge: BRIDGE_START ds5 port="sv << dport << " busid="sv
+                        << busid << " (reconnect; adopted live session on this port)"sv;
+        return "OK";
       }
       auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport);
       sess->start();
