@@ -20,9 +20,11 @@
 #include <thread>
 #include <vector>
 
+#include <boost/asio/ip/address.hpp>
 #include <enet/enet.h>
 
 #include "src/logging.h"
+#include "src/platform/common.h"
 #include "src/platform/windows/ds5_bridge/bridge_host.h"
 #include "src/platform/windows/ds5_bridge/ctmb_protocol.h"
 #include "src/platform/windows/ds5_bridge/ds5_haptics.h"
@@ -105,9 +107,18 @@ namespace platf::ds5_bridge {
       h->payload_len = len;
       if (len) std::memcpy(msg.data() + sizeof(ctmb_header_t), payload, len);
 
+      const bool paced = (flags & CTMB_FLAG_PACED) != 0;
       if (transport_ == ENET && peer_) {
-        ENetPacket *pkt = enet_packet_create(msg.data(), msg.size(), ENET_PACKET_FLAG_RELIABLE);
-        if (pkt && enet_peer_send(peer_, 0, pkt) == 0) {
+        // Paced audio rides UNRELIABLE on its own channel: with a continuous
+        // 100/s stream on the reliable channel there is ALWAYS unacked data in
+        // flight, so any >=5 s WiFi stall is a guaranteed peer timeout, and the
+        // retransmit queue head-of-line-blocks input/control traffic (the CTM
+        // reference splits exactly this way; the TV ingest is channel-agnostic
+        // and tolerates gaps). A lost frame is a ~10 ms blip.
+        uint32_t pktflags = paced ? 0 : ENET_PACKET_FLAG_RELIABLE;
+        uint8_t channel = (paced && peer_->channelCount > 1) ? 1 : 0;
+        ENetPacket *pkt = enet_packet_create(msg.data(), msg.size(), pktflags);
+        if (pkt && enet_peer_send(peer_, channel, pkt) == 0) {
           enet_host_flush(host_);
         } else if (pkt) {
           enet_packet_destroy(pkt);
@@ -116,8 +127,22 @@ namespace platf::ds5_bridge {
         int off = 0, total = (int) msg.size();
         while (off < total) {
           int n = ::send(tcp_client_, (const char *) msg.data() + off, total - off, 0);
-          if (n <= 0) { link_down_ = true; break; }
-          off += n;
+          if (n > 0) { off += n; continue; }
+          int e = (n == 0) ? WSAECONNRESET : WSAGetLastError();
+          if (e == WSAEWOULDBLOCK || e == WSAENOBUFS) {
+            // Full send buffer (WiFi stall) on the nonblocking socket is NOT a
+            // dead link — the recv path detects real drops. An untouched paced
+            // frame is disposable; anything partially sent (or non-paced) must
+            // complete or the byte stream desyncs, so wait for writability.
+            if (paced && off == 0) return;
+            WSAPOLLFD p {};
+            p.fd = tcp_client_;
+            p.events = POLLOUT;
+            if (WSAPoll(&p, 1, 1000) <= 0) { link_down_ = true; break; }
+            continue;
+          }
+          link_down_ = true;
+          break;
         }
       }
     }
@@ -147,6 +172,9 @@ namespace platf::ds5_bridge {
           }
           break;
         }
+        case CTMB_MSG_PACE_FEEDBACK:
+          on_pace_feedback(h, payload);
+          break;
         default:
           break;  // LOG/ERROR/ENUM/etc. — not used by the DS5 path
       }
@@ -199,7 +227,14 @@ namespace platf::ds5_bridge {
       // Always (re)answer the handshake: the client waits for HOST_CONFIG on every
       // (re)connect (needs_host_config), so this must be sent each HELLO.
       ctmb_host_config_t cfg {};
+      // TV drain pace for its paced queue; the client clamps this to <=8 ms
+      // (125/s) anyway, so its queue drains faster than our ~93.4/s arrival and
+      // the real bottleneck stays the NOCP-paced injector queue in ds5_txd.
       cfg.bt_pace_us = 10667;
+      // Advertise the rate-servo capability: a client that sees this forwards
+      // the daemon's inject-queue telemetry as CTMB_MSG_PACE_FEEDBACK. Old
+      // clients ignore reserved bytes and simply never send it.
+      cfg.reserved[0] = CTMB_HOSTCFG_PACE_FEEDBACK;
       cfg.input_report_len = caps.input_report_len;
       cfg.output_report_len = BT_OUTPUT_LEN;
       cfg.feature_report_len = caps.feature_report_len;
@@ -216,10 +251,68 @@ namespace platf::ds5_bridge {
         req[0] = rid;
         send_msg(CTMB_MSG_FEATURE_GET, CTMB_FLAG_OK, rid, req, sizeof(req));
       }
+
+      // Only now may output reports flow: the TV's handshake() hard-fails the
+      // session on ANY frame that is not HOST_CONFIG ("host config unexpected
+      // type"). Flushing a stale outbox ahead of this reply put every reconnect
+      // right back into a drop loop (the Phase 2b ~6 s drop/reconnect cycle, and
+      // the "2 drops then stable" connects before it).
+      hello_seen_.store(true);
+    }
+
+    // Session/run thread: inject-queue telemetry from the TV daemon (~4/s).
+    // Integrating servo on the pacer period: true backlog (fifo_count — frames
+    // parked behind a FULL credit window) or fresh drops stretch the period so
+    // the queue bleeds; clean samples decay it back toward the true drain
+    // cadence. Time constants: full stretch in ~1 s of pegged backlog, full
+    // relax in ~12 s of clean feedback — fast enough to shed a gap-storm
+    // backlog, slow enough not to chase the in-flight jitter.
+    void on_pace_feedback(const ctmb_header_t *h, const uint8_t *payload) {
+      if (h->payload_len < sizeof(ctmb_pace_feedback_t)) return;
+      ctmb_pace_feedback_t fb {};
+      std::memcpy(&fb, payload, sizeof(fb));
+      uint32_t drops = fb_seen_ ? (fb.drop_total - fb_last_drop_) : 0;
+      fb_last_drop_ = fb.drop_total;
+      fb_seen_ = true;
+      // Backlog = parked FIFO frames PLUS credit-window excess. The window
+      // (outstanding) is its own ratchet: with arrival == drain it parks
+      // wherever the connect burst left it (observed 5-7/12 sustained = 50-75ms
+      // of latency the fifo signal never sees). Frames above the target ride
+      // the same shed path, just with a gentler gain; the true in-flight floor
+      // (~1-2 at this rate) stops the shed naturally — once q reaches the
+      // target the excess term is 0 and adj decays back to the drain rate.
+      constexpr int Q_TARGET = 3;
+      int q_excess = std::max(0, (int) fb.outstanding - Q_TARGET);
+      int adj = pace_adj_us_.load(std::memory_order_relaxed);
+      if (fb.fifo_count > 0 || q_excess > 0 || drops > 0) {
+        int up = fb.fifo_count * 8 + q_excess * 4 + (int) std::min<uint32_t>(drops, 5u) * 20;
+        adj = std::min(adj + std::min(up, 40), DS5_PACE_ADJ_MAX_US);
+      } else if (adj > 0) {
+        adj = std::max(adj - 3, 0);
+      }
+      pace_adj_us_.store(adj, std::memory_order_relaxed);
+      fb_last_ms_.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count(),
+        std::memory_order_relaxed);
+      // Servo telemetry, ~every 10 s (40 samples at 4/s).
+      dbg_fb_drops_ += drops;
+      if (fb.fifo_count > dbg_fb_fifo_max_) dbg_fb_fifo_max_ = fb.fifo_count;
+      if (++dbg_fb_n_ >= 40) {
+        BOOST_LOG(info) << "ds5-pace: adj=" << adj << "us ("
+                        << (DS5_PACE_BASE_US + adj) << "us/tick) fifo_max="
+                        << dbg_fb_fifo_max_ << " q=" << (int) fb.outstanding
+                        << "/" << fb.maxq << " drops+=" << dbg_fb_drops_
+                        << " inj=" << fb.inj_total;
+        dbg_fb_n_ = 0;
+        dbg_fb_drops_ = 0;
+        dbg_fb_fifo_max_ = 0;
+      }
     }
 
     // usbip server thread: the game wrote a 47-byte USB output effects block.
     void on_game_output(const uint8_t *eff) {
+      if (!hello_seen_.load(std::memory_order_relaxed)) return;  // pre-handshake: drop (state refreshes)
       uint8_t bt[BT_OUTPUT_LEN];
       usb_output_to_bt(eff, out_seq_++, bt);
       std::lock_guard<std::mutex> lk(out_mtx_);
@@ -227,11 +320,13 @@ namespace platf::ds5_bridge {
     }
 
     void drain_outbox() {
+      if (!hello_seen_.load(std::memory_order_relaxed)) return;
       std::deque<std::vector<uint8_t>> pending;
       { std::lock_guard<std::mutex> lk(out_mtx_); pending.swap(outbox_); }
       for (auto &bt : pending) {
         // 0x36 audio/haptic reports are paced (HOST_CONFIG advertises them); the
-        // TV routes PACED output onto its 10.667 ms raw-ACL injector.
+        // TV drains its PACED queue onto the raw-ACL injector at min(bt_pace_us,
+        // 8 ms) (~125/s cap), so on-air cadence is arrival-limited to our 100/s.
         uint32_t flags = CTMB_FLAG_OK;
         if (!bt.empty() && bt[0] == 0x36) flags |= CTMB_FLAG_PACED;
         send_msg(CTMB_MSG_OUTPUT_REPORT, flags, 0, bt.data(), (uint32_t) bt.size());
@@ -248,13 +343,37 @@ namespace platf::ds5_bridge {
       SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
       using namespace std::chrono;
       auto next = steady_clock::now();
-      const auto period = microseconds(10000);  // 100 reports/s
+      // RATE-SERVO'D period: base = the DS5's true 93.75/s drain cadence,
+      // stretched by pace_adj_us_ (TV inject-queue feedback, on_pace_feedback)
+      // so the TV queue bleeds after BT NOCP gap bursts instead of ratcheting
+      // up (parked latency + drop bursts — see the clocking block in
+      // ds5_haptics.h). With no live feedback (old TV app, or none for >2 s)
+      // it falls back to the static -0.33% margin. Emitting faster than drain
+      // (100/s was tried) overruns the TV's paced queue outright: ~320 ms
+      // parked plus a drop (audible Opus discontinuity) every ~160 ms. The
+      // speaker resample ratio follows the live period (set_pace_us), so one
+      // 480-sample frame per tick balances at any servo setting.
+      // HIGH_RESOLUTION waitable timer: Win11 ignores timer-resolution requests
+      // from windowless processes, so sleep_until quantizes to the 15.625 ms
+      // system tick. The absolute grid keeps the AVERAGE rate regardless
+      // (expired deadlines pass through), but only at the cost of ~1.6-report
+      // bursts per wake; the high-res timer removes the bursting.
+      auto hpt = platf::create_high_precision_timer();
       uint8_t rep[DS5_0X36_LEN];
       while (!pacer_stop_.load() && !stop_.load()) {
+        int64_t now_ms = duration_cast<milliseconds>(
+          steady_clock::now().time_since_epoch()).count();
+        bool fb_live = (now_ms - fb_last_ms_.load(std::memory_order_relaxed)) < 2000;
+        int adj = fb_live ? pace_adj_us_.load(std::memory_order_relaxed)
+                          : DS5_PACE_FALLBACK_ADJ_US;
+        const auto period = microseconds(DS5_PACE_BASE_US + adj);
+        if (hap_) hap_->set_pace_us(DS5_PACE_BASE_US + adj);
         next += period;
-        std::this_thread::sleep_until(next);
+        auto now = steady_clock::now();
+        if (now - next > milliseconds(100)) next = now;  // genuine stall: no catch-up burst
+        else if (next > now && hpt && *hpt) hpt->sleep_for(next - now);
         if (!hap_) continue;
-        if (hap_->build_0x36(rep)) {
+        if (hap_->build_0x36(rep) && hello_seen_.load(std::memory_order_relaxed)) {
           std::lock_guard<std::mutex> lk(out_mtx_);
           if (outbox_.size() < 256) outbox_.emplace_back(rep, rep + DS5_0X36_LEN);
         }
@@ -286,7 +405,32 @@ namespace platf::ds5_bridge {
             if (enet_host_service(host_, &ev, 2) > 0 && ev.type == ENET_EVENT_TYPE_CONNECT) {
               peer_ = ev.peer;
               transport_ = ENET;
-              BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " transport=ENet"sv;
+              // AC_VO / DSCP-EF on the UDP socket (same helper Sunshine's A/V
+              // sockets use): the 93.75/s audio stream must not queue behind
+              // bulk WiFi traffic — every late frame is a TV-side PLC gap.
+              // (This ENet fork stores peer addresses as sockaddr_storage.)
+              boost::asio::ip::address peer_addr;
+              uint16_t peer_port = 0;
+              auto *sa = (const sockaddr *) &peer_->address.address;
+              if (sa->sa_family == AF_INET) {
+                auto *s4 = (const sockaddr_in *) sa;
+                boost::asio::ip::address_v4::bytes_type b {};
+                std::memcpy(b.data(), &s4->sin_addr, b.size());
+                peer_addr = boost::asio::ip::address_v4(b);
+                peer_port = ntohs(s4->sin_port);
+              } else if (sa->sa_family == AF_INET6) {
+                auto *s6 = (const sockaddr_in6 *) sa;
+                boost::asio::ip::address_v6::bytes_type b {};
+                std::memcpy(b.data(), &s6->sin6_addr, b.size());
+                peer_addr = boost::asio::ip::address_v6(b);
+                peer_port = ntohs(s6->sin6_port);
+              }
+              if (peer_port) {
+                qos_ = platf::enable_socket_qos((uintptr_t) host_->socket, peer_addr,
+                                                peer_port, platf::qos_data_type_e::audio, true);
+              }
+              BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " transport=ENet"sv
+                              << (qos_ ? " (AC_VO)"sv : ""sv);
             }
           }
           if (transport_ == NONE && ls != INVALID_SOCKET) {
@@ -326,10 +470,21 @@ namespace platf::ds5_bridge {
 
     void reset_transport() {
       if (tcp_client_ != INVALID_SOCKET) { ::closesocket(tcp_client_); tcp_client_ = INVALID_SOCKET; }
+      qos_.reset();
       peer_ = nullptr;
       rxbuf_.clear();
       transport_ = NONE;
       link_down_ = false;
+      // Nothing queued while disconnected may greet the fresh link: the TV's
+      // handshake fails hard on any pre-HOST_CONFIG frame. hello_seen_ regates
+      // the producers; the outbox drops what already accumulated.
+      hello_seen_.store(false);
+      { std::lock_guard<std::mutex> lk(out_mtx_); outbox_.clear(); }
+      // Servo: the next session may be a fresh daemon run (drop_total restarts)
+      // — rebase the delta and fall back to the static margin until feedback
+      // flows again. The learned adj is kept; it decays on clean samples.
+      fb_seen_ = false;
+      fb_last_ms_.store(0, std::memory_order_relaxed);
       BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " link dropped; awaiting reconnect"sv;
     }
 
@@ -416,6 +571,7 @@ namespace platf::ds5_bridge {
       }
       if (tcp_client_ != INVALID_SOCKET) { ::closesocket(tcp_client_); tcp_client_ = INVALID_SOCKET; }
       if (ls != INVALID_SOCKET) ::closesocket(ls);
+      qos_.reset();
       if (host_) { enet_host_destroy(host_); host_ = nullptr; }
       peer_ = nullptr;
     }
@@ -434,11 +590,24 @@ namespace platf::ds5_bridge {
 
     std::atomic<bool> stop_ {false};
     bool link_down_ {false};
+    // True from HOST_CONFIG sent (handshake answered) until the next link drop.
+    // Output-report producers and the drain are gated on it: the TV handshake
+    // hard-fails on any frame that precedes HOST_CONFIG. Atomic — set/cleared on
+    // the session thread, read by the pacer and usbip threads.
+    std::atomic<bool> hello_seen_ {false};
+
+    // Rate servo (on_pace_feedback writes on the run thread, pacer reads).
+    std::atomic<int> pace_adj_us_ {0};       // period stretch over the base cadence
+    std::atomic<int64_t> fb_last_ms_ {0};    // steady-clock ms of the last feedback
+    uint32_t fb_last_drop_ = 0;              // run thread only
+    bool fb_seen_ = false;                   // run thread only
+    uint32_t dbg_fb_n_ = 0, dbg_fb_drops_ = 0, dbg_fb_fifo_max_ = 0;
     std::thread thread_;
 
     transport_e transport_ {NONE};
     ENetHost *host_ {nullptr};
     ENetPeer *peer_ {nullptr};
+    std::unique_ptr<platf::deinit_t> qos_;  // AC_VO flow on the ENet socket (per link)
     SOCKET tcp_client_ {INVALID_SOCKET};
     std::vector<uint8_t> rxbuf_;
 

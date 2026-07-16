@@ -67,6 +67,11 @@ namespace platf::ds5_bridge {
     std::mutex input_mtx;
     uint8_t input_report[INPUT_REPORT_LEN] {};
     std::atomic<bool> attached {false};
+    // The live vhci import's client socket (set by serve_session while attached,
+    // ~0 otherwise). remove_slot() closes it to force the session thread — which
+    // invokes on_output/on_iso_out — to exit before the owner destroys those
+    // callbacks' captured state. uintptr_t so the header stays winsock-free.
+    std::atomic<uintptr_t> session_sock {~uintptr_t(0)};
 
     slot_t() {
       input_report[0] = 0x01;
