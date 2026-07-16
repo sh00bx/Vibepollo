@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -328,8 +329,32 @@ namespace platf::ds5_bridge {
     // usbip server thread: the game wrote a 47-byte USB output effects block.
     void on_game_output(const uint8_t *eff) {
       if (!hello_seen_.load(std::memory_order_relaxed)) return;  // pre-handshake: drop (state refreshes)
+      uint8_t common[USB_OUTPUT_COMMON_LEN];
+      std::memcpy(common, eff, USB_OUTPUT_COMMON_LEN);
+      // The HELLO-time lightbar-setup release can arrive before the pad has
+      // switched to extended BT mode (the 0x05/0x09/0x20 feature reads do the
+      // unlock, asynchronously). Fold the release into the game's own first
+      // reports too — SDL ships it combined with color/rumble the same way.
+      if (!lb_released_) {
+        common[38] |= 0x02;  // valid_flag2: LIGHTBAR_SETUP_CONTROL_ENABLE
+        common[41] = 0x02;   // lightbar_setup: LIGHT_OUT
+        lb_released_ = true;
+      }
+      // Diagnostics: first outputs per connect, plus any lightbar color change.
+      const bool lb_write = (common[1] & 0x04) != 0;
+      const bool rgb_changed = lb_write && (common[44] != dbg_rgb_[0] || common[45] != dbg_rgb_[1] || common[46] != dbg_rgb_[2]);
+      if (dbg_out_n_ < 10 || rgb_changed) {
+        ++dbg_out_n_;
+        if (lb_write) { dbg_rgb_[0] = common[44]; dbg_rgb_[1] = common[45]; dbg_rgb_[2] = common[46]; }
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+                      "ds5-out: f0=%02x f1=%02x f2=%02x motors=%02x/%02x setup=%02x pled=%02x rgb=%02x%02x%02x",
+                      common[0], common[1], common[38], common[2], common[3],
+                      common[41], common[43], common[44], common[45], common[46]);
+        BOOST_LOG(info) << msg;
+      }
       uint8_t bt[BT_OUTPUT_LEN];
-      usb_output_to_bt(eff, out_seq_++, bt);
+      usb_output_to_bt(common, out_seq_++, bt);
       std::lock_guard<std::mutex> lk(out_mtx_);
       outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
     }
@@ -495,6 +520,10 @@ namespace platf::ds5_bridge {
       // the producers; the outbox drops what already accumulated.
       hello_seen_.store(false);
       { std::lock_guard<std::mutex> lk(out_mtx_); outbox_.clear(); }
+      // Fresh link may be a fresh pad connect: re-arm the lightbar-setup
+      // release and the per-connect output diagnostics.
+      lb_released_ = false;
+      dbg_out_n_ = 0;
       // Servo: the next session may be a fresh daemon run (drop_total restarts)
       // — rebase the delta and fall back to the static margin until feedback
       // flows again. The learned adj is kept; it decays on clean samples.
@@ -631,6 +660,9 @@ namespace platf::ds5_bridge {
     std::atomic<int> vhci_port_ {-1};
     uint32_t seq_ {0};
     uint8_t out_seq_ {0};
+    bool lb_released_ {false};
+    uint32_t dbg_out_n_ {0};
+    uint8_t dbg_rgb_[3] {};
 
     std::mutex out_mtx_;
     std::deque<std::vector<uint8_t>> outbox_;
