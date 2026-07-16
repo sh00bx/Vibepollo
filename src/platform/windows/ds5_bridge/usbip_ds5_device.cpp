@@ -15,10 +15,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 
 #include "src/logging.h"
+#include "src/platform/common.h"
 #include "src/platform/windows/ds5_bridge/usbip_ds5_device.h"
 
 using namespace std::literals;
@@ -166,6 +168,25 @@ namespace platf::ds5_bridge {
       std::mutex pend_mtx;
       std::deque<std::pair<uint32_t, uint32_t>> pending_in;  // (seqnum, devid)
       std::atomic<bool> stop {false};
+
+      // ---- iso-OUT real-time pacer -----------------------------------------
+      // A deferred completion carries everything iso_ret_submit needs.
+      struct iso_job_t {
+        uint32_t seqnum, devid, ep, dir;
+        int xfer_len, npkts;
+        std::vector<uint8_t> pcm;       // the concatenated iso-OUT payload
+        std::vector<uint8_t> iso_desc;  // npkts*16 packet descriptors (echoed back)
+      };
+      std::mutex iso_mtx_;
+      std::condition_variable iso_cv_;
+      std::deque<iso_job_t> iso_q_;
+      // Per-direction virtual clocks (pacer thread only). OUT (speaker/haptic
+      // PCM) and IN (mic) are independent streams; sharing one deadline would
+      // halve both rates when both are open.
+      std::chrono::steady_clock::time_point iso_deadline_ {};     // OUT
+      std::chrono::steady_clock::time_point iso_in_deadline_ {};  // IN
+      bool iso_primed_ {false};
+      bool iso_in_primed_ {false};
 
       bool send_all(const uint8_t *buf, int len) {
         std::lock_guard<std::mutex> lk(send_mtx);
@@ -326,8 +347,113 @@ namespace platf::ds5_bridge {
         }
       }
 
+      // Real-time pacer for iso-OUT completions. Holds each URB's RET_SUBMIT until
+      // the URB's audio duration has elapsed on a monotonic clock. Completing iso
+      // URBs instantly makes usbaudio.sys free-run (there is no USB SOF over usbip
+      // to clock it) and flood the game's rendered PCM at ~150x real time; pacing
+      // the completion back-pressures usbaudio's bounded URB pool down to 48 kHz,
+      // and feeding the PCM here delivers it to the 0x36 builder at that cadence.
+      // Runs on its own thread so the recv loop keeps servicing interrupt-IN input.
+      void iso_pacer_run() {
+        using clock = std::chrono::steady_clock;
+        constexpr int BYTES_PER_FRAME = 8;   // 4ch * int16 (speaker/haptic OUT EP)
+        constexpr int64_t SR = 48000;
+        // This thread IS the virtual device's audio clock: its wake latency is
+        // audio-clock jitter. Elevated priority, and a HIGH_RESOLUTION waitable
+        // timer for the deadline wait — Win11 ignores timer-resolution requests
+        // from windowless processes (we run as a service), so a plain
+        // wait_until wakes on the 15.625 ms system tick.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        auto hpt = platf::create_high_precision_timer();
+        for (;;) {
+          iso_job_t job;
+          {
+            std::unique_lock<std::mutex> lk(iso_mtx_);
+            iso_cv_.wait(lk, [this] { return stop.load() || !iso_q_.empty(); });
+            if (stop.load()) return;   // dropping queued completions is fine (socket dying)
+            job = std::move(iso_q_.front());
+            iso_q_.pop_front();
+          }
+          // Virtual audio clock: this URB completes `duration` after the previous
+          // one in the same direction. OUT is clocked by its PCM content; IN (mic
+          // — no PCM source, zero-filled) by its packet count (1 ms per packet).
+          const bool dir_in = (job.dir == DIR_IN);
+          std::chrono::nanoseconds duration;
+          if (dir_in) {
+            duration = std::chrono::milliseconds(job.npkts > 0 ? job.npkts : 1);
+          } else {
+            // Frame count from the packet descriptors: a client that pads packets
+            // to wMaxPacketSize would otherwise inflate the clock and feed the
+            // inter-packet padding into the DSP as PCM. xfer_len is the fallback.
+            int64_t bytes = 0;
+            if ((int) job.iso_desc.size() >= job.npkts * 16) {
+              for (int i = 0; i < job.npkts; ++i)
+                bytes += rd32(job.iso_desc.data() + (size_t) i * 16 + 4);
+            } else {
+              bytes = job.xfer_len;
+            }
+            duration = std::chrono::nanoseconds(bytes / BYTES_PER_FRAME * 1000000000LL / SR);
+          }
+          auto &deadline = dir_in ? iso_in_deadline_ : iso_deadline_;
+          bool &primed = dir_in ? iso_in_primed_ : iso_primed_;
+          auto now = clock::now();
+          if (!primed || now - deadline > std::chrono::milliseconds(50)) {
+            // First URB, or a genuine feed stall (>50 ms behind): resync so a gap
+            // never becomes an unbounded catch-up burst. Ordinary wake-latency
+            // overshoots are NOT resynced — the absolute grid absorbs them (an
+            // already-expired deadline waits zero), keeping the long-run average
+            // at exactly 48 kHz. Resyncing every iteration instead quantized the
+            // clock to the system tick: 480 frames / 15.625 ms = 64% of real
+            // time, which starved the speaker ring into a 36% PLC storm.
+            deadline = now;
+            primed = true;
+          }
+          deadline += duration;
+          // Feed the DSP at the paced cadence (per-descriptor ranges — packed
+          // contiguous in practice, so this collapses to one call), then wait
+          // out the URB, then complete.
+          if (!dir_in && !job.pcm.empty() && slot && slot->on_iso_out) {
+            if ((int) job.iso_desc.size() >= job.npkts * 16) {
+              size_t run_off = 0, run_len = 0;
+              for (int i = 0; i < job.npkts; ++i) {
+                const uint8_t *d = job.iso_desc.data() + (size_t) i * 16;
+                size_t off = rd32(d), len = rd32(d + 4);
+                if (off + len > job.pcm.size()) break;   // malformed descriptor
+                if (run_len && off == run_off + run_len) { run_len += len; continue; }
+                if (run_len) slot->on_iso_out(job.pcm.data() + run_off, run_len);
+                run_off = off; run_len = len;
+              }
+              if (run_len) slot->on_iso_out(job.pcm.data() + run_off, run_len);
+            } else {
+              slot->on_iso_out(job.pcm.data(), job.pcm.size());
+            }
+          }
+          now = clock::now();
+          if (deadline > now) {
+            if (hpt && *hpt) {
+              // Not interruptible by stop, but bounded by one URB (~10 ms) —
+              // teardown just joins a beat later.
+              hpt->sleep_for(deadline - now);
+            } else {
+              std::unique_lock<std::mutex> lk(iso_mtx_);
+              iso_cv_.wait_until(lk, deadline, [this] { return stop.load(); });
+            }
+          }
+          if (stop.load()) return;
+          if (dir_in) {
+            std::vector<uint8_t> in_buf((size_t) job.xfer_len, 0);
+            iso_ret_submit(job.seqnum, job.devid, DIR_IN, job.ep, job.xfer_len,
+                           in_buf.data(), (int) in_buf.size(), job.iso_desc, job.npkts);
+          } else {
+            iso_ret_submit(job.seqnum, job.devid, DIR_OUT, job.ep,
+                           job.xfer_len, nullptr, 0, job.iso_desc, job.npkts);
+          }
+        }
+      }
+
       void run() {
         std::thread sender(&session_t::input_sender, this);
+        std::thread pacer(&session_t::iso_pacer_run, this);
         uint8_t hdr[48];
         while (!stop.load()) {
           if (!recv_n(hdr, 48)) break;
@@ -356,19 +482,36 @@ namespace platf::ds5_bridge {
               handle_control(seqnum, devid, direction, setup,
                              out_data.data(), (int) out_data.size());
             } else if (is_iso) {
-              // Complete the iso URB so the virtual audio endpoint never stalls.
-              // Phase 2 entry point: an iso-OUT URB carries the game's rendered
-              // audio + voice-coil PCM. Hand the payload to the session (which
-              // builds the DS5 0x36 report); the hook is unset in Phase 1, so the
-              // PCM is simply completed and discarded here.
-              if (direction == DIR_OUT && !out_data.empty() && slot && slot->on_iso_out)
-                slot->on_iso_out(out_data.data(), out_data.size());
-              std::vector<uint8_t> in_buf;
-              int in_len = 0;
-              if (direction == DIR_IN) { in_len = (int) xfer_len; in_buf.assign(in_len, 0); }
-              iso_ret_submit(seqnum, devid, direction, ep,
-                             direction == DIR_OUT ? (int) xfer_len : in_len,
-                             in_buf.data(), in_len, iso_desc, npkts);
+              // Iso URBs (OUT: rendered speaker/voice-coil PCM; IN: mic) defer to
+              // the pacer thread's virtual audio clock. Completing them inline
+              // makes the client free-run — usbaudio resubmits on completion, so
+              // OUT floods feed_pcm at ~150x real time and IN degenerates to a
+              // loopback-RTT spin on this recv thread. The pacer feeds OUT PCM to
+              // the 0x36 builder and holds each RET_SUBMIT for the URB's duration.
+              iso_job_t job;
+              job.seqnum = seqnum; job.devid = devid; job.ep = ep; job.dir = direction;
+              job.xfer_len = (int) xfer_len; job.npkts = npkts;
+              job.pcm = std::move(out_data);
+              job.iso_desc = std::move(iso_desc);
+              iso_job_t evict; bool have_evict = false;
+              {
+                std::lock_guard<std::mutex> lk(iso_mtx_);
+                if (iso_q_.size() > 1024) {  // backstop (~1 s of URBs)
+                  evict = std::move(iso_q_.front());
+                  iso_q_.pop_front();
+                  have_evict = true;
+                }
+                iso_q_.push_back(std::move(job));
+              }
+              iso_cv_.notify_one();
+              if (have_evict) {
+                // Complete the evicted URB (zero actual) instead of silently
+                // dropping it — a dropped URB leaks from the client's pool.
+                std::vector<uint8_t> zero(evict.dir == DIR_IN ? (size_t) evict.xfer_len : 0, 0);
+                iso_ret_submit(evict.seqnum, evict.devid, evict.dir, evict.ep,
+                               evict.xfer_len, zero.empty() ? nullptr : zero.data(),
+                               (int) zero.size(), evict.iso_desc, evict.npkts);
+              }
             } else if (direction == DIR_IN) {
               std::lock_guard<std::mutex> lk(pend_mtx);
               pending_in.emplace_back(seqnum, devid);
@@ -379,16 +522,28 @@ namespace platf::ds5_bridge {
             }
           } else if (command == CMD_UNLINK) {
             uint32_t unlink_seq = rd32(hdr + 20);
+            bool found = false;
             { std::lock_guard<std::mutex> lk(pend_mtx);
               for (auto it = pending_in.begin(); it != pending_in.end();)
-                it = (it->first == unlink_seq) ? pending_in.erase(it) : it + 1; }
-            ret_unlink(seqnum, devid, 0);
+                if (it->first == unlink_seq) { it = pending_in.erase(it); found = true; }
+                else ++it; }
+            // Queued iso completions must honor UNLINK too, or the pacer later
+            // emits a RET_SUBMIT for an unlinked seqnum — a protocol violation
+            // right when usbaudio cancels timed-out URBs. (The one job the pacer
+            // may currently hold completes normally: the not-found=0 case.)
+            { std::lock_guard<std::mutex> lk(iso_mtx_);
+              for (auto it = iso_q_.begin(); it != iso_q_.end();)
+                if (it->seqnum == unlink_seq) { it = iso_q_.erase(it); found = true; }
+                else ++it; }
+            ret_unlink(seqnum, devid, found ? -104 /*-ECONNRESET: unlinked*/ : 0);
           } else {
             break;
           }
         }
         stop.store(true);
+        iso_cv_.notify_all();  // wake the pacer out of wait / wait_until
         sender.join();
+        pacer.join();
       }
     };
 
@@ -428,6 +583,20 @@ namespace platf::ds5_bridge {
 
   void usbip_ds5_device::remove_slot(const std::shared_ptr<slot_t> &slot) {
     if (!slot) return;
+    // Stop the live vhci session BEFORE the caller destroys the slot's callbacks'
+    // captured state. session_t::run() invokes slot->on_output / on_iso_out (the
+    // latter on the iso pacer thread); the caller (bridge_session::teardown) frees
+    // the bridge_session + its haptic builder right after this returns. The owner's
+    // vhci_detach() already nudges the client to disconnect; shut the server side
+    // of the socket down too (shutdown, not close — the accept worker owns the
+    // handle) so recv() unblocks promptly, then wait (bounded) for the session
+    // thread to fully exit (attached -> false), guaranteeing no callback survives.
+    if (slot->attached.load()) {
+      uintptr_t s = slot->session_sock.load();
+      if (s != ~uintptr_t(0)) ::shutdown((SOCKET) s, SD_BOTH);
+      for (int i = 0; i < 500 && slot->attached.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
     std::lock_guard<std::mutex> lk(slots_mtx_);
     slots_.erase(std::remove(slots_.begin(), slots_.end(), slot), slots_.end());
     BOOST_LOG(info) << "ds5-bridge usbip: slot removed busid="sv << slot->busid;
@@ -543,12 +712,14 @@ namespace platf::ds5_bridge {
       if (!slot) return;
 
       BOOST_LOG(info) << "ds5-bridge usbip: vhci attached busid="sv << slot->busid;
+      slot->session_sock.store((uintptr_t) cs);
       slot->attached.store(true);
       session_t sess;
       sess.sock = cs;
       sess.slot = slot;
       sess.run();
       slot->attached.store(false);
+      slot->session_sock.store(~uintptr_t(0));
       BOOST_LOG(info) << "ds5-bridge usbip: vhci session ended busid="sv << slot->busid;
       return;
     }

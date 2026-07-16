@@ -13,8 +13,10 @@
  * the DS5 BT CRC and hands it to the session, which sends it as a PACED
  * OUTPUT_REPORT the TV injects via raw-ACL — symmetric to the 0x31 path.
  *
- * Phase 2a implements haptics; the 0x13 speaker slot carries a valid Opus
- * silence frame so the report is well-formed (live speaker audio is Phase 2b).
+ * Phase 2b also carries live speaker audio: the game's ch0/1 PCM is jitter-
+ * buffered and Opus-encoded per 10 ms into the 0x13 sub-packet (exactly-once,
+ * in-order — Opus is stateful, unlike the latest-wins int8 haptic), with PLC on
+ * underrun so the 0x13 is always a valid frame.
  *
  * License-clean: DSP + report geometry are our own (ds5_av_capture.cpp /
  * ds5_av_play.c, sh00bx authorship). No CTM source consulted.
@@ -22,16 +24,47 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <vector>
+
+// Global forward declaration so `enc_` resolves to the SAME ::OpusEncoder in
+// every TU regardless of whether <opus/opus.h> was included first (opus.h does
+// `typedef struct OpusEncoder OpusEncoder;` at global scope). Declaring it inside
+// the namespace instead would inject a distinct platf::ds5_bridge::OpusEncoder in
+// opus-less TUs (bridge_host.cpp) and ODR-clash with the opus.h type in this .cpp.
+struct OpusEncoder;
 
 namespace platf::ds5_bridge {
 
   // Full DS5 0x36 BT output report length. FIXED — the DS5 HID descriptor
   // rejects a shorter report (no audio/haptics). Geometry from ds5_av_play.c.
   constexpr int DS5_0X36_LEN = 398;
+
+  // Speaker clocking, shared with the session pacer (bridge_host.cpp).
+  //
+  // The DS5 drains one 480-sample 0x36 per ~10.667 ms — an effective ~45 kHz
+  // device clock (probed; the nominal "48 kHz" frames play 6.25% slow).
+  // Sending at exactly the drain rate means the TV-side inject queue can never
+  // shrink — every BT NOCP gap (30-80 ms stalls come in storms on this link)
+  // ratchets it up permanently, parking ~100 ms of latency and turning each
+  // further gap into a drop burst (hard Opus discontinuities; 529 dropped
+  // frames in one 19-min session).
+  //
+  // The pacer therefore runs a RATE SERVO on the TV's inject-queue telemetry
+  // (CTMB_MSG_PACE_FEEDBACK): base period = the true drain cadence; backlog or
+  // drops stretch it (up to DS5_PACE_ADJ_MAX) until the queue bleeds empty,
+  // then it decays back. The speaker resample ratio tracks the live period
+  // (audio-clock recovery), so production always equals consumption and the
+  // only artifact is a sub-1% pitch wobble at multi-second time constants.
+  // Without feedback (old TV app) the pacer falls back to a fixed
+  // DS5_PACE_FALLBACK_ADJ_US margin — the pre-servo behavior.
+  constexpr int DS5_SPK_FRAME = 480;      // samples/ch per 0x36 Opus frame
+  constexpr int DS5_PACE_BASE_US = 10667;         // true 93.75/s drain cadence
+  constexpr int DS5_PACE_ADJ_MAX_US = 140;        // slowest: ~92.5/s (-1.3%)
+  constexpr int DS5_PACE_FALLBACK_ADJ_US = 35;    // no-feedback static margin (-0.33%)
 
   /**
    * @brief Turns iso-OUT PCM into paced DS5 0x36 haptic reports.
@@ -43,10 +76,12 @@ namespace platf::ds5_bridge {
   class ds5_haptic_builder {
   public:
     ds5_haptic_builder();
+    ~ds5_haptic_builder();
 
     /// Feed raw iso-OUT PCM (int16 interleaved, 4ch @48 kHz: ch0/1 speaker,
-    /// ch2/3 voice-coil). Decimates the voice-coil channels and updates the
-    /// latest haptic snapshot (RMS-gated). Safe to call from any thread.
+    /// ch2/3 voice-coil). Decimates the voice-coil channels into the latest
+    /// haptic snapshot (RMS-gated) and queues the speaker channels for Opus.
+    /// Safe to call from any thread.
     void feed_pcm(const uint8_t *pcm, size_t len);
 
     /// Assemble the next 398-byte 0x36 report into @p out. Returns true while
@@ -54,11 +89,18 @@ namespace platf::ds5_bridge {
     /// pacer stops driving once this goes false (DS5 falls quiet, no idle hum).
     bool build_0x36(uint8_t out[DS5_0X36_LEN]);
 
+    /// Rate-servo hook (pacer thread): the live pacer period. The speaker
+    /// resample ratio follows it so production == consumption at any servo
+    /// setting (audio-clock recovery; no systematic PLC or ring growth).
+    void set_pace_us(int us) {
+      pace_us_.store(us, std::memory_order_relaxed);
+    }
+
   private:
     // -- FIR-decimation DSP (ported from ds5_av_capture.cpp) -----------------
     static constexpr int SR = 48000;
     static constexpr int CHANS = 4;            // ch0/1 speaker, ch2/3 voice-coil
-    static constexpr int SPK_L = 0, SPK_R = 1;  // (unused in 2a; documents layout)
+    static constexpr int SPK_L = 0, SPK_R = 1;  // speaker pair (2b: -> 0x13 Opus)
     static constexpr int HAP_L = 2, HAP_R = 3;
     static constexpr int DECIM = 16;           // 48000 -> 3000 Hz
     static constexpr int PROC_BLOCK = 128;     // multiple of DECIM (phase-consistent)
@@ -84,30 +126,94 @@ namespace platf::ds5_bridge {
     int dec_n_ = 0;
     uint64_t rng_ = 0x9E3779B97F4A7C15ULL;
 
-    // -- latest haptic snapshot (shared with the pacer) ----------------------
+    // -- haptic snapshot: latest-wins (shared with the pacer) ----------------
+    // The device-proven ds5_av_play.c model: the feed overwrites the newest 64-B
+    // coil snapshot, the pacer sends the latest one each tick. This is correct
+    // because the iso-OUT feed is real-time-paced upstream (usbip_ds5_device
+    // completes iso URBs on a virtual audio clock), so the producer runs at one
+    // snapshot per 10.667 ms — the same cadence the pacer sends at (93.75/s, the
+    // DS5 drain clock), so each snapshot is sent exactly once modulo jitter.
+    // (A FIFO ring was tried while the feed still flooded at ~150x real-time;
+    // it only reshuffled the incoherent flood.)
     static constexpr int HAPTIC_BYTES = 64;
     std::mutex hap_mtx_;
-    std::array<int8_t, HAPTIC_BYTES> latest_haptic_ {};
-    std::chrono::steady_clock::time_point latest_haptic_ts_ {};  // last snapshot store
-    std::chrono::steady_clock::time_point last_signal_ts_ {};    // last above-squelch block
+    std::array<int8_t, HAPTIC_BYTES> latest_frame_ {};  // newest coil snapshot
+    std::chrono::steady_clock::time_point latest_ts_ {};       // when it was produced
+    std::chrono::steady_clock::time_point last_signal_ts_ {};  // last above-squelch block
     bool have_haptic_ = false;
 
-    // Continuity vs idle-gating are decoupled: every decimated block updates the
-    // snapshot (so an active effect streams smoothly, no RMS-gate dropouts), while
-    // idle-gating keys off last_signal_ts_ (the last above-squelch block) so the
-    // DS5 still falls quiet after real silence instead of humming. HAPTIC_STALE
-    // only bridges an actual feed stall (game stopped writing audio); it is well
-    // above the ~10.7 ms snapshot cadence so normal jitter never zeroes the coil.
-    static constexpr auto HAPTIC_STALE = std::chrono::milliseconds(35);
+    // A snapshot older than this = the feed stalled (endpoint closed / paused);
+    // zero the coil so it stops buzzing the last frame. Generous vs the ~10.67 ms
+    // production cadence to tolerate URB jitter (ds5_av_play.c uses 15 ms on lossy
+    // WiFi; our feed is local + paced, so jitter is low, but keep headroom).
+    static constexpr auto HAPTIC_STALE = std::chrono::milliseconds(30);
+    // Idle-gate on real signal activity so the DS5 falls quiet after true silence
+    // (no idle hum) rather than on buffer state. Driven by haptic OR speaker.
     static constexpr auto GRACE = std::chrono::milliseconds(300);
 
-    // -- 398-byte 0x36 skeleton + Opus-silence speaker slot ------------------
+    // -- speaker (0x13 Opus) — ported from ds5_av_play.c ---------------------
+    // The game's ch0/1 speaker PCM. Unlike the stateless int8 haptic, Opus is a
+    // stateful codec, so the pacer must encode exactly one in-order frame per
+    // tick: a sample ring (jitter buffer) feeds the encoder, PLC covers
+    // underruns.
+    //
+    // RATE MATCH: the feed resamples 48 kHz onto the DS5's effective drain
+    // clock, derived from the LIVE pacer period (pace_us_, rate-servo'd by the
+    // session) so production, wire rate and device drain stay coupled at any
+    // servo setting — see the clocking block at namespace scope.
+    static constexpr int OPUS_FRAME = DS5_SPK_FRAME;  // one 0x13 frame (samples/ch, nominal 48k)
+    std::atomic<int> pace_us_ {DS5_PACE_BASE_US + DS5_PACE_FALLBACK_ADJ_US};
+    static constexpr int OPUS_BYTES = 200;          // 0x13 payload size (fixed, 160k CBR)
+    static constexpr double SPK_RMS = 0.0005;       // speaker activity squelch (ds5_av_capture.cpp)
+    static constexpr int SPK_CONCEAL = 8;           // max consecutive PLC-driven sends (~85 ms)
+    static constexpr int SPK_RING_FRAMES = 9600;    // ~200 ms of stereo cushion cap
+    static constexpr size_t SPK_LAT_TARGET = 4 * OPUS_FRAME;  // ~40 ms jitter floor
+    static constexpr size_t SPK_LAT_DRAIN = 8 * OPUS_FRAME;   // drain above ~80 ms
+    std::mutex spk_mtx_;
+    std::array<int16_t, SPK_RING_FRAMES * 2> spk_ring_ {};  // interleaved stereo
+    size_t spk_head_ = 0, spk_count_ = 0;                   // frames (L+R pairs)
+    bool spk_priming_ = true;                               // prefill before draining
+    // Pacer-thread-only speaker state (no lock needed):
+    ::OpusEncoder *enc_ = nullptr;                          // persistent, 48k/2ch/CELT
+    std::array<float, OPUS_FRAME * 2> last_pcm_f_ {};       // PLC source (last good frame)
+    int plc_run_ = 0;                                       // consecutive underruns
+    std::chrono::steady_clock::time_point last_spk_ts_ {};  // last frame popped (idle gate)
+
+    void spk_push(const int16_t *pcm4, size_t nframe);  // extract ch0/1, resample, ring-push (feed thread)
+    int spk_pop_frame(int16_t out[OPUS_FRAME * 2]);      // pop 480 stereo (pacer thread)
+
+    // 48 kHz -> drain-clock resampler (feed thread only): pending input stereo
+    // frames plus a fractional read position (step tracks pace_us_), polyphase Kaiser-sinc
+    // interpolated. Catmull-Rom was tried first but a cubic has no anti-alias
+    // stopband — downsampling folds >22 kHz content back into the audible band
+    // and its interpolation sidelobes smear HF detail ("not quite as clear").
+    // 64 taps @ fc 21 kHz / beta 9 leaves ~60 dB in the folded region; phase
+    // rows are linearly blended so the irrational step stays artifact-free.
+    static constexpr int RS_TAPS = 64;
+    static constexpr int RS_PHASES = 128;
+    static constexpr double RS_FC = 21000.0;  // LP cutoff (Hz, at 48 kHz input)
+    static constexpr double RS_BETA = 9.0;
+    std::vector<float> rs_filt_;     // (RS_PHASES+1) x RS_TAPS, DC-normalized rows
+    std::vector<int16_t> rs_pend_;   // interleaved stereo input awaiting resample
+    double rs_pos_ = RS_TAPS / 2 - 1;  // fractional input index (needs 31 left history)
+
+    void build_resampler();
+
+    // -- diagnostics (periodic log; cheap atomics) ---------------------------
+    std::atomic<uint64_t> dbg_feed_frames_ {0};
+    std::atomic<uint32_t> dbg_blocks_ {0}, dbg_gate_blocks_ {0};
+    std::atomic<uint32_t> dbg_sends_ {0}, dbg_stale_ {0};
+    std::atomic<uint32_t> dbg_spk_pop_ {0}, dbg_spk_plc_ {0};
+    double dbg_max_hrms_ = 0.0;  // under hap_mtx_
+    uint32_t dbg_build_ctr_ = 0;  // pacer thread only
+
+    // -- 398-byte 0x36 skeleton (sub-packet headers + audio SetState) --------
+    // The 0x12 haptic and 0x13 Opus payloads are written per tick in build_0x36.
     std::array<uint8_t, DS5_0X36_LEN> skeleton_ {};
     uint8_t out_seq_ = 0;
     uint8_t pktctr_ = 0;
 
     void build_skeleton();
-    void encode_opus_silence();  // fills the 0x13 slot in skeleton_ once
   };
 
 }  // namespace platf::ds5_bridge

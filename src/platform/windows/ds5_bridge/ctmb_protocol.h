@@ -38,7 +38,14 @@ namespace platf::ds5_bridge {
     CTMB_MSG_ERROR = 8,
     CTMB_MSG_FEATURE_SET = 9,
     CTMB_MSG_ENUM = 10,
+    // TV -> host inject-queue telemetry (our protocol extension, not CTM's).
+    // The client sends it ONLY when HOST_CONFIG advertised
+    // CTMB_HOSTCFG_PACE_FEEDBACK, so a legacy/CTM host never sees the type.
+    CTMB_MSG_PACE_FEEDBACK = 11,
   };
+
+  // ctmb_host_config_t.reserved[0] capability bits (0 on a CTM host).
+  constexpr uint8_t CTMB_HOSTCFG_PACE_FEEDBACK = 0x01;
 
 #pragma pack(push, 1)
   struct ctmb_header_t {
@@ -84,6 +91,23 @@ namespace platf::ds5_bridge {
     uint8_t paced_report_ids[16];
     uint8_t reserved[31];
   };
+
+  // CTMB_MSG_PACE_FEEDBACK payload: a snapshot of the TV daemon's raw-ACL
+  // inject queue for this pad's link (published by ds5_txd, forwarded by the
+  // client ~4/s). Drives the host pacer's rate servo: fifo_count > 0 means the
+  // NOCP credit window is full AND frames are parked behind it (true backlog);
+  // drop_total advancing means the parked backlog overflowed fifo_cap.
+  struct ctmb_pace_feedback_t {
+    uint8_t outstanding;  // in-flight TX (NOCP credit window occupancy)
+    uint8_t fifo_count;   // parked behind the window (elastic FIFO depth)
+    uint16_t maxq;        // credit window cap
+    uint16_t fifo_cap;    // elastic FIFO cap
+    uint16_t reserved0;
+    uint32_t inj_total;   // daemon lifetime counters (monotonic)
+    uint32_t drop_total;
+    uint8_t reserved[16];
+  };
+  static_assert(sizeof(ctmb_pace_feedback_t) == 32, "pace feedback layout drift");
 #pragma pack(pop)
 
 }  // namespace platf::ds5_bridge

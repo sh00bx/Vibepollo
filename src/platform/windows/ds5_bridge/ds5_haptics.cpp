@@ -12,6 +12,7 @@
 
 #include <opus/opus.h>
 
+#include "src/logging.h"
 #include "src/platform/windows/ds5_bridge/ds5_haptics.h"
 #include "src/platform/windows/ds5_bridge/ds5_reports.h"
 
@@ -19,11 +20,10 @@ namespace platf::ds5_bridge {
 
   namespace {
     // Report 0x36 sub-packet offsets (canonical, from ds5_av_play.c).
+    // (OPUS_FRAME / OPUS_BYTES live on the class — used by member arrays too.)
     constexpr int OFF_SETSTATE = 13;   // SetState (0x10) payload
     constexpr int OFF_HAPTIC = 78;     // voice-coil (0x12) payload
     constexpr int OFF_OPUS = 144;      // Opus speaker (0x13) payload
-    constexpr int OPUS_BYTES = 200;
-    constexpr int OPUS_FRAME = 480;    // 10 ms @48k stereo (samples per channel)
 
     // Non-destructive "audio-only" SetState (0x10) payload: asserts only the
     // audio Allow bits so it never fights Moonlight's own trigger/rumble/LED
@@ -31,7 +31,15 @@ namespace platf::ds5_bridge {
     const uint8_t state_audio_data[63] = {
       0xB0, 0x82,                 // ValidFlags: audio-only
       0x00, 0x00,                 // RumbleEmulation R/L (not allowed)
-      0x7f, 0x7f,                 // VolumeHeadphones=127, VolumeSpeaker=127
+      // VolumeHeadphones=127 (7-bit field), VolumeSpeaker=255.
+      // The speaker byte is NOT 7-bit: CTM maps its volume slider onto
+      // 0x80..0xFF (`0x80 + scale(0..0x7f)`), so 0x7f — which ds5_av_play.c
+      // used believing it was "max" — sits at the very bottom of the real
+      // range and plays ~6 dB below CTM's full scale (the "quieter than CTM"
+      // field report). 0xFF is exactly what CTM emits at max. Windows still
+      // attenuates digitally (the endpoint exposes no hardware volume unit),
+      // so the host slider keeps working with the physical volume pinned high.
+      0x7f, 0xff,
       0x00,                       // VolumeMic (not allowed)
       0x00,                       // AudioControl (Auto mic / default)
       0x00,                       // MuteLightMode (ignored)
@@ -60,9 +68,59 @@ namespace platf::ds5_bridge {
 
   ds5_haptic_builder::ds5_haptic_builder() {
     build_fir();
+    build_resampler();
     build_skeleton();
+    // One persistent Opus encoder: 48k / 2ch / RESTRICTED_LOWDELAY (CELT-only, no
+    // SILK look-ahead) / 10 ms / 160 kbps CBR / complexity 0 — the DS5-proven
+    // config from ds5_av_play.c. Used only on the pacer thread (build_0x36), so no
+    // lock. If creation fails, build_0x36 emits a zeroed (silent) 0x13.
+    int err = 0;
+    enc_ = opus_encoder_create(SR, 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
+    if (err != OPUS_OK || !enc_) {
+      if (enc_) { opus_encoder_destroy(enc_); enc_ = nullptr; }
+      // Near-impossible with valid args; log it and fall back to a zeroed 0x13
+      // (build_0x36 still ships a well-formed report; only the speaker is silent).
+      BOOST_LOG(error) << "ds5-haptics: opus_encoder_create failed ("
+                       << opus_strerror(err) << "); speaker disabled, haptics unaffected";
+    } else {
+      opus_encoder_ctl(enc_, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
+      opus_encoder_ctl(enc_, OPUS_SET_BITRATE(160000));
+      opus_encoder_ctl(enc_, OPUS_SET_VBR(0));
+      // Complexity 0 was the TV-tool's ARM budget; on the host one stereo frame
+      // per 10.7 ms is nothing — buy the full encoder quality back.
+      opus_encoder_ctl(enc_, OPUS_SET_COMPLEXITY(10));
+    }
     // last_signal_ts_ defaults to the epoch and have_haptic_ starts false, so
     // build_0x36 idle-gates (sends nothing) until the first real signal block.
+  }
+
+  ds5_haptic_builder::~ds5_haptic_builder() {
+    if (enc_) opus_encoder_destroy(enc_);
+  }
+
+  // Polyphase fractional-delay bank for the 48 kHz -> drain-clock speaker resample:
+  // RS_PHASES+1 rows of an RS_TAPS Kaiser-windowed sinc low-pass, row p sampled
+  // at fractional offset p/RS_PHASES, each row normalized to unity DC gain (the
+  // per-phase sinc sampling otherwise ripples the gain by up to ~0.5%).
+  void ds5_haptic_builder::build_resampler() {
+    const int C = RS_TAPS / 2;  // output taps span input indices i0-C+1 .. i0+C
+    const double i0b = bessel_i0(RS_BETA);
+    rs_filt_.assign((size_t) (RS_PHASES + 1) * RS_TAPS, 0.0f);
+    for (int p = 0; p <= RS_PHASES; ++p) {
+      float *row = rs_filt_.data() + (size_t) p * RS_TAPS;
+      const double a = (double) p / RS_PHASES;
+      double sum = 0.0;
+      for (int k = 0; k < RS_TAPS; ++k) {
+        const double t = (k - (C - 1)) - a;      // tap offset from the output point
+        const double x = 2.0 * RS_FC / SR * t;
+        const double s = (x == 0.0) ? 1.0 : std::sin(M_PI * x) / (M_PI * x);
+        const double r = t / C;
+        const double w = (std::abs(r) >= 1.0) ? 0.0 : bessel_i0(RS_BETA * std::sqrt(1.0 - r * r)) / i0b;
+        row[k] = (float) (2.0 * RS_FC / SR * s * w);
+        sum += row[k];
+      }
+      for (int k = 0; k < RS_TAPS; ++k) row[k] = (float) (row[k] / sum);
+    }
   }
 
   // Kaiser-windowed sinc low-pass @FIR_FC, unity DC gain (ds5_av_capture.cpp).
@@ -129,20 +187,21 @@ namespace platf::ds5_bridge {
         for (int i = 0; i < HAP_OUT; ++i)
           hrms += (double) decL_[i] * decL_[i] + (double) decR_[i] * decR_[i];
         hrms = std::sqrt(hrms / (HAP_OUT * 2));
-        // Always publish the block (continuity: an active effect must stream every
-        // ~10.7 ms with no RMS-gate dropouts, or the coil actuation is choppy). The
-        // squelch only decides idle-gating, not whether to store.
         std::array<int8_t, HAPTIC_BYTES> snap {};
         for (int i = 0; i < HAP_OUT; ++i) {
           snap[2 * i] = quantize_one(decL_[i]);
           snap[2 * i + 1] = quantize_one(decR_[i]);
         }
         auto now = std::chrono::steady_clock::now();
+        dbg_blocks_.fetch_add(1, std::memory_order_relaxed);
+        if (hrms > ACTIVE_RMS) dbg_gate_blocks_.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(hap_mtx_);
-        latest_haptic_ = snap;
-        latest_haptic_ts_ = now;
+        // Latest-wins: overwrite the newest snapshot; the pacer sends it next tick.
+        std::memcpy(latest_frame_.data(), snap.data(), HAPTIC_BYTES);
+        latest_ts_ = now;
         have_haptic_ = true;
         if (hrms > ACTIVE_RMS) last_signal_ts_ = now;
+        if (hrms > dbg_max_hrms_) dbg_max_hrms_ = hrms;
         dec_n_ = 0;
       }
     }
@@ -154,6 +213,8 @@ namespace platf::ds5_bridge {
   void ds5_haptic_builder::feed_pcm(const uint8_t *pcm, size_t len) {
     const int16_t *s = reinterpret_cast<const int16_t *>(pcm);
     size_t nframe = (len / 2) / CHANS;  // 4ch int16 frames
+    dbg_feed_frames_.fetch_add(nframe, std::memory_order_relaxed);
+    // Voice-coil (ch2/3) -> FIR-decimated haptic snapshot.
     for (size_t f = 0; f < nframe; ++f) {
       const int16_t *fr = s + f * CHANS;
       curL_[cur_n_] = fr[HAP_L] / 32768.0f;
@@ -163,75 +224,227 @@ namespace platf::ds5_bridge {
         cur_n_ = 0;
       }
     }
+    // Speaker (ch0/1) -> jitter-buffered for per-tick Opus encoding (Phase 2b).
+    spk_push(s, nframe);
   }
 
-  // Encode one 10 ms Opus silence frame into the 0x13 slot of the skeleton. The
-  // DS5 rejects a malformed 0x13, so even the (Phase-2a) silent speaker needs a
-  // valid Opus payload. LOWDELAY/CELT-only, matching ds5_av_play.c's encoder.
-  void ds5_haptic_builder::encode_opus_silence() {
-    uint8_t *slot = skeleton_.data() + OFF_OPUS;
-    std::memset(slot, 0, OPUS_BYTES);
-    int err = 0;
-    OpusEncoder *enc = opus_encoder_create(SR, 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
-    if (err != OPUS_OK || !enc) {
-      if (enc) opus_encoder_destroy(enc);
-      return;  // zero-filled fallback (worst case: speaker click, haptic unaffected)
+  // Extract ch0/1 from the 4ch frames, resample 48 kHz -> drain clock (the DS5's
+  // real 0x36 drain clock — see the RATE MATCH note in the header) and push
+  // onto the speaker ring, dropping the oldest on overflow so queued latency
+  // stays bounded.
+  void ds5_haptic_builder::spk_push(const int16_t *pcm4, size_t nframe) {
+    // Stage the stereo input (resampler state is feed-thread-only).
+    size_t base = rs_pend_.size() / 2;
+    rs_pend_.resize((base + nframe) * 2);
+    for (size_t i = 0; i < nframe; ++i) {
+      const int16_t *fr = pcm4 + i * CHANS;
+      rs_pend_[(base + i) * 2] = fr[SPK_L];
+      rs_pend_[(base + i) * 2 + 1] = fr[SPK_R];
     }
-    opus_encoder_ctl(enc, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
-    opus_encoder_ctl(enc, OPUS_SET_BITRATE(160000));
-    opus_encoder_ctl(enc, OPUS_SET_VBR(0));
-    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(0));
-    float silence[OPUS_FRAME * 2] = {0};
-    int n = opus_encode_float(enc, silence, OPUS_FRAME, slot, OPUS_BYTES);
-    if (n > 0 && n < OPUS_BYTES) std::memset(slot + n, 0, OPUS_BYTES - n);
-    opus_encoder_destroy(enc);
+    // Elastic ratio (audio-clock recovery): one 480-sample frame is consumed
+    // per pace_us_ tick, so the output rate is 480e6/pace_us_ Hz and the input
+    // step per output sample follows the live servo period.
+    const double pace_us = (double) pace_us_.load(std::memory_order_relaxed);
+    const double step = (double) SR * pace_us / ((double) OPUS_FRAME * 1e6);
+    const size_t npend = rs_pend_.size() / 2;
+    const int C = RS_TAPS / 2;  // output at i0+a reads inputs i0-C+1 .. i0+C
+    std::lock_guard<std::mutex> lk(spk_mtx_);
+    // Emit every output sample whose full tap neighborhood is staged. Blend the
+    // two bracketing phase rows so the irrational step never quantizes to a
+    // phase grid (a nearest-phase pick would modulate HF by the grid error).
+    while ((size_t) rs_pos_ + (size_t) C < npend) {
+      const size_t i0 = (size_t) rs_pos_;
+      const double ph = (rs_pos_ - (double) i0) * RS_PHASES;
+      const int p0 = (int) ph;
+      const float pf = (float) (ph - p0);
+      const float *r0 = rs_filt_.data() + (size_t) p0 * RS_TAPS;
+      const float *r1 = r0 + RS_TAPS;
+      const int16_t *in = rs_pend_.data() + (i0 - (C - 1)) * 2;
+      float accL = 0.0f, accR = 0.0f;
+      for (int k = 0; k < RS_TAPS; ++k) {
+        const float c = r0[k] + (r1[k] - r0[k]) * pf;
+        accL += c * in[k * 2];
+        accR += c * in[k * 2 + 1];
+      }
+      auto clamp16 = [](float v) -> int16_t {
+        if (v > 32767.0f) v = 32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        return (int16_t) v;
+      };
+      if (spk_count_ == SPK_RING_FRAMES) {
+        spk_head_ = (spk_head_ + 1) % SPK_RING_FRAMES;  // full -> drop oldest
+        spk_count_--;
+      }
+      size_t w = (spk_head_ + spk_count_) % SPK_RING_FRAMES;
+      spk_ring_[w * 2] = clamp16(accL);
+      spk_ring_[w * 2 + 1] = clamp16(accR);
+      spk_count_++;
+      rs_pos_ += step;
+    }
+    // Retire consumed input, keeping C-1 frames of left-tap history.
+    if ((size_t) rs_pos_ > (size_t) (C - 1)) {
+      size_t keep_from = (size_t) rs_pos_ - (C - 1);
+      rs_pend_.erase(rs_pend_.begin(), rs_pend_.begin() + keep_from * 2);
+      rs_pos_ -= (double) keep_from;
+    }
+    if (rs_pend_.size() / 2 > 8192) {  // backstop against a stalled consumer
+      rs_pend_.clear();
+      rs_pos_ = C - 1;
+    }
   }
 
-  // Fixed 398-byte skeleton: sub-packet headers + audio SetState + Opus silence.
-  // Only seq (buf[1]), pktctr (buf[10]), the haptic payload and the CRC change
-  // per tick (ds5_av_play.c report layout).
+  // Pop exactly OPUS_FRAME stereo frames; 1 on success, 0 if underrun/priming
+  // (caller runs PLC). Latency-drain + jitter-buffer prime ported from ds5_av_play.c.
+  int ds5_haptic_builder::spk_pop_frame(int16_t out[OPUS_FRAME * 2]) {
+    std::lock_guard<std::mutex> lk(spk_mtx_);
+    // Latency drain: if the queue ratcheted above the drain threshold, skip whole
+    // 10 ms frames back to target so speaker latency stays tight to the haptic.
+    // Hysteresis (target < drain) avoids dropping every tick.
+    if (spk_count_ > SPK_LAT_DRAIN) {
+      size_t drop = spk_count_ - SPK_LAT_TARGET;
+      drop -= drop % OPUS_FRAME;
+      spk_head_ = (spk_head_ + drop) % SPK_RING_FRAMES;
+      spk_count_ -= drop;
+    }
+    // Prime: after start/underrun, hold silence until a target cushion rebuilds,
+    // so one late chunk can't re-trigger underruns mid-effect.
+    if (spk_priming_) {
+      if (spk_count_ < SPK_LAT_TARGET) return 0;
+      spk_priming_ = false;
+    }
+    if (spk_count_ < (size_t) OPUS_FRAME) {
+      spk_priming_ = true;
+      return 0;
+    }
+    for (int i = 0; i < OPUS_FRAME; ++i) {
+      size_t r = (spk_head_ + i) % SPK_RING_FRAMES;
+      out[i * 2] = spk_ring_[r * 2];
+      out[i * 2 + 1] = spk_ring_[r * 2 + 1];
+    }
+    spk_head_ = (spk_head_ + OPUS_FRAME) % SPK_RING_FRAMES;
+    spk_count_ -= OPUS_FRAME;
+    return 1;
+  }
+
+  // Fixed 398-byte skeleton: sub-packet headers + audio SetState. seq (buf[1]),
+  // pktctr (buf[10]), the 0x12 haptic payload, the 0x13 Opus payload and the CRC
+  // are written per tick in build_0x36 (ds5_av_play.c report layout).
   void ds5_haptic_builder::build_skeleton() {
     skeleton_.fill(0);
     uint8_t *buf = skeleton_.data();
     buf[0] = 0x36;                                     // report id
-    buf[2] = 0x11 | 0x80; buf[3] = 7; buf[4] = 0xFE;   // config (0x11) sub-packet
-    buf[5] = buf[6] = buf[7] = buf[8] = buf[9] = 255;  // audio_buffer_length=255
+    // 0x91 timing sub-packet (CTM parity): payload = [0xFE][latency ms x5],
+    // plus the audio sequence counter at buf[10] (pktctr_, advanced per send).
+    // The five latency bytes size the pad's own audio jitter buffer; the TV
+    // client live-patches them to its latency slider (default 100 ms) on every
+    // outbound 0x36, so this value is only on-air when that patch is off —
+    // match the slider default rather than the old 255 (max buffering).
+    buf[2] = 0x11 | 0x80; buf[3] = 7; buf[4] = 0xFE;
+    buf[5] = buf[6] = buf[7] = buf[8] = buf[9] = 100;
     buf[11] = 0x10 | 0x80; buf[12] = 63;               // SetState (0x10) sub-packet
     std::memcpy(buf + OFF_SETSTATE, state_audio_data, 63);
     buf[76] = 0x12 | 0x80; buf[77] = HAPTIC_BYTES;     // voice-coil (0x12) sub-packet
     buf[142] = 0x13 | 0x80; buf[143] = OPUS_BYTES;     // Opus speaker (0x13) sub-packet
-    encode_opus_silence();
   }
 
   bool ds5_haptic_builder::build_0x36(uint8_t out[DS5_0X36_LEN]) {
     std::memcpy(out, skeleton_.data(), DS5_0X36_LEN);
-    out[1] = (uint8_t) ((out_seq_ & 0x0F) << 4);
-    out_seq_++;
-    out[10] = pktctr_++;
 
-    bool should_send = false;
+    auto now = std::chrono::steady_clock::now();
+
+    // ---- Speaker (0x13): pop 480 stereo, PLC on underrun, Opus-encode. -----
+    // Encode EVERY tick so the encoder state stays continuous and in-order
+    // (Opus is stateful — a dropped/duplicated frame desyncs the DS5 decoder).
+    int16_t pcm_i[OPUS_FRAME * 2];
+    float pcm_f[OPUS_FRAME * 2];
+    if (spk_pop_frame(pcm_i)) {
+      double srms = 0.0;
+      for (int i = 0; i < OPUS_FRAME * 2; ++i) {
+        pcm_f[i] = pcm_i[i] / 32768.0f;
+        srms += (double) pcm_f[i] * pcm_f[i];
+      }
+      srms = std::sqrt(srms / (OPUS_FRAME * 2));
+      std::memcpy(last_pcm_f_.data(), pcm_f, sizeof(pcm_f));
+      plc_run_ = 0;
+      // Activity keys on AMPLITUDE, not on buffer state: usbaudio streams
+      // digital silence continuously whenever any session holds the endpoint
+      // open, so "a frame was popped" is true forever. Un-gated, that kept
+      // should_send high at 100/s for the whole session — the continuous
+      // reliable 0x36 flood behind the Phase 2b link-drop regression. Squelch
+      // from ds5_av_capture.cpp (the reference gated at the supply instead).
+      if (srms > SPK_RMS) last_spk_ts_ = now;
+      dbg_spk_pop_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      // Packet-loss concealment: a decayed copy of the last good frame. Hard
+      // silence would click; this fades a sustained gap smoothly to zero over
+      // ~8 frames. The 0x13 stays a valid 200-byte Opus frame either way.
+      float g = 1.0f;
+      for (int k = 0; k <= plc_run_; ++k) g *= 0.6f;
+      if (g < 0.02f) g = 0.0f;
+      for (int i = 0; i < OPUS_FRAME * 2; ++i) pcm_f[i] = last_pcm_f_[i] * g;
+      plc_run_++;
+      dbg_spk_plc_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (enc_) {
+      int n = opus_encode_float(enc_, pcm_f, OPUS_FRAME, out + OFF_OPUS, OPUS_BYTES);
+      if (n < 0) std::memset(out + OFF_OPUS, 0, OPUS_BYTES);
+      else if (n < OPUS_BYTES) std::memset(out + OFF_OPUS + n, 0, OPUS_BYTES - n);
+    }
+    // Active while audible signal is inside the grace tail AND the ring is not
+    // in a sustained underrun (SPK_CONCEAL caps how long PLC alone may keep
+    // driving the link if the feed stalls — CTM conceals ~8 frames, then quiets).
+    bool spk_active = (now - last_spk_ts_) < GRACE && plc_run_ <= SPK_CONCEAL;
+
+    // ---- Haptic (0x12): latest-wins, fresh within staleness ---------------
+    bool hap_active = false;
     {
       std::lock_guard<std::mutex> lk(hap_mtx_);
-      auto now = std::chrono::steady_clock::now();
-      if (have_haptic_ && (now - latest_haptic_ts_) <= HAPTIC_STALE) {
-        for (int i = 0; i < HAPTIC_BYTES; ++i)
-          out[OFF_HAPTIC + i] = (uint8_t) latest_haptic_[i];
+      hap_active = have_haptic_ && (now - last_signal_ts_) < GRACE;
+      bool fresh = have_haptic_ && (now - latest_ts_) < HAPTIC_STALE;
+      if (hap_active && fresh) {
+        std::memcpy(out + OFF_HAPTIC, latest_frame_.data(), HAPTIC_BYTES);
+      } else if (hap_active) {
+        // Within grace but the feed went stale -> zeroed coil (skeleton's 0x12 is
+        // already zero) rather than buzz a frozen frame.
+        dbg_stale_.fetch_add(1, std::memory_order_relaxed);
       }
-      // else: the skeleton's zeroed 0x12 payload is copied through -> silence.
-      // Idle-gate on real signal activity (not snapshot freshness): continuous
-      // near-zero blocks during a lull still stop within GRACE, no idle buzz.
-      should_send = have_haptic_ && (now - last_signal_ts_) < GRACE;
+      // else (idle): the skeleton's zeroed 0x12 passes through -> silence.
     }
 
-    // DS5 BT output CRC: CRC32 over the 0xA2 seed byte + bytes [0 .. len-4).
-    const uint8_t seed = PS_OUTPUT_CRC_SEED;
-    uint32_t crc = ds5_crc32_update(0xFFFFFFFFu, &seed, 1);
-    crc = ds5_crc32_update(crc, out, DS5_0X36_LEN - 4);
-    crc = ~crc;
-    out[394] = (uint8_t) (crc & 0xFF);
-    out[395] = (uint8_t) ((crc >> 8) & 0xFF);
-    out[396] = (uint8_t) ((crc >> 16) & 0xFF);
-    out[397] = (uint8_t) ((crc >> 24) & 0xFF);
+    // ---- Idle gate: drive the DS5 while haptic OR speaker is active --------
+    bool should_send = hap_active || spk_active;
+    if (should_send) {
+      dbg_sends_.fetch_add(1, std::memory_order_relaxed);
+      // Advance the BT seq (buf[1]) and audio counter (buf[10]) ONLY on a report
+      // that is actually sent, so the DS5 sees contiguous counters across idle
+      // gaps (holes glitch its Opus playback on resume — ds5_av_play.c does this).
+      out[1] = (uint8_t) ((out_seq_ & 0x0F) << 4);
+      out_seq_++;
+      out[10] = pktctr_++;
+      // DS5 BT output CRC: CRC32 over the 0xA2 seed byte + bytes [0 .. len-4).
+      const uint8_t seed = PS_OUTPUT_CRC_SEED;
+      uint32_t crc = ds5_crc32_update(0xFFFFFFFFu, &seed, 1);
+      crc = ds5_crc32_update(crc, out, DS5_0X36_LEN - 4);
+      crc = ~crc;
+      out[394] = (uint8_t) (crc & 0xFF);
+      out[395] = (uint8_t) ((crc >> 8) & 0xFF);
+      out[396] = (uint8_t) ((crc >> 16) & 0xFF);
+      out[397] = (uint8_t) ((crc >> 24) & 0xFF);
+    }
+
+    if (++dbg_build_ctr_ >= 200) {  // ~every 2 s at 100 Hz
+      dbg_build_ctr_ = 0;
+      double maxh;
+      { std::lock_guard<std::mutex> lk(hap_mtx_); maxh = dbg_max_hrms_; dbg_max_hrms_ = 0.0; }
+      BOOST_LOG(info) << "ds5-haptics: feedframes=" << dbg_feed_frames_.exchange(0)
+                      << " blocks=" << dbg_blocks_.exchange(0)
+                      << " gate=" << dbg_gate_blocks_.exchange(0)
+                      << " sends=" << dbg_sends_.exchange(0)
+                      << " stale=" << dbg_stale_.exchange(0)
+                      << " spkpop=" << dbg_spk_pop_.exchange(0)
+                      << " spkplc=" << dbg_spk_plc_.exchange(0)
+                      << " maxhrms=" << maxh;
+    }
     return should_send;
   }
 
