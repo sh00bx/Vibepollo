@@ -2046,8 +2046,7 @@ namespace video {
                   continue;
                 }
 
-                while (capture_ctx->images->peek()) {
-                  capture_ctx->images->pop();
+                while (capture_ctx->images->try_pop()) {
                 }
 
                 ++capture_ctx;
@@ -2985,6 +2984,17 @@ namespace video {
       if (placeholder_input && !bootstrap_state.should_encode_placeholder()) {
         ++loop_stats.gate_skipped;
         continue;
+      }
+
+      // Re-check teardown right before encode: the image pop above can block up to
+      // max_frametime, during which shutdown/reinit may have been raised. Encoding one
+      // more frame then would put packets in flight after encoder teardown.
+      {
+        const bool reinit_now = reinit_event.peek() && frame_nr > 1;
+        if (shutdown_event->peek() || !images->running() || reinit_now) {
+          force_sync_teardown = reinit_now;
+          break;
+        }
       }
 
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp)) {
