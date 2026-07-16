@@ -258,6 +258,21 @@ namespace platf::ds5_bridge {
       // right back into a drop loop (the Phase 2b ~6 s drop/reconnect cycle, and
       // the "2 drops then stable" connects before it).
       hello_seen_.store(true);
+
+      // BT firmware gate: over Bluetooth the DualSense ignores lightbar color
+      // writes until a one-shot lightbar-setup release (valid_flag2 bit1 +
+      // lightbar_setup=2 — what hid-playstation/SDL send on BT connect). Games
+      // talk to the virtual USB pad and never send it (USB needs none), so
+      // release it here each (re)connect or in-game lightbar colors stay dark.
+      {
+        uint8_t common[USB_OUTPUT_COMMON_LEN] = {0};
+        common[38] = 0x02;  // valid_flag2: LIGHTBAR_SETUP_CONTROL_ENABLE
+        common[41] = 0x02;  // lightbar_setup: LIGHT_OUT
+        uint8_t bt[BT_OUTPUT_LEN];
+        usb_output_to_bt(common, out_seq_++, bt);
+        std::lock_guard<std::mutex> lk(out_mtx_);
+        outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
+      }
     }
 
     // Session/run thread: inject-queue telemetry from the TV daemon (~4/s).
