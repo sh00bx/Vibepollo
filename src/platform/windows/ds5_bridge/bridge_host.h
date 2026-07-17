@@ -79,7 +79,12 @@ namespace platf::ds5_bridge {
     std::thread control_thread_;
 
     std::mutex sessions_mtx_;
-    std::map<std::string, std::unique_ptr<bridge_session>> sessions_;
+    // Keyed by data port — the controller's stable identity across reconnects.
+    // The TV's busid is only a label (it restarts from ctm-ds5-1 whenever the
+    // TV app relaunches, so keying by busid let a reconnecting pad collide with
+    // — and destroy — another pad's live session). BRIDGE_STOP resolves busids
+    // by scanning the labels.
+    std::map<int, std::unique_ptr<bridge_session>> sessions_;
   };
 
 }  // namespace platf::ds5_bridge

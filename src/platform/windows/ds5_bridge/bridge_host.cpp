@@ -59,8 +59,12 @@ namespace platf::ds5_bridge {
   public:
     bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, bool haptics,
                    const std::atomic<uint32_t> *lightbar_rgb):
-        usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport), haptics_(haptics),
-        lightbar_rgb_(lightbar_rgb) {}
+        usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport),
+        lightbar_rgb_(lightbar_rgb) { haptics_want_.store(haptics); }
+
+    /// Control thread, on every BRIDGE_START for this session (incl. adopts).
+    /// Takes effect at the next HELLO (see on_hello).
+    void set_haptics(bool on) { haptics_want_.store(on, std::memory_order_relaxed); }
 
     ~bridge_session() { stop(); }
 
@@ -89,11 +93,14 @@ namespace platf::ds5_bridge {
       ctmb_busid_ = busid;
     }
 
-  private:
+    /// Current busid label (control thread resolves BRIDGE_STOP by scanning
+    /// these; also used in log lines on the session thread).
     std::string label() {
       std::lock_guard<std::mutex> lk(label_mtx_);
       return ctmb_busid_;
     }
+
+  private:
 
     // ---- outbound message send (transport-agnostic) -----------------------
     void send_msg(uint16_t type, uint32_t flags, uint32_t request_id,
@@ -152,6 +159,13 @@ namespace platf::ds5_bridge {
 
     // ---- inbound message dispatch -----------------------------------------
     void on_message(const ctmb_header_t *h, const uint8_t *payload) {
+      // Any non-HELLO inbound frame proves the client's handshake() consumed
+      // HOST_CONFIG (it hard-fails and drops the link otherwise) — from here the
+      // unreliable ch1 0x36 stream can no longer overtake a lost-and-
+      // retransmitted HOST_CONFIG and kill the fresh session.
+      if (h->type != CTMB_MSG_HELLO) {
+        client_ready_.store(true, std::memory_order_relaxed);
+      }
       switch (h->type) {
         case CTMB_MSG_HELLO:
           on_hello(h, payload);
@@ -207,25 +221,43 @@ namespace platf::ds5_bridge {
             return 0;
           });
         // Phase 2: capture the game's iso-OUT PCM and drive a paced 0x36 haptic
-        // stream. Wire the hook before the attach below (which is when the game
-        // starts writing), and start the 10 ms pacer. Off unless configured.
-        if (haptics_) {
-          hap_ = std::make_unique<ds5_haptic_builder>();
-          slot_->on_iso_out = [this](const uint8_t *pcm, size_t len) {
-            if (hap_) hap_->feed_pcm(pcm, len);
-          };
-          pacer_stop_.store(false);
-          pacer_thread_ = std::thread(&bridge_session::pacer_run, this);
-        }
+        // stream. The builder is cheap (DSP tables + one Opus encoder, no device
+        // handles), so it and the pacer are set up unconditionally and gated at
+        // runtime by haptics_on_ — that lets a config flip land on the next HELLO
+        // of an adopted session without racing the usbip iso callback. Wire the
+        // hook before the attach below (which is when the game starts writing).
+        hap_ = std::make_unique<ds5_haptic_builder>();
+        slot_->on_iso_out = [this](const uint8_t *pcm, size_t len) {
+          if (hap_ && haptics_on_.load(std::memory_order_relaxed)) hap_->feed_pcm(pcm, len);
+        };
+        pacer_stop_.store(false);
+        pacer_thread_ = std::thread(&bridge_session::pacer_run, this);
         // Attach off the session thread: `usbip attach` spawns a CLI + two port
         // snapshots (a couple of seconds); the loop must keep servicing ENet in
         // the meantime or the client link would go unpinged.
         std::string busid = slot_->busid;
         attach_thread_ = std::thread([this, busid] { vhci_port_.store(vhci_attach(busid)); });
         BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " up (serial="sv
-                        << serial << ", usbip busid="sv << busid
-                        << (haptics_ ? ", haptics on"sv : ""sv) << ")"sv;
+                        << serial << ", usbip busid="sv << busid << ")"sv;
       }
+
+      // Latch the configured haptics state for this connect (see haptics_want_).
+      {
+        const bool want = haptics_want_.load(std::memory_order_relaxed);
+        if (want != haptics_on_.load(std::memory_order_relaxed)) {
+          haptics_on_.store(want, std::memory_order_relaxed);
+          BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " haptics "sv
+                          << (want ? "on"sv : "off"sv) << " (applied on HELLO)"sv;
+        }
+      }
+
+      // The fresh handshake starts unconfirmed: hold the unreliable 0x36 stream
+      // until the first post-HELLO inbound frame proves the client got
+      // HOST_CONFIG (see client_ready_).
+      client_ready_.store(false, std::memory_order_relaxed);
+      // A re-HELLO can mean a re-paired BT link whose firmware re-latched the
+      // lightbar-setup gate — re-arm so the release is folded again.
+      lb_released_.store(false, std::memory_order_relaxed);
 
       // Always (re)answer the handshake: the client waits for HOST_CONFIG on every
       // (re)connect (needs_host_config), so this must be sent each HELLO.
@@ -347,10 +379,10 @@ namespace platf::ds5_bridge {
       // switched to extended BT mode (the 0x05/0x09/0x20 feature reads do the
       // unlock, asynchronously). Fold the release into the game's own first
       // reports too — SDL ships it combined with color/rumble the same way.
-      if (!lb_released_) {
+      if (!lb_released_.load(std::memory_order_relaxed)) {
         common[38] |= 0x02;  // valid_flag2: LIGHTBAR_SETUP_CONTROL_ENABLE
         common[41] = 0x02;   // lightbar_setup: LIGHT_OUT
-        lb_released_ = true;
+        lb_released_.store(true, std::memory_order_relaxed);
       }
       // Synthetic lightbar: libScePad titles write the lightbar once at pad
       // init — to black — and never again (on the PS5 the OS supplies the
@@ -359,23 +391,29 @@ namespace platf::ds5_bridge {
       // back to the synth — libScePad writes black both at pad init and as its
       // exit reset, so without the hand-back the bar goes dark for the rest of
       // the connect once a lightbar-aware game quits.
+      bool owned = lb_game_owned_.load(std::memory_order_relaxed);
       if (common[1] & 0x04) {
-        lb_game_owned_.store((common[44] | common[45] | common[46]) != 0, std::memory_order_relaxed);
+        owned = (common[44] | common[45] | common[46]) != 0;
       }
       const uint32_t synth = lightbar_rgb_ ? lightbar_rgb_->load(std::memory_order_relaxed) : LIGHTBAR_OFF;
-      if (!lb_game_owned_.load(std::memory_order_relaxed) && synth != LIGHTBAR_OFF) {
+      if (!owned && synth != LIGHTBAR_OFF) {
         common[1] |= 0x04;  // valid_flag1: LIGHTBAR_CONTROL_ENABLE
         common[44] = (uint8_t) (synth >> 16);
         common[45] = (uint8_t) (synth >> 8);
         common[46] = (uint8_t) synth;
         lb_last_paint_ms_.store(now_ms(), std::memory_order_relaxed);
       }
-      // Diagnostics: first outputs per connect, plus any lightbar color change.
+      // Diagnostics: first outputs per connect, plus lightbar color changes at
+      // most once a second (games animating the bar write a new RGB on every
+      // report — unthrottled that was ~60 log lines/s on the rumble thread).
       const bool lb_write = (common[1] & 0x04) != 0;
       const bool rgb_changed = lb_write && (common[44] != dbg_rgb_[0] || common[45] != dbg_rgb_[1] || common[46] != dbg_rgb_[2]);
-      if (dbg_out_n_ < 10 || rgb_changed) {
-        ++dbg_out_n_;
-        if (lb_write) { dbg_rgb_[0] = common[44]; dbg_rgb_[1] = common[45]; dbg_rgb_[2] = common[46]; }
+      if (lb_write) { dbg_rgb_[0] = common[44]; dbg_rgb_[1] = common[45]; dbg_rgb_[2] = common[46]; }
+      const int64_t dbg_now = now_ms();
+      if (dbg_out_n_.load(std::memory_order_relaxed) < 10 ||
+          (rgb_changed && dbg_now - dbg_rgb_log_ms_ >= 1000)) {
+        dbg_out_n_.fetch_add(1, std::memory_order_relaxed);
+        dbg_rgb_log_ms_ = dbg_now;
         char msg[128];
         std::snprintf(msg, sizeof(msg),
                       "ds5-out: f0=%02x f1=%02x f2=%02x motors=%02x/%02x setup=%02x pled=%02x rgb=%02x%02x%02x",
@@ -385,7 +423,11 @@ namespace platf::ds5_bridge {
       }
       uint8_t bt[BT_OUTPUT_LEN];
       usb_output_to_bt(common, out_seq_.fetch_add(1, std::memory_order_relaxed), bt);
+      // Publish ownership and enqueue as one unit under out_mtx_: the keep-alive
+      // re-checks ownership under the same lock before pushing, so a synth paint
+      // can never land in the outbox after the game's first color write.
       std::lock_guard<std::mutex> lk(out_mtx_);
+      lb_game_owned_.store(owned, std::memory_order_relaxed);
       outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
     }
 
@@ -405,13 +447,26 @@ namespace platf::ds5_bridge {
       if (now - lb_last_paint_ms_.load(std::memory_order_relaxed) < 5000) return;
       lb_last_paint_ms_.store(now, std::memory_order_relaxed);
       uint8_t common[USB_OUTPUT_COMMON_LEN] = {0};
+      // Keep folding the BT lightbar-setup release until a game output latches
+      // it: a re-paired BT link re-latches the firmware gate, and without the
+      // release every color-only repaint is silently ignored — the very
+      // scenario this keep-alive exists for.
+      if (!lb_released_.load(std::memory_order_relaxed)) {
+        common[38] = 0x02;  // valid_flag2: LIGHTBAR_SETUP_CONTROL_ENABLE
+        common[41] = 0x02;  // lightbar_setup: LIGHT_OUT
+      }
       common[1] = 0x04;  // valid_flag1: LIGHTBAR_CONTROL_ENABLE
       common[44] = (uint8_t) (synth >> 16);
       common[45] = (uint8_t) (synth >> 8);
       common[46] = (uint8_t) synth;
       uint8_t bt[BT_OUTPUT_LEN];
       usb_output_to_bt(common, out_seq_.fetch_add(1, std::memory_order_relaxed), bt);
+      // Ownership re-check and push are one unit under out_mtx_ (see
+      // on_game_output): without this, a game's first color write racing the
+      // 5 s tick could be overpainted by a stale synth frame for the rest of
+      // the session.
       std::lock_guard<std::mutex> lk(out_mtx_);
+      if (lb_game_owned_.load(std::memory_order_relaxed)) return;
       outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
     }
 
@@ -468,8 +523,12 @@ namespace platf::ds5_bridge {
         auto now = steady_clock::now();
         if (now - next > milliseconds(100)) next = now;  // genuine stall: no catch-up burst
         else if (next > now && hpt && *hpt) hpt->sleep_for(next - now);
-        if (!hap_) continue;
-        if (hap_->build_0x36(rep) && hello_seen_.load(std::memory_order_relaxed)) {
+        if (!hap_ || !haptics_on_.load(std::memory_order_relaxed)) continue;
+        // client_ready_ (not hello_seen_): 0x36 rides UNRELIABLE ch1, so it can
+        // overtake a lost HOST_CONFIG (reliable ch0) and hard-fail the TV's
+        // handshake. Wait for the first post-HELLO inbound frame instead; the
+        // dropped frames are disposable.
+        if (hap_->build_0x36(rep) && client_ready_.load(std::memory_order_relaxed)) {
           std::lock_guard<std::mutex> lk(out_mtx_);
           if (outbox_.size() < 256) outbox_.emplace_back(rep, rep + DS5_0X36_LEN);
         }
@@ -581,12 +640,13 @@ namespace platf::ds5_bridge {
       // handshake fails hard on any pre-HOST_CONFIG frame. hello_seen_ regates
       // the producers; the outbox drops what already accumulated.
       hello_seen_.store(false);
+      client_ready_.store(false, std::memory_order_relaxed);
       { std::lock_guard<std::mutex> lk(out_mtx_); outbox_.clear(); }
       // Fresh link may be a fresh pad connect: re-arm the lightbar-setup
       // release, lightbar ownership and the per-connect output diagnostics.
-      lb_released_ = false;
+      lb_released_.store(false, std::memory_order_relaxed);
       lb_game_owned_.store(false, std::memory_order_relaxed);
-      dbg_out_n_ = 0;
+      dbg_out_n_.store(0, std::memory_order_relaxed);
       // Servo: the next session may be a fresh daemon run (drop_total restarts)
       // — rebase the delta and fall back to the static margin until feedback
       // flows again. The learned adj is kept; it decays on clean samples.
@@ -689,9 +749,14 @@ namespace platf::ds5_bridge {
     std::mutex label_mtx_;
     std::string ctmb_busid_;  // guarded by label_mtx_ (relabel from control thread)
     int dport_;
-    bool haptics_ {false};
+    // Desired HD-haptics state (config), pushed by the control thread on every
+    // BRIDGE_START (incl. adopts); latched into haptics_on_ at the next HELLO so
+    // the documented "takes effect on the next connect" A/B semantics hold even
+    // though adopted sessions never re-run the constructor.
+    std::atomic<bool> haptics_want_ {false};
+    std::atomic<bool> haptics_on_ {false};
 
-    std::unique_ptr<ds5_haptic_builder> hap_;   // Phase 2 0x36 builder (if haptics_)
+    std::unique_ptr<ds5_haptic_builder> hap_;   // Phase 2 0x36 builder (gated by haptics_on_)
     std::thread pacer_thread_;
     std::atomic<bool> pacer_stop_ {false};
 
@@ -726,12 +791,19 @@ namespace platf::ds5_bridge {
     // (on_game_output) and the session thread (HELLO paint, lightbar
     // keep-alive), hence atomic.
     std::atomic<uint8_t> out_seq_ {0};
-    bool lb_released_ {false};
+    // Lightbar state crosses the usbip server thread (on_game_output), the
+    // session thread (HELLO paint, keep-alive, reset_transport) and the control
+    // thread — all flags atomic. dbg_rgb_/dbg_rgb_log_ms_ are usbip-thread-only.
+    std::atomic<bool> lb_released_ {false};
     std::atomic<bool> lb_game_owned_ {false};
     std::atomic<int64_t> lb_last_paint_ms_ {0};
     const std::atomic<uint32_t> *lightbar_rgb_ {nullptr};
-    uint32_t dbg_out_n_ {0};
+    std::atomic<uint32_t> dbg_out_n_ {0};
     uint8_t dbg_rgb_[3] {};
+    int64_t dbg_rgb_log_ms_ {0};
+    // Set on the first post-HELLO inbound frame; gates the unreliable 0x36
+    // stream so it cannot outrun a lost HOST_CONFIG (see on_message).
+    std::atomic<bool> client_ready_ {false};
 
     std::mutex out_mtx_;
     std::deque<std::vector<uint8_t>> outbox_;
@@ -853,28 +925,26 @@ namespace platf::ds5_bridge {
       }
       std::lock_guard<std::mutex> lk(sessions_mtx_);
       // The data port is a controller's stable identity across reconnects: the TV
-      // reuses it but issues a fresh busid each time (ctm-ds5-1 -> ctm-ds5-2 ...).
-      // If a session already owns this dport, adopt it — its ENet host, usbip slot
-      // and vhci attach stay up, so the game never sees a re-plug — and just
-      // relabel it to the incoming busid so a later BRIDGE_STOP resolves. Spinning
-      // up a second session would only race for the same port: enet_host_create
-      // fails and the loser lingers as a zombie TCP-fallback session the
-      // reconnecting peer never reaches.
-      for (auto it = sessions_.begin(); it != sessions_.end(); ++it) {
-        if (it->second->dport() != dport) continue;
-        if (it->first != busid) {
-          auto sess = std::move(it->second);
-          sessions_.erase(it);
-          sess->relabel(busid);
-          sessions_[busid] = std::move(sess);
-        }
+      // reuses it but issues a fresh busid each time (ctm-ds5-1 -> ctm-ds5-2 ...,
+      // restarting from 1 whenever the TV app relaunches). The map is keyed by
+      // dport for exactly that reason — a reused busid must never collide with
+      // (let alone destroy) another pad's live session. If a session already owns
+      // this dport, adopt it — its ENet host, usbip slot and vhci attach stay up,
+      // so the game never sees a re-plug — and just relabel it to the incoming
+      // busid so a later BRIDGE_STOP resolves. Spinning up a second session would
+      // only race for the same port: enet_host_create fails and the loser lingers
+      // as a zombie TCP-fallback session the reconnecting peer never reaches.
+      auto it = sessions_.find(dport);
+      if (it != sessions_.end()) {
+        it->second->relabel(busid);
+        it->second->set_haptics(haptics_.load());
         BOOST_LOG(info) << "ds5-bridge: BRIDGE_START ds5 port="sv << dport << " busid="sv
                         << busid << " (reconnect; adopted live session on this port)"sv;
         return "OK";
       }
       auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, haptics_.load(), &lightbar_rgb_);
       sess->start();
-      sessions_[busid] = std::move(sess);
+      sessions_[dport] = std::move(sess);
       BOOST_LOG(info) << "ds5-bridge: BRIDGE_START ds5 port="sv << dport << " busid="sv << busid;
       return "OK";
     }
@@ -891,12 +961,15 @@ namespace platf::ds5_bridge {
     std::unique_ptr<bridge_session> victim;
     {
       std::lock_guard<std::mutex> lk(sessions_mtx_);
-      auto it = sessions_.find(busid);
-      if (it == sessions_.end()) return;
-      victim = std::move(it->second);
-      sessions_.erase(it);
+      for (auto it = sessions_.begin(); it != sessions_.end(); ++it) {
+        if (it->second->label() != busid) continue;
+        victim = std::move(it->second);
+        sessions_.erase(it);
+        break;
+      }
+      if (!victim) return;  // stale busid (e.g. from before a TV app relaunch)
     }
-    if (victim) victim->stop();  // join outside the lock
+    victim->stop();  // join outside the lock
     BOOST_LOG(info) << "ds5-bridge: BRIDGE_STOP busid="sv << busid;
   }
 
