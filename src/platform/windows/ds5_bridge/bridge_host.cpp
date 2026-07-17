@@ -279,6 +279,7 @@ namespace platf::ds5_bridge {
           common[44] = (uint8_t) (synth >> 16);
           common[45] = (uint8_t) (synth >> 8);
           common[46] = (uint8_t) synth;
+          lb_last_paint_ms_.store(now_ms(), std::memory_order_relaxed);
         }
         uint8_t bt[BT_OUTPUT_LEN];
         usb_output_to_bt(common, out_seq_++, bt);
@@ -353,18 +354,21 @@ namespace platf::ds5_bridge {
       }
       // Synthetic lightbar: libScePad titles write the lightbar once at pad
       // init — to black — and never again (on the PS5 the OS supplies the
-      // player color), so the bar stays dark on PC. Paint the configured color
-      // until the game writes a non-black color of its own; from then on the
-      // game owns the lightbar for the rest of the connect.
-      if ((common[1] & 0x04) && (common[44] | common[45] | common[46]) != 0) {
-        lb_game_owned_ = true;
+      // player color), so the bar stays dark on PC. Ownership follows the last
+      // lightbar write: a real color hands the bar to the game, black hands it
+      // back to the synth — libScePad writes black both at pad init and as its
+      // exit reset, so without the hand-back the bar goes dark for the rest of
+      // the connect once a lightbar-aware game quits.
+      if (common[1] & 0x04) {
+        lb_game_owned_.store((common[44] | common[45] | common[46]) != 0, std::memory_order_relaxed);
       }
       const uint32_t synth = lightbar_rgb_ ? lightbar_rgb_->load(std::memory_order_relaxed) : LIGHTBAR_OFF;
-      if (!lb_game_owned_ && synth != LIGHTBAR_OFF) {
+      if (!lb_game_owned_.load(std::memory_order_relaxed) && synth != LIGHTBAR_OFF) {
         common[1] |= 0x04;  // valid_flag1: LIGHTBAR_CONTROL_ENABLE
         common[44] = (uint8_t) (synth >> 16);
         common[45] = (uint8_t) (synth >> 8);
         common[46] = (uint8_t) synth;
+        lb_last_paint_ms_.store(now_ms(), std::memory_order_relaxed);
       }
       // Diagnostics: first outputs per connect, plus any lightbar color change.
       const bool lb_write = (common[1] & 0x04) != 0;
@@ -379,6 +383,32 @@ namespace platf::ds5_bridge {
                       common[41], common[43], common[44], common[45], common[46]);
         BOOST_LOG(info) << msg;
       }
+      uint8_t bt[BT_OUTPUT_LEN];
+      usb_output_to_bt(common, out_seq_++, bt);
+      std::lock_guard<std::mutex> lk(out_mtx_);
+      outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
+    }
+
+    static int64_t now_ms() {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // Session thread: repaint the synthetic lightbar color every few seconds
+    // while connected and no game owns the bar (see on_game_output).
+    void maybe_repaint_lightbar() {
+      if (!hello_seen_.load(std::memory_order_relaxed)) return;
+      if (lb_game_owned_.load(std::memory_order_relaxed)) return;
+      const uint32_t synth = lightbar_rgb_ ? lightbar_rgb_->load(std::memory_order_relaxed) : LIGHTBAR_OFF;
+      if (synth == LIGHTBAR_OFF) return;
+      const int64_t now = now_ms();
+      if (now - lb_last_paint_ms_.load(std::memory_order_relaxed) < 5000) return;
+      lb_last_paint_ms_.store(now, std::memory_order_relaxed);
+      uint8_t common[USB_OUTPUT_COMMON_LEN] = {0};
+      common[1] = 0x04;  // valid_flag1: LIGHTBAR_CONTROL_ENABLE
+      common[44] = (uint8_t) (synth >> 16);
+      common[45] = (uint8_t) (synth >> 8);
+      common[46] = (uint8_t) synth;
       uint8_t bt[BT_OUTPUT_LEN];
       usb_output_to_bt(common, out_seq_++, bt);
       std::lock_guard<std::mutex> lk(out_mtx_);
@@ -526,6 +556,12 @@ namespace platf::ds5_bridge {
         // 3) Flush outbound (paced BT output reports produced by the game).
         drain_outbox();
 
+        // 3b) Lightbar keep-alive: after a lightbar-aware game exits there are
+        // no further game outputs to ride on, and a BT re-pair can drop the
+        // latched color. Repaint the synthetic color at a slow cadence while
+        // no game owns the bar.
+        maybe_repaint_lightbar();
+
         // 4) A dropped link recycles the transport (the client reconnects to the
         // same port and re-HELLOs) — the virtual device + vhci stay attached.
         if (link_down_) reset_transport();
@@ -549,7 +585,7 @@ namespace platf::ds5_bridge {
       // Fresh link may be a fresh pad connect: re-arm the lightbar-setup
       // release, lightbar ownership and the per-connect output diagnostics.
       lb_released_ = false;
-      lb_game_owned_ = false;
+      lb_game_owned_.store(false, std::memory_order_relaxed);
       dbg_out_n_ = 0;
       // Servo: the next session may be a fresh daemon run (drop_total restarts)
       // — rebase the delta and fall back to the static margin until feedback
@@ -688,7 +724,8 @@ namespace platf::ds5_bridge {
     uint32_t seq_ {0};
     uint8_t out_seq_ {0};
     bool lb_released_ {false};
-    bool lb_game_owned_ {false};
+    std::atomic<bool> lb_game_owned_ {false};
+    std::atomic<int64_t> lb_last_paint_ms_ {0};
     const std::atomic<uint32_t> *lightbar_rgb_ {nullptr};
     uint32_t dbg_out_n_ {0};
     uint8_t dbg_rgb_[3] {};
