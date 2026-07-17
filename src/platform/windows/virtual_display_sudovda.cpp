@@ -2996,13 +2996,18 @@ namespace VDISPLAY_SUDOVDA {
     const std::optional<std::string> hdr_profile = std::string(s_hdr_profile);
 
     // Physical displays: best-effort apply; do not clear mismatched profiles.
+    // Synchronous (like the virtual-display call sites): a detached apply could
+    // poke Windows Advanced Color AFTER the capture gate opened — a mid-stream
+    // colorspace change is exactly the reinit class the v2 display helper
+    // serializes ahead of the gate.
     apply_hdr_profile_if_available(
       std::nullopt,
       device_id,
       std::nullopt,
       client_name,
       hdr_profile,
-      false
+      false,
+      true
     );
   }
 

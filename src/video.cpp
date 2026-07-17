@@ -5128,7 +5128,11 @@ namespace video {
     // Probing only validates encoder capability (10-bit HDR probes encode fine against an
     // SDR desktop), so it must not pay the settle wait: 2s per HDR probe adds multiple
     // seconds to service start and every reprobe.
-    if (config.dynamicRange && !hdr_display && !config.prefer_sdr_10bit && !probing) {
+    // force_sdr sessions (client asked HDR but the session deliberately encodes
+    // SDR — hdr_request_override, or a display policy that resolves HDR off)
+    // must not pay the settle wait: their display is *expected* to stay SDR, so
+    // the poll would burn the full 2 s on every connect.
+    if (config.dynamicRange && !hdr_display && !config.prefer_sdr_10bit && !config.force_sdr && !probing) {
       const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
       int settle_ms = 0;
       while (std::chrono::steady_clock::now() < settle_deadline) {

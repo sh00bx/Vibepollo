@@ -790,6 +790,7 @@ namespace nvhttp {
           // Virtual-display creation may eagerly enable HDR. Default to no state change so
           // "Do not change HDR" preserves the retained Windows setting.
           bool virtual_display_hdr_requested = false;
+          bool virtual_display_hdr_forced_off = false;
           display_helper_integration::helpers::SessionDisplayConfigurationHelper initial_display_helper(config::video, *launch_session, true);
           if (auto initial_configuration = initial_display_helper.initial_virtual_display_configuration()) {
             if (initial_configuration->m_resolution &&
@@ -803,6 +804,8 @@ namespace nvhttp {
             if (initial_configuration->m_hdr_state) {
               virtual_display_hdr_requested =
                 *initial_configuration->m_hdr_state == display_device::HdrState::Enabled;
+              virtual_display_hdr_forced_off =
+                *initial_configuration->m_hdr_state == display_device::HdrState::Disabled;
             }
           }
           const uint32_t base_vd_fps_millihz = launch_session->client_display_refresh_millihz > 0 ?
@@ -898,6 +901,15 @@ namespace nvhttp {
           if (display_info) {
             launch_session->virtual_display = true;
             launch_session->virtual_display_failed = false;
+            // The display policy explicitly resolves HDR OFF for this virtual
+            // display, so it will never flip to HDR — encode SDR deliberately
+            // instead of letting the encode path's HDR settle poll time out
+            // (2 s) on every connect. "Do not change HDR" (no m_hdr_state) is
+            // NOT forced: the retained Windows state may legitimately be HDR.
+            if (virtual_display_hdr_forced_off && launch_session->enable_hdr && !launch_session->force_sdr) {
+              launch_session->force_sdr = true;
+              BOOST_LOG(info) << "Display policy resolves HDR off for the virtual display; encoding SDR (skipping the HDR settle wait).";
+            }
             if (display_info->device_id && !display_info->device_id->empty()) {
               launch_session->virtual_display_device_id = *display_info->device_id;
             } else if (auto resolved_device = VDISPLAY::resolveActiveVirtualDisplayDeviceIdForStableId(
