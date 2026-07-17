@@ -3,9 +3,12 @@
  * @brief Native DS5 bridge provider supervisor (see header).
  */
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <stop_token>
+#include <string>
 #include <thread>
 
 #include "src/config.h"
@@ -22,6 +25,24 @@ namespace ds5_bridge_provider {
     // Poll interval for the supervisor loop, in 100ms steps (5s total).
     constexpr int kTickSteps = 50;
 
+    /// Parse the ds5_lightbar_color config value ("RRGGBB", optional '#';
+    /// empty/"off"/"none"/"disabled" or anything malformed disables the synth).
+    uint32_t parse_lightbar(const std::string &raw) {
+      std::string h;
+      for (char c : raw) {
+        if (!std::isspace((unsigned char) c) && c != '#') {
+          h += (char) std::tolower((unsigned char) c);
+        }
+      }
+      if (h.empty() || h == "off" || h == "none" || h == "disabled") {
+        return platf::ds5_bridge::LIGHTBAR_OFF;
+      }
+      if (h.size() != 6 || h.find_first_not_of("0123456789abcdef") != std::string::npos) {
+        return platf::ds5_bridge::LIGHTBAR_OFF;
+      }
+      return (uint32_t) std::strtoul(h.c_str(), nullptr, 16);
+    }
+
     platf::ds5_bridge::bridge_host &host() {
       static platf::ds5_bridge::bridge_host h;
       return h;
@@ -34,11 +55,13 @@ namespace ds5_bridge_provider {
       while (!st.stop_requested()) {
         bool enable, ctm_enable, haptics;
         int port;
+        std::string lightbar;
         {
           std::lock_guard<std::mutex> lk(config::ds5b_mutex);
           enable = config::ds5b.native_bridge;
           port = config::ds5b.port;
           haptics = config::ds5b.native_haptics;
+          lightbar = config::ds5b.lightbar_color;
         }
         {
           std::lock_guard<std::mutex> lk(config::ctm_mutex);
@@ -61,6 +84,7 @@ namespace ds5_bridge_provider {
         }
 
         host().set_haptics(haptics);
+        host().set_lightbar(parse_lightbar(lightbar));
         if (want && !started) {
           started = host().start(port);
         } else if (!want && started) {
