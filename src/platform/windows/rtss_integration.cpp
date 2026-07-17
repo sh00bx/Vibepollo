@@ -412,7 +412,7 @@ namespace platf {
         if (ensure_hooks_loaded()) {
           applied = set_profile_property_int("FramerateLimit", value).has_value();
         }
-        if (!applied && write_profile_value_int(root, "FramerateLimit", value)) {
+        if (!applied && write_profile_value_int(root, "Limit", value)) {
           applied = true;
         }
         if (!applied) {
@@ -503,6 +503,11 @@ namespace platf {
         }
         std::string needle = std::string(key) + '=';
         auto pos = content.find(needle);
+        // Key must start a line: a bare find would also hit substrings of longer keys
+        // (e.g. "Limit=" inside a stale "FramerateLimit=" line).
+        while (pos != std::string::npos && pos != 0 && content[pos - 1] != '\n' && content[pos - 1] != '\r') {
+          pos = content.find(needle, pos + 1);
+        }
         if (pos == std::string::npos) {
           return std::nullopt;
         }
@@ -536,6 +541,11 @@ namespace platf {
         }
         std::string needle = std::string(key) + '=';
         auto pos = content.find(needle);
+        // Key must start a line: a bare find would also hit substrings of longer keys
+        // (e.g. "Limit=" inside a stale "FramerateLimit=" line).
+        while (pos != std::string::npos && pos != 0 && content[pos - 1] != '\n' && content[pos - 1] != '\r') {
+          pos = content.find(needle, pos + 1);
+        }
         char buf[64];
         snprintf(buf, sizeof(buf), "%s=%d", key, new_value);
         if (pos != std::string::npos) {
@@ -1053,7 +1063,7 @@ namespace platf {
                       << ", syncLimiter="
                       << (g_original_sync_limiter.has_value() ? std::to_string(*g_original_sync_limiter) : std::string("<unset>"));
     } else {
-      g_original_limit = read_profile_value_int(g_rtss_root, "FramerateLimit");
+      g_original_limit = read_profile_value_int(g_rtss_root, "Limit");
       g_original_sync_limiter = read_profile_value_int(g_rtss_root, "SyncLimiter");
       BOOST_LOG(info) << "RTSS profile snapshot: limit="
                       << (g_original_limit.has_value() ? std::to_string(*g_original_limit) : std::string("<unset>"))
@@ -1127,7 +1137,7 @@ namespace platf {
       if (limit_already_set) {
         BOOST_LOG(info) << "RTSS profile framerate limit already "sv << applied_limit << " ("sv << limit_fps << "Hz)"sv;
         g_limit_active = true;
-      } else if (write_profile_value_int(g_rtss_root, "FramerateLimit", applied_limit)) {
+      } else if (write_profile_value_int(g_rtss_root, "Limit", applied_limit)) {
         BOOST_LOG(info) << "RTSS profile framerate limit set to "sv << applied_limit << " ("sv << limit_fps << "Hz)"sv;
         g_limit_active = true;
         g_limit_modified = true;
@@ -1253,7 +1263,7 @@ namespace platf {
     if (hooks_available()) {
       limit_applied = set_profile_property_int("FramerateLimit", applied_limit).has_value();
     }
-    if (!limit_applied && write_profile_value_int(g_rtss_root, "FramerateLimit", applied_limit)) {
+    if (!limit_applied && write_profile_value_int(g_rtss_root, "Limit", applied_limit)) {
       limit_applied = true;
     }
     if (limit_applied) {
@@ -1362,7 +1372,7 @@ namespace platf {
       if (hooks_available()) {
         restored = set_profile_property_int("FramerateLimit", original_limit).has_value();
       }
-      if (!restored && write_profile_value_int(g_rtss_root, "FramerateLimit", original_limit)) {
+      if (!restored && write_profile_value_int(g_rtss_root, "Limit", original_limit)) {
         restored = true;
         BOOST_LOG(info) << "RTSS profile framerate limit restored to "sv << original_limit;
         if (hooks_available()) {
