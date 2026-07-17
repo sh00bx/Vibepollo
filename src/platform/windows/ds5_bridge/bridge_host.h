@@ -30,6 +30,10 @@
 
 namespace platf::ds5_bridge {
 
+  /// Sentinel for "no synthetic lightbar color" (top byte set — real colors
+  /// are plain 0x00RRGGBB).
+  inline constexpr uint32_t LIGHTBAR_OFF = 0xFF000000u;
+
   class bridge_session;
 
   class bridge_host {
@@ -53,6 +57,10 @@ namespace platf::ds5_bridge {
     /// controller connect), so flipping it takes effect on the next connect.
     void set_haptics(bool on) { haptics_.store(on); }
 
+    /// Synthetic lightbar color (0x00RRGGBB) or LIGHTBAR_OFF. Sessions read it
+    /// live on every game output, so config changes apply immediately.
+    void set_lightbar(uint32_t rgb) { lightbar_rgb_.store(rgb); }
+
   private:
     void control_loop();
     std::string handle_command(const std::string &line);
@@ -61,6 +69,7 @@ namespace platf::ds5_bridge {
     std::atomic<bool> running_ {false};
     std::atomic<bool> stop_ {false};
     std::atomic<bool> haptics_ {false};
+    std::atomic<uint32_t> lightbar_rgb_ {LIGHTBAR_OFF};
     int port_ {48054};
 
     usbip_ds5_device usbip_;

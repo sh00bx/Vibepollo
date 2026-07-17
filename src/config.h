@@ -400,6 +400,13 @@ namespace config {
     // so the DS5's HD (voice-coil) haptics work over the native provider. Off by
     // default; opt-in for A/B against CTM. Read when a controller connects.
     bool native_haptics {false};
+
+    // Synthetic lightbar color, hex "RRGGBB" (empty/"off" disables). PC games
+    // via libScePad set the lightbar to black at pad init and never write a
+    // real color — on the PS5 the OS supplies the player color — so without
+    // this the bar stays dark. The bridge paints this color until a game
+    // writes a non-black color of its own (which then owns the lightbar).
+    std::string lightbar_color {"0000ff"};
   };
 
   namespace flag {

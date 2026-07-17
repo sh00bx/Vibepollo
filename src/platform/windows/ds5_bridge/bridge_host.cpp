@@ -57,8 +57,10 @@ namespace platf::ds5_bridge {
   // ===========================================================================
   class bridge_session {
   public:
-    bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, bool haptics):
-        usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport), haptics_(haptics) {}
+    bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, bool haptics,
+                   const std::atomic<uint32_t> *lightbar_rgb):
+        usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport), haptics_(haptics),
+        lightbar_rgb_(lightbar_rgb) {}
 
     ~bridge_session() { stop(); }
 
@@ -269,6 +271,15 @@ namespace platf::ds5_bridge {
         uint8_t common[USB_OUTPUT_COMMON_LEN] = {0};
         common[38] = 0x02;  // valid_flag2: LIGHTBAR_SETUP_CONTROL_ENABLE
         common[41] = 0x02;  // lightbar_setup: LIGHT_OUT
+        // Carry the synthetic color along so the bar lights on pad connect,
+        // not only once a game starts writing output reports.
+        const uint32_t synth = lightbar_rgb_ ? lightbar_rgb_->load(std::memory_order_relaxed) : LIGHTBAR_OFF;
+        if (synth != LIGHTBAR_OFF) {
+          common[1] |= 0x04;  // valid_flag1: LIGHTBAR_CONTROL_ENABLE
+          common[44] = (uint8_t) (synth >> 16);
+          common[45] = (uint8_t) (synth >> 8);
+          common[46] = (uint8_t) synth;
+        }
         uint8_t bt[BT_OUTPUT_LEN];
         usb_output_to_bt(common, out_seq_++, bt);
         std::lock_guard<std::mutex> lk(out_mtx_);
@@ -339,6 +350,21 @@ namespace platf::ds5_bridge {
         common[38] |= 0x02;  // valid_flag2: LIGHTBAR_SETUP_CONTROL_ENABLE
         common[41] = 0x02;   // lightbar_setup: LIGHT_OUT
         lb_released_ = true;
+      }
+      // Synthetic lightbar: libScePad titles write the lightbar once at pad
+      // init — to black — and never again (on the PS5 the OS supplies the
+      // player color), so the bar stays dark on PC. Paint the configured color
+      // until the game writes a non-black color of its own; from then on the
+      // game owns the lightbar for the rest of the connect.
+      if ((common[1] & 0x04) && (common[44] | common[45] | common[46]) != 0) {
+        lb_game_owned_ = true;
+      }
+      const uint32_t synth = lightbar_rgb_ ? lightbar_rgb_->load(std::memory_order_relaxed) : LIGHTBAR_OFF;
+      if (!lb_game_owned_ && synth != LIGHTBAR_OFF) {
+        common[1] |= 0x04;  // valid_flag1: LIGHTBAR_CONTROL_ENABLE
+        common[44] = (uint8_t) (synth >> 16);
+        common[45] = (uint8_t) (synth >> 8);
+        common[46] = (uint8_t) synth;
       }
       // Diagnostics: first outputs per connect, plus any lightbar color change.
       const bool lb_write = (common[1] & 0x04) != 0;
@@ -521,8 +547,9 @@ namespace platf::ds5_bridge {
       hello_seen_.store(false);
       { std::lock_guard<std::mutex> lk(out_mtx_); outbox_.clear(); }
       // Fresh link may be a fresh pad connect: re-arm the lightbar-setup
-      // release and the per-connect output diagnostics.
+      // release, lightbar ownership and the per-connect output diagnostics.
       lb_released_ = false;
+      lb_game_owned_ = false;
       dbg_out_n_ = 0;
       // Servo: the next session may be a fresh daemon run (drop_total restarts)
       // — rebase the delta and fall back to the static margin until feedback
@@ -661,6 +688,8 @@ namespace platf::ds5_bridge {
     uint32_t seq_ {0};
     uint8_t out_seq_ {0};
     bool lb_released_ {false};
+    bool lb_game_owned_ {false};
+    const std::atomic<uint32_t> *lightbar_rgb_ {nullptr};
     uint32_t dbg_out_n_ {0};
     uint8_t dbg_rgb_[3] {};
 
@@ -803,7 +832,7 @@ namespace platf::ds5_bridge {
                         << busid << " (reconnect; adopted live session on this port)"sv;
         return "OK";
       }
-      auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, haptics_.load());
+      auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, haptics_.load(), &lightbar_rgb_);
       sess->start();
       sessions_[busid] = std::move(sess);
       BOOST_LOG(info) << "ds5-bridge: BRIDGE_START ds5 port="sv << dport << " busid="sv << busid;
