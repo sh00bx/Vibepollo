@@ -282,7 +282,7 @@ namespace platf::ds5_bridge {
           lb_last_paint_ms_.store(now_ms(), std::memory_order_relaxed);
         }
         uint8_t bt[BT_OUTPUT_LEN];
-        usb_output_to_bt(common, out_seq_++, bt);
+        usb_output_to_bt(common, out_seq_.fetch_add(1, std::memory_order_relaxed), bt);
         std::lock_guard<std::mutex> lk(out_mtx_);
         outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
       }
@@ -384,7 +384,7 @@ namespace platf::ds5_bridge {
         BOOST_LOG(info) << msg;
       }
       uint8_t bt[BT_OUTPUT_LEN];
-      usb_output_to_bt(common, out_seq_++, bt);
+      usb_output_to_bt(common, out_seq_.fetch_add(1, std::memory_order_relaxed), bt);
       std::lock_guard<std::mutex> lk(out_mtx_);
       outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
     }
@@ -410,7 +410,7 @@ namespace platf::ds5_bridge {
       common[45] = (uint8_t) (synth >> 8);
       common[46] = (uint8_t) synth;
       uint8_t bt[BT_OUTPUT_LEN];
-      usb_output_to_bt(common, out_seq_++, bt);
+      usb_output_to_bt(common, out_seq_.fetch_add(1, std::memory_order_relaxed), bt);
       std::lock_guard<std::mutex> lk(out_mtx_);
       outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
     }
@@ -722,7 +722,10 @@ namespace platf::ds5_bridge {
     std::thread attach_thread_;
     std::atomic<int> vhci_port_ {-1};
     uint32_t seq_ {0};
-    uint8_t out_seq_ {0};
+    // BT report sequence nibble; bumped from both the usbip server thread
+    // (on_game_output) and the session thread (HELLO paint, lightbar
+    // keep-alive), hence atomic.
+    std::atomic<uint8_t> out_seq_ {0};
     bool lb_released_ {false};
     std::atomic<bool> lb_game_owned_ {false};
     std::atomic<int64_t> lb_last_paint_ms_ {0};
