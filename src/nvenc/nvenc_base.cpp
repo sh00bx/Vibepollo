@@ -588,7 +588,7 @@ namespace nvenc {
           set_ref_frames(format_config.maxNumRefFrames, format_config.numRefL0, 5);
           set_minqp_if_enabled(config.min_qp_h264);
           fill_h264_hevc_vui(format_config.h264VUIParameters);
-          if (client_config.enableIntraRefresh == 1) {
+          if (client_config.enableIntraRefresh == 1 || config.intra_refresh) {
             if (get_encoder_cap(NV_ENC_CAPS_SUPPORT_INTRA_REFRESH)) {
               format_config.enableIntraRefresh = 1;
               format_config.intraRefreshPeriod = 300;
@@ -630,7 +630,7 @@ namespace nvenc {
             format_config.outputMasteringDisplay = hdr_metadata.maxDisplayLuminance != 0;
           }
 #endif
-          if (client_config.enableIntraRefresh == 1) {
+          if (client_config.enableIntraRefresh == 1 || config.intra_refresh) {
             if (get_encoder_cap(NV_ENC_CAPS_SUPPORT_INTRA_REFRESH)) {
               format_config.enableIntraRefresh = 1;
               format_config.intraRefreshPeriod = 300;

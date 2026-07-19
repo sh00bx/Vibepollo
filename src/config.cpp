@@ -2642,6 +2642,7 @@ namespace config {
         "nvenc_aq_strength",
         "nvenc_weighted_prediction",
         "nvenc_split_encode",
+        "nvenc_intra_refresh",
         "nvenc_vbv_increase",
         "nvenc_realtime_hags",
         "nvenc_latency_over_power",
