@@ -409,12 +409,6 @@ namespace config {
     // default; opt-in for A/B against CTM. Read when a controller connects.
     bool native_haptics {false};
 
-    // Anti-alias low-pass (Kaiser FIR @1400 Hz) in the 48k->3k voice-coil
-    // decimation. The wired DS5 decimates WITHOUT one (aliasing is part of the
-    // stock haptic texture), so 'disabled' = cable-like raw decimation.
-    // Read when a controller connects.
-    bool haptics_aa_filter {true};
-
     // Synthetic lightbar color, hex "RRGGBB" (empty/"off" disables). PC games
     // via libScePad set the lightbar to black at pad init and never write a
     // real color — on the PS5 the OS supplies the player color — so without
