@@ -115,6 +115,13 @@ namespace platf::ds5_bridge {
     int8_t quantize_one(double d);
 
     std::array<double, NTAP> fir_ {};
+    // ds5_haptics_aa_filter: when false, decimation takes the raw center-tap
+    // sample instead of the FIR sum (same NTAP/2 group delay, so toggling never
+    // shifts haptic-vs-speaker alignment). The wired DS5 firmware decimates its
+    // voice-coil stream WITHOUT an anti-alias low-pass - the folded >1.4 kHz
+    // content is part of the stock haptic texture, and the filtered path feels
+    // damped by comparison.
+    bool aa_filter_ = true;
     std::array<float, PROC_BLOCK> prevHL_ {};   // overlap-save history (ch2/3)
     std::array<float, PROC_BLOCK> prevHR_ {};
     bool primed_ = false;

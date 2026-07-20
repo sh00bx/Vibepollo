@@ -12,6 +12,7 @@
 
 #include <opus/opus.h>
 
+#include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/windows/ds5_bridge/ds5_haptics.h"
 #include "src/platform/windows/ds5_bridge/ds5_reports.h"
@@ -67,6 +68,11 @@ namespace platf::ds5_bridge {
   }  // namespace
 
   ds5_haptic_builder::ds5_haptic_builder() {
+    // Read once at connect (same lifecycle as native_haptics itself).
+    aa_filter_ = config::ds5b.haptics_aa_filter;
+    if (!aa_filter_) {
+      BOOST_LOG(info) << "ds5-haptics: anti-alias filter DISABLED (raw decimation, wired-DS5-like)";
+    }
     build_fir();
     build_resampler();
     build_skeleton();
@@ -166,6 +172,22 @@ namespace platf::ds5_bridge {
     for (int j = 0; j < ndec; ++j) {
       int base = j * DECIM;
       double accL = 0.0, accR = 0.0;
+      if (!aa_filter_) {
+        // Raw decimation like the wired DS5's own firmware: pick the sample at
+        // the FIR center tap (identical NTAP/2 group delay, no low-pass). The
+        // aliased >1.4 kHz content is intentional - it matches the cable feel.
+        int idx = base + (NTAP - 1) / 2;
+        float vL, vR;
+        if (idx < PROC_BLOCK) {
+          vL = prevL ? prevL[idx] : 0.0f;
+          vR = prevR ? prevR[idx] : 0.0f;
+        } else {
+          vL = hapL[idx - PROC_BLOCK];
+          vR = hapR[idx - PROC_BLOCK];
+        }
+        accL = vL;
+        accR = vR;
+      } else
       for (int k = 0; k < NTAP; ++k) {
         int idx = base + k;
         float vL, vR;
