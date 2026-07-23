@@ -96,6 +96,15 @@ namespace platf::ds5_bridge {
       pace_us_.store(us, std::memory_order_relaxed);
     }
 
+    /// Trigger-kick envelope: peak |amplitude| of the newest decimated coil
+    /// block (0-255) and its steady-clock ms stamp. The session thread polls
+    /// this to fire trigger bursts on haptic transients; a stale stamp (idle
+    /// feed) reads as silence there.
+    void kick_env(int &env, long long &ms) const {
+      env = kick_env_.load(std::memory_order_relaxed);
+      ms = kick_env_ms_.load(std::memory_order_relaxed);
+    }
+
   private:
     // -- FIR-decimation DSP (ported from ds5_av_capture.cpp) -----------------
     static constexpr int SR = 48000;
@@ -125,6 +134,10 @@ namespace platf::ds5_bridge {
     std::array<float, HAP_OUT> decR_ {};
     int dec_n_ = 0;
     uint64_t rng_ = 0x9E3779B97F4A7C15ULL;
+
+    // Trigger-kick envelope (feed thread writes, session thread reads).
+    std::atomic<int> kick_env_ {0};
+    std::atomic<long long> kick_env_ms_ {0};
 
     // -- haptic snapshot: latest-wins (shared with the pacer) ----------------
     // The device-proven ds5_av_play.c model: the feed overwrites the newest 64-B

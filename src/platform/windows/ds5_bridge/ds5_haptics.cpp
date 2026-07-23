@@ -195,6 +195,22 @@ namespace platf::ds5_bridge {
         auto now = std::chrono::steady_clock::now();
         dbg_blocks_.fetch_add(1, std::memory_order_relaxed);
         if (hrms > ACTIVE_RMS) dbg_gate_blocks_.fetch_add(1, std::memory_order_relaxed);
+        // Trigger-kick envelope: per-block peak of the (band-limited) coil
+        // signal, 0-255. Published pre-quantization so the kick scales with
+        // the true transient, not the tanh-clipped wire value.
+        {
+          double pk = 0.0;
+          for (int i = 0; i < HAP_OUT; ++i) {
+            double aL = std::fabs((double) decL_[i]), aR = std::fabs((double) decR_[i]);
+            if (aL > pk) pk = aL;
+            if (aR > pk) pk = aR;
+          }
+          int env = (int) (pk * 255.0);
+          kick_env_.store(env > 255 ? 255 : env, std::memory_order_relaxed);
+          kick_env_ms_.store((long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                               now.time_since_epoch()).count(),
+                             std::memory_order_relaxed);
+        }
         std::lock_guard<std::mutex> lk(hap_mtx_);
         // Latest-wins: overwrite the newest snapshot; the pacer sends it next tick.
         std::memcpy(latest_frame_.data(), snap.data(), HAPTIC_BYTES);

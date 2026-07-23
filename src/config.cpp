@@ -1856,6 +1856,11 @@ namespace config {
       int_between_f(vars, "ds5_bridge_port", ds5b.port, {1, 65535});
       bool_f(vars, "ds5_native_haptics", ds5b.native_haptics);
       string_f(vars, "ds5_lightbar_color", ds5b.lightbar_color);
+      bool_f(vars, "ds5_trigger_kick", ds5b.trigger_kick);
+      int_between_f(vars, "ds5_trigger_kick_strength", ds5b.trigger_kick_strength, {0, 100});
+      int_between_f(vars, "ds5_trigger_kick_freq", ds5b.trigger_kick_freq, {10, 200});
+      string_f(vars, "ds5_trigger_kick_source", ds5b.trigger_kick_source);
+      string_f(vars, "ds5_trigger_kick_side", ds5b.trigger_kick_side);
     }
 
     path_f(vars, "pkey", nvhttp.pkey);

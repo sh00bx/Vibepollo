@@ -415,6 +415,18 @@ namespace config {
     // this the bar stays dark. The bridge paints this color until a game
     // writes a non-black color of its own (which then owns the lightbar).
     std::string lightbar_color {"0000ff"};
+
+    // Trigger-kick synthesis (concept: artzox/DS5Dongle, MIT): on rumble/haptic
+    // transients the bridge briefly switches an adaptive trigger to a vibration
+    // burst (a static resistance change is barely felt under a holding finger).
+    // Only fires while the game itself drives no effect on that trigger, so
+    // DS5-native titles are never overridden — the win is XInput-era titles
+    // that only rumble.
+    bool trigger_kick {false};
+    int trigger_kick_strength {70};              // envelope scale, 0-100
+    int trigger_kick_freq {35};                  // burst carrier Hz; lower = heavier knock
+    std::string trigger_kick_source {"both"};    // haptic | rumble | both
+    std::string trigger_kick_side {"r2"};        // r2 | l2 | both
   };
 
   namespace flag {

@@ -61,6 +61,10 @@ namespace platf::ds5_bridge {
     /// live on every game output, so config changes apply immediately.
     void set_lightbar(uint32_t rgb) { lightbar_rgb_.store(rgb); }
 
+    /// Packed trigger-kick config (see ds5_bridge.cpp for the bit layout; 0 =
+    /// disabled). Sessions read it live each tick, so changes apply immediately.
+    void set_trigger_kick(uint32_t k) { trigger_kick_.store(k); }
+
   private:
     void control_loop();
     std::string handle_command(const std::string &line);
@@ -70,6 +74,7 @@ namespace platf::ds5_bridge {
     std::atomic<bool> stop_ {false};
     std::atomic<bool> haptics_ {false};
     std::atomic<uint32_t> lightbar_rgb_ {LIGHTBAR_OFF};
+    std::atomic<uint32_t> trigger_kick_ {0};
     int port_ {48054};
 
     usbip_ds5_device usbip_;

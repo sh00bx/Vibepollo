@@ -56,12 +56,25 @@ namespace ds5_bridge_provider {
         bool enable, ctm_enable, haptics;
         int port;
         std::string lightbar;
+        uint32_t kick = 0;
         {
           std::lock_guard<std::mutex> lk(config::ds5b_mutex);
           enable = config::ds5b.native_bridge;
           port = config::ds5b.port;
           haptics = config::ds5b.native_haptics;
           lightbar = config::ds5b.lightbar_color;
+          // Trigger-kick config, packed for the sessions' lock-free live read:
+          // bit0 enable, bit1 R2, bit2 L2, bit3 haptic source, bit4 rumble
+          // source, bits 8-15 carrier freq, bits 16-23 strength.
+          if (config::ds5b.trigger_kick) {
+            const auto &side = config::ds5b.trigger_kick_side;
+            const auto &src = config::ds5b.trigger_kick_source;
+            kick = 1u;
+            kick |= (side == "l2") ? 4u : (side == "both") ? 6u : 2u;
+            kick |= (src == "haptic") ? 8u : (src == "rumble") ? 16u : 24u;
+            kick |= (uint32_t) (config::ds5b.trigger_kick_freq & 0xFF) << 8;
+            kick |= (uint32_t) (config::ds5b.trigger_kick_strength & 0xFF) << 16;
+          }
         }
         {
           std::lock_guard<std::mutex> lk(config::ctm_mutex);
@@ -85,6 +98,7 @@ namespace ds5_bridge_provider {
 
         host().set_haptics(haptics);
         host().set_lightbar(parse_lightbar(lightbar));
+        host().set_trigger_kick(kick);
         if (want && !started) {
           started = host().start(port);
         } else if (!want && started) {

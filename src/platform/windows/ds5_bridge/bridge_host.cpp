@@ -58,9 +58,10 @@ namespace platf::ds5_bridge {
   class bridge_session {
   public:
     bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, bool haptics,
-                   const std::atomic<uint32_t> *lightbar_rgb):
+                   const std::atomic<uint32_t> *lightbar_rgb,
+                   const std::atomic<uint32_t> *trigger_kick):
         usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport),
-        lightbar_rgb_(lightbar_rgb) { haptics_want_.store(haptics); }
+        lightbar_rgb_(lightbar_rgb), kick_cfg_(trigger_kick) { haptics_want_.store(haptics); }
 
     /// Control thread, on every BRIDGE_START for this session (incl. adopts).
     /// Takes effect at the next HELLO (see on_hello).
@@ -403,6 +404,35 @@ namespace platf::ds5_bridge {
         common[46] = (uint8_t) synth;
         lb_last_paint_ms_.store(now_ms(), std::memory_order_relaxed);
       }
+      // Trigger-kick bookkeeping (concept: artzox/DS5Dongle, MIT). Rumble
+      // envelope: only reports that assert rumble emulation carry live motor
+      // values. Ownership: a game drives a trigger only when its allow-bit
+      // comes WITH a real effect payload — Steam-Input-style wrappers set the
+      // allow-bits with an empty (0x00/0x05) payload in every report, and a
+      // naive latch on the bit alone would permanently mute the synthesis.
+      if (common[0] & 0x01) {
+        tk_rumble_env_.store(std::max(common[2], common[3]), std::memory_order_relaxed);
+        tk_rumble_ms_.store(now_ms(), std::memory_order_relaxed);
+      }
+      const uint32_t kc = kick_cfg_ ? kick_cfg_->load(std::memory_order_relaxed) : 0;
+      for (int s = 0; s < 2; ++s) {
+        const uint8_t bit = s ? 0x08 : 0x04;  // valid_flag0: R2 / L2 trigger FFB
+        const int off = s ? 21 : 10;          // FFB block offset in the common block
+        if (!(common[0] & bit)) continue;
+        const uint8_t mode = common[off];
+        if (mode != 0x00 && mode != 0x05) {
+          // Real effect: the game owns this trigger (3 s yield latch — many
+          // games send their effect once and then drop the allow-bit).
+          tk_game_ffb_ms_[s].store(now_ms(), std::memory_order_relaxed);
+          tk_synth_on_[s].store(false, std::memory_order_relaxed);
+        } else if ((kc & 1) && tk_synth_on_[s].load(std::memory_order_relaxed)) {
+          // Empty allow-bit while our burst is live would clear it on the pad;
+          // re-assert the current burst in place (the game loses nothing — it
+          // asked for "no effect", which is what the burst decays to).
+          write_kick_ffb(&common[off], tk_last_amp_[s].load(std::memory_order_relaxed),
+                         (int) ((kc >> 8) & 0xFF));
+        }
+      }
       // Diagnostics: first outputs per connect, plus lightbar color changes at
       // most once a second (games animating the bar write a new RGB on every
       // report — unthrottled that was ~60 log lines/s on the rumble thread).
@@ -468,6 +498,119 @@ namespace platf::ds5_bridge {
       std::lock_guard<std::mutex> lk(out_mtx_);
       if (lb_game_owned_.load(std::memory_order_relaxed)) return;
       outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
+    }
+
+    // -- trigger-kick synthesis (concept: artzox/DS5Dongle, MIT) --------------
+    // On rumble/haptic transients, briefly switch an idle trigger from "no
+    // effect" to a vibration burst (effect 0x26) and release afterwards. A
+    // static resistance change is barely felt under a holding finger — the
+    // MODE flip is what reads as recoil. Never touches a trigger the game
+    // drives itself (see on_game_output for the ownership rule).
+
+    /// Fill an 11-byte trigger FFB block with a full-travel vibration burst.
+    /// Effect 0x26 wire form: [mode][active zones u16 LE][3-bit strength per
+    /// zone, packed u32 LE][0][0][carrier Hz][0]. sv is the 3-bit strength.
+    static void write_kick_ffb(uint8_t *ffb, int sv, int freq) {
+      std::memset(ffb, 0, 11);
+      ffb[0] = 0x26;
+      ffb[1] = 0xFF; ffb[2] = 0x03;  // all 10 travel zones
+      uint32_t amps = 0;
+      for (int z = 0; z < 10; ++z) amps |= (uint32_t) (sv & 7) << (3 * z);
+      ffb[3] = (uint8_t) amps; ffb[4] = (uint8_t) (amps >> 8);
+      ffb[5] = (uint8_t) (amps >> 16); ffb[6] = (uint8_t) (amps >> 24);
+      ffb[9] = (uint8_t) freq;
+    }
+
+    /// Queue a standalone BT output report that touches ONLY one trigger (byte-0
+    /// hygiene: no other valid flags, so rumble/haptics/lightbar stay untouched).
+    void send_trigger_report(int side, bool burst, int sv, int freq) {
+      uint8_t common[USB_OUTPUT_COMMON_LEN] = {0};
+      common[0] = side ? 0x08 : 0x04;
+      const int off = side ? 21 : 10;
+      if (burst) write_kick_ffb(&common[off], sv, freq);
+      else common[off] = 0x05;  // effect off/reset, zero params
+      uint8_t bt[BT_OUTPUT_LEN];
+      usb_output_to_bt(common, out_seq_.fetch_add(1, std::memory_order_relaxed), bt);
+      std::lock_guard<std::mutex> lk(out_mtx_);
+      outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
+    }
+
+    // Session thread, every loop pass (~2 ms). Hysteresis: burst on at env>=32,
+    // off below 16 AND only after a 45 ms minimum — both together stop the
+    // mode flip from chattering at the threshold.
+    void trigger_kick_tick() {
+      const uint32_t kc = kick_cfg_ ? kick_cfg_->load(std::memory_order_relaxed) : 0;
+      const int64_t now = now_ms();
+      if (!(kc & 1) || !hello_seen_.load(std::memory_order_relaxed)) {
+        // Feature off (or link down): release anything we still hold.
+        for (int s = 0; s < 2; ++s) {
+          if (tk_synth_on_[s].exchange(false, std::memory_order_relaxed) &&
+              hello_seen_.load(std::memory_order_relaxed)) {
+            send_trigger_report(s, false, 0, 0);
+          }
+        }
+        return;
+      }
+      // Shared envelope, 0-255: newest band-limited coil block peak and/or the
+      // classic rumble motors — both already shaped by the game's intent.
+      int env = 0;
+      if ((kc & 8) && hap_ && haptics_on_.load(std::memory_order_relaxed)) {
+        int he; long long hms;
+        hap_->kick_env(he, hms);
+        if (now - (int64_t) hms <= 50) env = he;
+      }
+      if (kc & 16) {
+        // A rumble level is only as live as the game's report stream; age it
+        // out so a title that stops sending mid-effect can't latch a burst.
+        if (now - tk_rumble_ms_.load(std::memory_order_relaxed) <= 500) {
+          int re = tk_rumble_env_.load(std::memory_order_relaxed);
+          if (re > env) env = re;
+        }
+      }
+      const int strength = (int) ((kc >> 16) & 0xFF);
+      const int freq = (int) ((kc >> 8) & 0xFF);
+      const int scaled = std::min(255, env * strength / 100);
+      for (int s = 0; s < 2; ++s) {
+        if (!(kc & (s ? 4u : 2u))) continue;
+        const bool owned = now - tk_game_ffb_ms_[s].load(std::memory_order_relaxed) < 3000;
+        const bool on = tk_synth_on_[s].load(std::memory_order_relaxed);
+        if (!on) {
+          if (scaled < 32) continue;
+          if (owned) { tk_yields_.fetch_add(1, std::memory_order_relaxed); continue; }
+          const int sv = std::min(7, scaled >> 5);
+          send_trigger_report(s, true, sv, freq);
+          tk_synth_on_[s].store(true, std::memory_order_relaxed);
+          tk_last_amp_[s].store(sv, std::memory_order_relaxed);
+          tk_on_ms_[s] = now;
+          tk_send_ms_[s] = now;
+          tk_kicks_.fetch_add(1, std::memory_order_relaxed);
+        } else if (owned) {
+          // The game just wrote a real effect; its report already replaced our
+          // burst on the pad — just drop our claim, no clearing write.
+          tk_synth_on_[s].store(false, std::memory_order_relaxed);
+        } else if (scaled < 16 && now - tk_on_ms_[s] >= 45) {
+          send_trigger_report(s, false, 0, 0);
+          tk_synth_on_[s].store(false, std::memory_order_relaxed);
+        } else {
+          // Track the envelope while the burst holds (3-bit steps, rate-limited).
+          const int sv = std::min(7, std::max(scaled, 16) >> 5);
+          if (sv != tk_last_amp_[s].load(std::memory_order_relaxed) &&
+              now - tk_send_ms_[s] >= 30) {
+            send_trigger_report(s, true, sv, freq);
+            tk_last_amp_[s].store(sv, std::memory_order_relaxed);
+            tk_send_ms_[s] = now;
+          }
+        }
+      }
+      // Telemetry, at most every 30 s and only while the counters move.
+      const uint32_t k = tk_kicks_.load(std::memory_order_relaxed);
+      const uint32_t y = tk_yields_.load(std::memory_order_relaxed);
+      if ((k != tk_log_kicks_ || y != tk_log_yields_) && now - tk_log_ms_ >= 30000) {
+        BOOST_LOG(info) << "ds5-kick: kicks=" << k << " yields=" << y;
+        tk_log_kicks_ = k;
+        tk_log_yields_ = y;
+        tk_log_ms_ = now;
+      }
     }
 
     void drain_outbox() {
@@ -620,6 +763,9 @@ namespace platf::ds5_bridge {
         // latched color. Repaint the synthetic color at a slow cadence while
         // no game owns the bar.
         maybe_repaint_lightbar();
+
+        // 3c) Trigger-kick synthesis (no-op unless ds5_trigger_kick is on).
+        trigger_kick_tick();
 
         // 4) A dropped link recycles the transport (the client reconnects to the
         // same port and re-HELLOs) — the virtual device + vhci stay attached.
@@ -798,6 +944,20 @@ namespace platf::ds5_bridge {
     std::atomic<bool> lb_game_owned_ {false};
     std::atomic<int64_t> lb_last_paint_ms_ {0};
     const std::atomic<uint32_t> *lightbar_rgb_ {nullptr};
+    // Trigger-kick state. Envelope + ownership cross the usbip server thread
+    // (on_game_output) and the session thread (trigger_kick_tick) — atomics.
+    // tk_on_ms_/tk_send_ms_/tk_log_* are session-thread-only.
+    const std::atomic<uint32_t> *kick_cfg_ {nullptr};
+    std::atomic<int> tk_rumble_env_ {0};
+    std::atomic<int64_t> tk_rumble_ms_ {0};
+    std::atomic<int64_t> tk_game_ffb_ms_[2] {0, 0};  // last real game FFB (R2, L2)
+    std::atomic<bool> tk_synth_on_[2] {false, false};
+    std::atomic<int> tk_last_amp_[2] {0, 0};
+    int64_t tk_on_ms_[2] {0, 0};
+    int64_t tk_send_ms_[2] {0, 0};
+    std::atomic<uint32_t> tk_kicks_ {0}, tk_yields_ {0};
+    uint32_t tk_log_kicks_ {0}, tk_log_yields_ {0};
+    int64_t tk_log_ms_ {0};
     std::atomic<uint32_t> dbg_out_n_ {0};
     uint8_t dbg_rgb_[3] {};
     int64_t dbg_rgb_log_ms_ {0};
@@ -942,7 +1102,7 @@ namespace platf::ds5_bridge {
                         << busid << " (reconnect; adopted live session on this port)"sv;
         return "OK";
       }
-      auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, haptics_.load(), &lightbar_rgb_);
+      auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, haptics_.load(), &lightbar_rgb_, &trigger_kick_);
       sess->start();
       sessions_[dport] = std::move(sess);
       BOOST_LOG(info) << "ds5-bridge: BRIDGE_START ds5 port="sv << dport << " busid="sv << busid;
