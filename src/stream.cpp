@@ -2226,8 +2226,15 @@ namespace stream {
             packet->frame_timestamp = ratecontrol_next_frame_start;
             frame_is_dupe = true;
           }
-          using rtp_tick = std::chrono::duration<uint32_t, std::ratio<1, 90000>>;
-          uint32_t timestamp = std::chrono::round<rtp_tick>(*packet->frame_timestamp - video_epoch).count();
+          // Round in a signed representation and only then wrap into the RTP field. video_epoch is
+          // latched on this broadcast thread while frame_timestamp comes from the capture thread, so
+          // a frame that predates the epoch yields a negative delta -- rounding that directly in an
+          // unsigned rep produces a garbage timestamp, which a client pacing on host PTS would see
+          // as a huge PTS jump. The final cast to uint32_t keeps the intended modular wrap.
+          using signed_rtp_tick = std::chrono::duration<std::int64_t, std::ratio<1, 90000>>;
+          uint32_t timestamp = static_cast<uint32_t>(
+            std::chrono::round<signed_rtp_tick>(*packet->frame_timestamp - video_epoch).count()
+          );
 
           // set FEC info now that we know for sure what our percentage will be for this frame
           for (auto x = 0; x < shards.size(); ++x) {
