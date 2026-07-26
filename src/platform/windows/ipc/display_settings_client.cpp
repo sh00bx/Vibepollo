@@ -26,6 +26,15 @@ namespace platf::display_helper_client {
     constexpr int kSendTimeoutMs = 5000;
     constexpr int kShutdownIpcTimeoutMs = 500;
     constexpr int kApplyResultTimeoutMs = 5000;
+    // A refresh-only mode set on a virtual display serializes against the OS display
+    // stack. While an alt-tab is already changing modes, the helper has been measured
+    // at ~6s for a single apply, so a 5s budget declared a healthy helper dead and
+    // retired a connection it was about to answer.
+    constexpr int kRefreshRateResultTimeoutMs = 12000;
+    // Best-effort adaptive refresh has its own retry, so it must never pay the full
+    // connect budget (anonymous transport, then named fallback) when the helper is
+    // down: that stalls the poll loop for seconds per attempt.
+    constexpr int kRefreshRateConnectTimeoutMs = 600;
 
     bool shutdown_requested() {
       if (!mail::man) {
@@ -177,7 +186,7 @@ namespace platf::display_helper_client {
     std::optional<bool> wait_for_refresh_rate_result_locked(platf::dxgi::INamedPipe &pipe) {
       using namespace std::chrono;
 
-      const auto deadline = steady_clock::now() + milliseconds(kApplyResultTimeoutMs);
+      const auto deadline = steady_clock::now() + milliseconds(kRefreshRateResultTimeoutMs);
       std::array<uint8_t, 2048> buffer {};
       while (steady_clock::now() < deadline) {
         const auto remaining = duration_cast<milliseconds>(deadline - steady_clock::now());
@@ -447,7 +456,7 @@ namespace platf::display_helper_client {
     }
 
     std::unique_lock<std::mutex> lk(pipe_mutex());
-    if (!ensure_connected_locked()) {
+    if (!ensure_connected_locked(kRefreshRateConnectTimeoutMs)) {
       BOOST_LOG(warning) << "Display helper IPC: refresh-rate request aborted - no connection";
       return false;
     }

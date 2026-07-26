@@ -42,6 +42,15 @@ namespace platf::game_activity {
   state_t reduce_signals(std::span<const signal_t> signals);
   const char *source_name(signal_source_e source);
 
+  /**
+   * @brief Whether a virtual-display mode set is in flight or still settling.
+   *
+   * Anything that calls into D3D11 or the display stack can block for the duration
+   * of a mode change, so work that can be deferred (creating GPU features, tearing
+   * them down) should stay out of this window.
+   */
+  bool display_mode_change_in_flight();
+
   struct refresh_target_options_t {
     std::string display_name;
     std::string device_id;
