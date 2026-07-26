@@ -96,6 +96,11 @@ namespace display_helper_integration {
   // Returns a very large value if no apply has ever been performed.
   int64_t ms_since_last_apply();
 
+  // True when the most recent APPLY asked for HDR to be enabled. Capture start
+  // uses this to wait for HDR to actually come up rather than for a fixed
+  // interval, so a session never begins in SDR and transitions mid-stream.
+  bool last_apply_requested_hdr();
+
   // Start a lightweight watchdog during active streams that pings the helper periodically
   // and restarts/re-handshakes if it crashes. No-ops if already running.
   void start_watchdog();

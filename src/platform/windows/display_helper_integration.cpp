@@ -348,18 +348,21 @@ namespace {
     return false;
   }
 
+  bool any_virtual_display_active() {
+    auto virtual_displays = VDISPLAY::enumerateVirtualDisplays();
+    return std::any_of(
+      virtual_displays.begin(),
+      virtual_displays.end(),
+      [](const VDISPLAY::VirtualDisplayInfo &info) {
+        return info.is_active;
+      }
+    );
+  }
+
   bool wait_for_virtual_display_activation(std::chrono::steady_clock::duration timeout) {
     auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-      auto virtual_displays = VDISPLAY::enumerateVirtualDisplays();
-      bool any_active = std::any_of(
-        virtual_displays.begin(),
-        virtual_displays.end(),
-        [](const VDISPLAY::VirtualDisplayInfo &info) {
-          return info.is_active;
-        }
-      );
-      if (any_active) {
+      if (any_virtual_display_active()) {
         return true;
       }
 
@@ -392,8 +395,10 @@ namespace {
     }
 
     if (session.virtual_display) {
+      // The hint records a past observation, so confirm the display is still active
+      // before skipping the wait. Mirrors the device_id branch above.
       const bool hint_ready = session.virtual_display_ready_since.has_value();
-      if (hint_ready) {
+      if (hint_ready && any_virtual_display_active()) {
         BOOST_LOG(debug) << "Display helper: virtual display ready hint satisfied. Skipping activation wait.";
         return true;
       }
@@ -642,6 +647,10 @@ namespace {
   // Tracks when the most recent successful APPLY completed, so the capture thread
   // can add a stabilization delay before attempting to reinit after topology changes.
   static std::atomic<std::int64_t> g_last_apply_completed_us {0};
+
+  // Whether that same APPLY asked for HDR to be enabled. Written together with the
+  // timestamp above so it always describes the apply ms_since_last_apply() measures.
+  static std::atomic<bool> g_last_apply_requested_hdr {false};
 
   static std::int64_t now_steady_us() {
     using namespace std::chrono;
@@ -1255,6 +1264,11 @@ namespace display_helper_integration {
         return false;
       }
 
+      // Recorded alongside the completion timestamp below so capture start can wait for the
+      // display to actually report HDR instead of burning a fixed settle window.
+      const bool source_hdr_requested =
+        request.configuration && request.configuration->m_hdr_state == display_device::HdrState::Enabled;
+
       // Prefer the helper for APPLY, even when running as SYSTEM without an interactive user session.
       // In-process display APIs frequently return ERROR_ACCESS_DENIED in that context.
       const bool system_no_user_session = platf::is_running_as_system() && !user_session_ready();
@@ -1298,7 +1312,8 @@ namespace display_helper_integration {
         g_last_apply_used_helper.store(ok, std::memory_order_relaxed);
         if (ok && request.session) {
           g_restore_expected.store(false, std::memory_order_relaxed);
-          g_last_apply_completed_us.store(now_steady_us(), std::memory_order_relaxed);
+          g_last_apply_requested_hdr.store(source_hdr_requested, std::memory_order_relaxed);
+          g_last_apply_completed_us.store(now_steady_us(), std::memory_order_release);
           set_active_session(
             *request.session,
             request.session_overrides.device_id_override,
@@ -1347,7 +1362,8 @@ namespace display_helper_integration {
       }
       (void) apply_topology_definition(request.topology, "in-process");
 
-      g_last_apply_completed_us.store(now_steady_us(), std::memory_order_relaxed);
+      g_last_apply_requested_hdr.store(source_hdr_requested, std::memory_order_relaxed);
+      g_last_apply_completed_us.store(now_steady_us(), std::memory_order_release);
       set_active_session(
         *request.session,
         request.session_overrides.device_id_override,
@@ -1558,12 +1574,21 @@ namespace display_helper_integration {
   }
 
   int64_t ms_since_last_apply() {
-    const auto last_us = g_last_apply_completed_us.load(std::memory_order_relaxed);
+    const auto last_us = g_last_apply_completed_us.load(std::memory_order_acquire);
     if (last_us == 0) {
       return std::numeric_limits<int64_t>::max();
     }
     const auto elapsed_us = now_steady_us() - last_us;
     return elapsed_us / 1000;
+  }
+
+  bool last_apply_requested_hdr() {
+    // Acquire on the timestamp pairs with the release store in apply_internal, so the
+    // flag we read below belongs to the apply that timestamp refers to.
+    if (g_last_apply_completed_us.load(std::memory_order_acquire) == 0) {
+      return false;
+    }
+    return g_last_apply_requested_hdr.load(std::memory_order_relaxed);
   }
 
   namespace {
