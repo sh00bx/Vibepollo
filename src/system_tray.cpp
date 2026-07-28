@@ -185,6 +185,25 @@ namespace system_tray {
   }
 #endif
 
+  /**
+   * @brief Push the tray state, dropping the balloon popup unless it is enabled.
+   *
+   * Single choke point for every tray_update() in this file. Icon, tooltip and
+   * menu always update; only the notification payload is suppressed, so the
+   * tray keeps reflecting the session state without popping a toast for every
+   * launch/pause/connect event. Controlled by `system_tray_notifications`
+   * (default off).
+   */
+  static void tray_update_gated() {
+    if (!config::sunshine.system_tray_notifications) {
+      tray.notification_title = nullptr;
+      tray.notification_text = nullptr;
+      tray.notification_cb = nullptr;
+      tray.notification_icon = nullptr;
+    }
+    tray_update(&tray);
+  }
+
   template<typename Fn>
   static void run_on_tray_thread(Fn &&fn) {
     if (!tray_initialized.load()) {
@@ -451,7 +470,7 @@ namespace system_tray {
       tray.tooltip = s_tooltip.c_str();
       tray.menu[2].text = force_close_msg;
       s_last_playing_app = std::move(app_name);
-      tray_update(&tray);
+      tray_update_gated();
     });
   }
 
@@ -475,7 +494,7 @@ namespace system_tray {
       tray.notification_text = s_notification_text.c_str();
       tray.notification_icon = TRAY_ICON_PAUSING;
       tray.tooltip = s_notification_text.c_str();
-      tray_update(&tray);
+      tray_update_gated();
     });
   }
 
@@ -501,7 +520,7 @@ namespace system_tray {
       tray.tooltip = PROJECT_NAME;
       tray.menu[2].text = TRAY_MSG_NO_APP_RUNNING;
       s_last_playing_app.clear();
-      tray_update(&tray);
+      tray_update_gated();
     });
   }
 
@@ -531,7 +550,7 @@ namespace system_tray {
       };
       tray.tooltip = PROJECT_NAME;
       s_last_playing_app.clear();
-      tray_update(&tray);
+      tray_update_gated();
     });
   }
 
@@ -550,7 +569,7 @@ namespace system_tray {
       tray.notification_cb = []() {
         launch_ui("/clients");
       };
-      tray_update(&tray);
+      tray_update_gated();
     });
   }
 
@@ -575,7 +594,7 @@ namespace system_tray {
       tray.notification_text = s_paired_text.c_str();
       tray.notification_icon = TRAY_ICON;
       tray.tooltip = PROJECT_NAME;
-      tray_update(&tray);
+      tray_update_gated();
     });
   }
 
@@ -601,7 +620,7 @@ namespace system_tray {
       tray.notification_text = s_client_text.c_str();
       tray.notification_icon = TRAY_ICON;
       tray.tooltip = PROJECT_NAME;
-      tray_update(&tray);
+      tray_update_gated();
     });
   }
 
@@ -620,7 +639,7 @@ namespace system_tray {
       tray.notification_cb = []() {
         launch_ui("/");
       };
-      tray_update(&tray);
+      tray_update_gated();
     });
   }
 
@@ -729,7 +748,7 @@ namespace system_tray {
       tray.notification_cb = nullptr;
       tray.notification_icon = nullptr;
       tray.icon = TRAY_ICON;
-      tray_update(&tray);
+      tray_update_gated();
 
       static std::string s_notify_title;
       s_notify_title = title_copy;
@@ -741,7 +760,7 @@ namespace system_tray {
       tray.notification_icon = TRAY_ICON;
       tray.tooltip = PROJECT_NAME;
       tray.notification_cb = cb;
-      tray_update(&tray);
+      tray_update_gated();
     });
   }
 
