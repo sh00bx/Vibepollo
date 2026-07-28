@@ -3773,6 +3773,8 @@ namespace VDISPLAY_SUNSHINE {
       switch (presence) {
         case MonitorTargetPresence::missing:
           return "missing";
+        case MonitorTargetPresence::no_devices:
+          return "no_devices";
         case MonitorTargetPresence::present_inactive:
           return "inactive";
         case MonitorTargetPresence::present_active:
