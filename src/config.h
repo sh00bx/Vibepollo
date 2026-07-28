@@ -479,6 +479,11 @@ namespace config {
     bool notify_pre_releases;
     bool legacy_ordering;
     bool system_tray;
+    /// Balloon/toast popups from the tray icon (app launched, stream paused,
+    /// client connected, ...). The tray icon, its tooltip and menu are
+    /// unaffected. Default off - the popups are pure noise on a host that runs
+    /// as a service.
+    bool system_tray_notifications;
     std::vector<prep_cmd_t> prep_cmds;
     std::vector<prep_cmd_t> state_cmds;
     std::vector<server_cmd_t> server_cmds;
