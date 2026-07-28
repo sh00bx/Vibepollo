@@ -134,7 +134,23 @@ namespace VDISPLAY_SUNSHINE {
     wait,
   };
 
+  // Trennt reine Transport-Opens von echter Treiber-Recovery: nur wer den
+  // Treiber besitzt (startPingThread/Lease-Feed) darf einen PnP-Zyklus
+  // ausloesen. Startup, Recovery-Polling und externer Teardown oeffnen
+  // transport_only, sonst laeuft nach erreichter Readiness ein zweiter
+  // PnP-Zyklus gegen den Restart-Cooldown.
+  enum class OpenRecoveryBehavior {
+    transport_only,
+    recover_driver,
+  };
+
   static bool ensure_driver_is_ready_impl(RestartCooldownBehavior cooldown_behavior);
+  static DRIVER_STATUS open_vdisplay_device_impl(OpenRecoveryBehavior recovery_behavior);
+  static bool start_ping_thread_impl(std::function<void()> failCb, OpenRecoveryBehavior recovery_behavior);
+  bool ensure_control_transport_responsive(
+    std::string_view operation,
+    OpenRecoveryBehavior recovery_behavior = OpenRecoveryBehavior::recover_driver
+  );
 
   namespace {
     constexpr auto WATCHDOG_INIT_GRACE = std::chrono::seconds(30);
@@ -313,7 +329,9 @@ namespace VDISPLAY_SUNSHINE {
       return g_watchdog_thread.joinable();
     }
 
-    bool ensure_watchdog_thread_active_for_lease() {
+    bool ensure_watchdog_thread_active_for_lease(
+      OpenRecoveryBehavior recovery_behavior = OpenRecoveryBehavior::recover_driver
+    ) {
       if (watchdog_thread_running()) {
         return true;
       }
@@ -324,7 +342,7 @@ namespace VDISPLAY_SUNSHINE {
         fail_cb = default_watchdog_fail_cb();
       }
 
-      if (!startPingThread(std::move(fail_cb))) {
+      if (!start_ping_thread_impl(std::move(fail_cb), recovery_behavior)) {
         BOOST_LOG(warning) << "Sunshine virtual display lease-feed thread could not be started for an active temporary display.";
         return false;
       }
@@ -3890,7 +3908,9 @@ namespace VDISPLAY_SUNSHINE {
         return false;
       }
 
-      proc::vDisplayDriverStatus = openVDisplayDevice();
+      // Recovery besitzt den Rollback selbst: hier nur den Transport oeffnen,
+      // damit das Polling keinen zweiten PnP-Zyklus startet.
+      proc::vDisplayDriverStatus = open_vdisplay_device_impl(OpenRecoveryBehavior::transport_only);
       if (proc::vDisplayDriverStatus != DRIVER_STATUS::OK) {
         BOOST_LOG(warning) << "Virtual display recovery: failed to reopen driver (status="
                            << static_cast<int>(proc::vDisplayDriverStatus) << ") for "
@@ -3902,7 +3922,7 @@ namespace VDISPLAY_SUNSHINE {
       // The old ping thread is still feeding a stale duplicated handle;
       // startPingThread stops it and duplicates the freshly opened handle.
       if (auto watchdog_fail_cb = copy_watchdog_fail_cb(); watchdog_fail_cb) {
-        if (!startPingThread(std::move(watchdog_fail_cb))) {
+        if (!start_ping_thread_impl(std::move(watchdog_fail_cb), OpenRecoveryBehavior::transport_only)) {
           BOOST_LOG(warning) << "Virtual display recovery: failed to restart watchdog ping thread for "
                              << state.describe_target();
         }
@@ -4350,7 +4370,7 @@ namespace VDISPLAY_SUNSHINE {
     clear_control_transport();
   }
 
-  bool ensure_control_transport_responsive(std::string_view operation) {
+  bool ensure_control_transport_responsive(std::string_view operation, OpenRecoveryBehavior recovery_behavior) {
     std::lock_guard<std::recursive_mutex> lifecycle_lock(g_watchdog_lifecycle_mutex);
     auto transport = control_transport_snapshot();
     if (driver_transport_responsive(transport.get())) {
@@ -4362,7 +4382,7 @@ namespace VDISPLAY_SUNSHINE {
       closeVDisplayDevice();
     }
 
-    const auto status = openVDisplayDevice();
+    const auto status = open_vdisplay_device_impl(recovery_behavior);
     if (status != DRIVER_STATUS::OK) {
       BOOST_LOG(warning) << operation << ": failed to open Sunshine virtual display driver transport (status="
                          << static_cast<int>(status) << ").";
@@ -4384,6 +4404,13 @@ namespace VDISPLAY_SUNSHINE {
   }
 
   DRIVER_STATUS openVDisplayDevice() {
+    // proc::initVDisplayDriver() probed/restartet den Adapter unmittelbar vor
+    // diesem Aufruf. Diese Phase oeffnet daher nur den Transport, damit ein
+    // Initialisierungsversuch keinen zweiten PnP-Recovery-Zyklus startet.
+    return open_vdisplay_device_impl(OpenRecoveryBehavior::transport_only);
+  }
+
+  static DRIVER_STATUS open_vdisplay_device_impl(OpenRecoveryBehavior recovery_behavior) {
     std::lock_guard<std::recursive_mutex> lifecycle_lock(g_watchdog_lifecycle_mutex);
     std::shared_ptr<sunshine_driver::WindowsControlTransport> transport;
     uint32_t retryInterval = 20;
@@ -4392,7 +4419,7 @@ namespace VDISPLAY_SUNSHINE {
       auto opened = sunshine_driver::open_first_control_device();
       if (!opened.ok()) {
         if (retryInterval > 320) {
-          if (!attempted_recovery) {
+          if (recovery_behavior == OpenRecoveryBehavior::recover_driver && !attempted_recovery) {
             attempted_recovery = true;
             if (ensure_driver_is_ready_impl(RestartCooldownBehavior::wait)) {
               retryInterval = 20;
@@ -4457,7 +4484,7 @@ namespace VDISPLAY_SUNSHINE {
     }
 
     if (!g_watchdog_start_in_progress && !driver_lease_tracker().all().empty()) {
-      (void) ensure_watchdog_thread_active_for_lease();
+      (void) ensure_watchdog_thread_active_for_lease(recovery_behavior);
     }
 
     return DRIVER_STATUS::OK;
@@ -4549,6 +4576,12 @@ namespace VDISPLAY_SUNSHINE {
   }
 
   bool startPingThread(std::function<void()> failCb) {
+    // Der Lease-Feed besitzt den Treiber und darf als einziger Pfad eine
+    // echte Recovery ausloesen.
+    return start_ping_thread_impl(std::move(failCb), OpenRecoveryBehavior::recover_driver);
+  }
+
+  static bool start_ping_thread_impl(std::function<void()> failCb, OpenRecoveryBehavior recovery_behavior) {
     std::lock_guard<std::recursive_mutex> lifecycle_lock(g_watchdog_lifecycle_mutex);
     if (g_watchdog_start_in_progress) {
       return watchdog_thread_running();
@@ -4563,7 +4596,7 @@ namespace VDISPLAY_SUNSHINE {
     store_watchdog_fail_cb(failCb);
     auto failure_cb = std::make_shared<std::function<void()>>(std::move(failCb));
 
-    if (!ensure_control_transport_responsive("Sunshine virtual display lease feed")) {
+    if (!ensure_control_transport_responsive("Sunshine virtual display lease feed", recovery_behavior)) {
       return false;
     }
 

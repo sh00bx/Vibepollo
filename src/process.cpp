@@ -4198,15 +4198,12 @@ namespace proc {
     }
 
 #ifdef _WIN32
-    size_t fail_count = 0;
-    while (fail_count < 5 && vDisplayDriverStatus != VDISPLAY::DRIVER_STATUS::OK) {
+    // initVDisplayDriver() macht selbst bereits einen begrenzten
+    // Readiness-/Recovery-Durchlauf. Ihn hier zu wiederholen kann den
+    // Restart-Cooldown ueberdauern und bei jedem Parse einen frischen
+    // PnP-Zyklus starten, was Zweitinstanzen minutenlang blockiert.
+    if (vDisplayDriverStatus != VDISPLAY::DRIVER_STATUS::OK) {
       initVDisplayDriver();
-      if (vDisplayDriverStatus == VDISPLAY::DRIVER_STATUS::OK) {
-        break;
-      }
-
-      fail_count += 1;
-      std::this_thread::sleep_for(1s);
     }
 #endif
 
