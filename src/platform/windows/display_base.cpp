@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -1407,6 +1408,15 @@ namespace platf::dxgi {
   };
 
   const char *display_base_t::dxgi_format_to_string(DXGI_FORMAT format) {
+    // Die Tabelle wird direkt mit dem DXGI_FORMAT-Wert indiziert, deckt aber nur den
+    // zusammenhaengenden Bereich der dokumentierten Formate ab und hat nullptr-Loecher
+    // fuer die reservierten Werte zwischen B4G4R4A4_UNORM (115) und P208 (130).
+    // Formate ausserhalb (z.B. A4B4G4R4_UNORM = 191, die Sampler-Feedback-Formate oder
+    // ein Muellwert vom Treiber) laesen sonst out of bounds, und die nullptr-Loecher
+    // wuerden als Null-char-Pointer in den Log-Stream geschoben = UB.
+    if (format >= std::size(format_str) || !format_str[format]) {
+      return "DXGI_FORMAT_UNRECOGNIZED";
+    }
     return format_str[format];
   }
 
