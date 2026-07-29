@@ -30,6 +30,7 @@
 #include "src/platform/windows/ds5_bridge/ctmb_protocol.h"
 #include "src/platform/windows/ds5_bridge/ds5_haptics.h"
 #include "src/platform/windows/ds5_bridge/ds5_reports.h"
+#include "src/platform/windows/ds5_bridge/ds5_trigger_fx.h"
 #include "src/platform/windows/ds5_bridge/vhci_attach.h"
 
 using namespace std::literals;
@@ -176,6 +177,13 @@ namespace platf::ds5_bridge {
             uint8_t usb[INPUT_REPORT_LEN];
             if (bt_input_to_usb(payload, h->payload_len, usb)) {
               usbip_->set_input(slot_, usb);
+              // Live analog trigger travel, for the positional trigger-effect
+              // sequencer. USB report is [0x01][common input block], and the
+              // common block is x,y,rx,ry,z,rz — z (byte 4) is L2, rz (byte 5)
+              // is R2 — so they land at usb[5] and usb[6]. Index order here is
+              // the bridge's own side order: 0 = R2, 1 = L2.
+              tk_pos_[0].store(usb[6], std::memory_order_relaxed);
+              tk_pos_[1].store(usb[5], std::memory_order_relaxed);
             }
           }
           break;
@@ -427,10 +435,10 @@ namespace platf::ds5_bridge {
           tk_synth_on_[s].store(false, std::memory_order_relaxed);
         } else if ((kc & 1) && tk_synth_on_[s].load(std::memory_order_relaxed)) {
           // Empty allow-bit while our burst is live would clear it on the pad;
-          // re-assert the current burst in place (the game loses nothing — it
-          // asked for "no effect", which is what the burst decays to).
-          write_kick_ffb(&common[off], tk_last_amp_[s].load(std::memory_order_relaxed),
-                         (int) ((kc >> 8) & 0xFF));
+          // re-assert the exact block we last wrote (the game loses nothing —
+          // it asked for "no effect", which is what the burst decays to).
+          std::lock_guard<std::mutex> lk(tk_ffb_mtx_);
+          std::memcpy(&common[off], tk_held_[s].data(), trigger_fx::FFB_LEN);
         }
       }
       // Diagnostics: first outputs per connect, plus lightbar color changes at
@@ -501,38 +509,142 @@ namespace platf::ds5_bridge {
     }
 
     // -- trigger-kick synthesis (concept: artzox/DS5Dongle, MIT) --------------
-    // On rumble/haptic transients, briefly switch an idle trigger from "no
-    // effect" to a vibration burst (effect 0x26) and release afterwards. A
-    // static resistance change is barely felt under a holding finger — the
-    // MODE flip is what reads as recoil. Never touches a trigger the game
-    // drives itself (see on_game_output for the ownership rule).
+    // On rumble/haptic transients, briefly drive an idle trigger with a real
+    // adaptive-trigger effect and release it afterwards. A static resistance
+    // change is barely felt under a holding finger — what reads as recoil is
+    // the transition. Never touches a trigger the game drives itself (see
+    // on_game_output for the ownership rule).
+    //
+    // Phase 2 makes the effect selectable, because the right one depends on
+    // what is being simulated (see ds5_trigger_fx.h for the wire encoding):
+    //   vibration (0x26) — a buzz across the whole travel. The Phase 1
+    //     behaviour and still the default: it is felt regardless of how far
+    //     the trigger happens to be pulled.
+    //   bow       (0x22) — the snap force pushes the trigger BACK against the
+    //     finger. The only genuine mechanical recoil the pad can produce, and
+    //     the reason this phase exists (a buzz does not read as a gun or an
+    //     engine; a push does).
+    //   break     (0x25) — a wall that gives way with a hardware-sharp snap,
+    //     with a buzz taking over past the break point. Two stages, played
+    //     positionally against the live trigger travel.
 
-    /// Fill an 11-byte trigger FFB block with a full-travel vibration burst.
-    /// Effect 0x26 wire form: [mode][active zones u16 LE][3-bit strength per
-    /// zone, packed u32 LE][0][0][carrier Hz][0]. sv is the 3-bit strength.
-    static void write_kick_ffb(uint8_t *ffb, int sv, int freq) {
-      std::memset(ffb, 0, 11);
-      ffb[0] = 0x26;
-      ffb[1] = 0xFF; ffb[2] = 0x03;  // all 10 travel zones
-      uint32_t amps = 0;
-      for (int z = 0; z < 10; ++z) amps |= (uint32_t) (sv & 7) << (3 * z);
-      ffb[3] = (uint8_t) amps; ffb[4] = (uint8_t) (amps >> 8);
-      ffb[5] = (uint8_t) (amps >> 16); ffb[6] = (uint8_t) (amps >> 24);
-      ffb[9] = (uint8_t) freq;
+    enum kick_style_e : int {
+      KICK_VIBRATION = 0,
+      KICK_BOW = 1,
+      KICK_BREAK = 2,
+    };
+
+    /**
+     * @brief Stages for one kick fire at 3-bit amplitude @p sv.
+     *
+     * Every stage goes through stage_set::add(), which is where the
+     * distinct-start-zone invariant lives: two stages starting at the same zone
+     * have no defined play order, so the sequencer would fall back to
+     * time-based A/B cycling — felt as a continuous click rather than as a
+     * sequence. The synthesized sets below cannot violate it by construction
+     * (the break's buzz starts at the break point, strictly above the wall),
+     * but the check is on the only door stages enter by, so a future style or
+     * a captured set is covered too. A rejection is counted and logged rather
+     * than silently dropping the stage.
+     */
+    trigger_fx::stage_set build_kick_stages(int style, int zone, int sv, int freq) {
+      using namespace trigger_fx;
+      stage_set set;
+      auto add = [&](const ffb_t &st) {
+        uint8_t clash = 0;
+        const auto r = set.add(st, &clash);
+        if (r == add_result_e::rejected_start_clash || r == add_result_e::full) {
+          if (tk_stage_rejects_.fetch_add(1, std::memory_order_relaxed) == 0) {
+            BOOST_LOG(warning) << "ds5-kick: dropped a trigger stage (type 0x"
+                               << std::hex << (int) st[0] << std::dec
+                               << ", start zone " << (int) start_zone(st)
+                               << ") - stages need distinct start zones";
+          }
+        }
+      };
+      switch (style) {
+        case KICK_BOW:
+          // Draw resistance and snap force both ride the envelope: the finger
+          // has to be loaded against something for the snap to be felt at all.
+          add(make_bow_snap_wire((uint8_t) zone, (uint8_t) sv, (uint8_t) sv));
+          break;
+        case KICK_BREAK: {
+          const auto wall = make_weapon_break((uint8_t) zone, (uint8_t) (zone + 2),
+                                              wire_to_force(sv));
+          uint8_t wlo = 0, whi = 0;
+          zone_span(wall, wlo, whi);
+          add(wall);
+          // Past the break the travel is free, so the buzz is what remains to
+          // be felt there. Starting it at the break point keeps it clear of the
+          // wall's start zone.
+          uint16_t buzz = 0;
+          for (int z = whi; z < ZONE_COUNT; ++z) buzz |= (uint16_t) (1u << z);
+          add(make_vibration_wire(buzz, (uint8_t) sv, (uint8_t) freq));
+          break;
+        }
+        case KICK_VIBRATION:
+        default:
+          add(make_vibration_wire(ZONES_FULL_TRAVEL, (uint8_t) sv, (uint8_t) freq));
+          break;
+      }
+      return set;
     }
 
     /// Queue a standalone BT output report that touches ONLY one trigger (byte-0
     /// hygiene: no other valid flags, so rumble/haptics/lightbar stay untouched).
-    void send_trigger_report(int side, bool burst, int sv, int freq) {
+    void send_trigger_report(int side, const trigger_fx::ffb_t &ffb) {
       uint8_t common[USB_OUTPUT_COMMON_LEN] = {0};
       common[0] = side ? 0x08 : 0x04;
       const int off = side ? 21 : 10;
-      if (burst) write_kick_ffb(&common[off], sv, freq);
-      else common[off] = 0x05;  // effect off/reset, zero params
+      std::memcpy(&common[off], ffb.data(), trigger_fx::FFB_LEN);
+      {
+        std::lock_guard<std::mutex> lk(tk_ffb_mtx_);
+        tk_held_[side] = ffb;
+      }
       uint8_t bt[BT_OUTPUT_LEN];
       usb_output_to_bt(common, out_seq_.fetch_add(1, std::memory_order_relaxed), bt);
       std::lock_guard<std::mutex> lk(out_mtx_);
       outbox_.emplace_back(bt, bt + BT_OUTPUT_LEN);
+    }
+
+    /**
+     * @brief Build the kick, pick the stage the live trigger travel is in, and
+     *        write it unless the pad already holds exactly those bytes.
+     * @param force  emit even if the bytes are unchanged (the initial fire)
+     * @return true if a report was queued.
+     */
+    bool emit_kick(int side, int style, int zone, int sv, int freq, bool force) {
+      const auto set = build_kick_stages(style, zone, sv, freq);
+      if (set.empty()) return false;
+      const uint8_t pos = tk_pos_[side].load(std::memory_order_relaxed);
+      // rearm_pos 0: the sequence resets only at full release, so a wall is
+      // never re-armed under a finger that is still holding the trigger.
+      int idx = tk_seq_[side].pick(set, pos, 0);
+      if (idx < 0) idx = 0;  // not positional (single vibration) — first stage
+      const bool rearm = tk_seq_[side].take_rearm_pulse();
+      const auto &ffb = set[idx];
+
+      bool same;
+      {
+        std::lock_guard<std::mutex> lk(tk_ffb_mtx_);
+        same = (tk_held_[side] == ffb);
+      }
+      if (same && !force && !rearm) return false;
+      // A weapon break is CONSUMED when the trigger is pushed through it, and
+      // an identical re-write does not re-arm it — the pad collapses the
+      // unchanged frame. One Off frame breaks that suppression so the write
+      // that follows is seen as new.
+      if (same && ffb[0] == trigger_fx::effect::weapon_break) {
+        send_trigger_report(side, trigger_fx::make_off());
+      }
+      send_trigger_report(side, ffb);
+      return true;
+    }
+
+    /// Release our claim on a trigger and rewind its sequence.
+    void release_trigger(int side, bool write_off) {
+      tk_seq_[side].reset();
+      if (write_off) send_trigger_report(side, trigger_fx::make_off());
     }
 
     // Session thread, every loop pass (~2 ms). Hysteresis: burst on at env>=32,
@@ -544,9 +656,8 @@ namespace platf::ds5_bridge {
       if (!(kc & 1) || !hello_seen_.load(std::memory_order_relaxed)) {
         // Feature off (or link down): release anything we still hold.
         for (int s = 0; s < 2; ++s) {
-          if (tk_synth_on_[s].exchange(false, std::memory_order_relaxed) &&
-              hello_seen_.load(std::memory_order_relaxed)) {
-            send_trigger_report(s, false, 0, 0);
+          if (tk_synth_on_[s].exchange(false, std::memory_order_relaxed)) {
+            release_trigger(s, hello_seen_.load(std::memory_order_relaxed));
           }
         }
         return;
@@ -569,6 +680,8 @@ namespace platf::ds5_bridge {
       }
       const int strength = (int) ((kc >> 16) & 0xFF);
       const int freq = (int) ((kc >> 8) & 0xFF);
+      const int style = (int) ((kc >> 5) & 0x03);
+      const int zone = (int) ((kc >> 24) & 0x0F);
       const int scaled = std::min(255, env * strength / 100);
       for (int s = 0; s < 2; ++s) {
         if (!(kc & (s ? 4u : 2u))) continue;
@@ -578,9 +691,9 @@ namespace platf::ds5_bridge {
           if (scaled < 32) continue;
           if (owned) { tk_yields_.fetch_add(1, std::memory_order_relaxed); continue; }
           const int sv = std::min(7, scaled >> 5);
-          send_trigger_report(s, true, sv, freq);
+          tk_seq_[s].reset();
+          emit_kick(s, style, zone, sv, freq, true);
           tk_synth_on_[s].store(true, std::memory_order_relaxed);
-          tk_last_amp_[s].store(sv, std::memory_order_relaxed);
           tk_on_ms_[s] = now;
           tk_send_ms_[s] = now;
           tk_kicks_.fetch_add(1, std::memory_order_relaxed);
@@ -588,27 +701,30 @@ namespace platf::ds5_bridge {
           // The game just wrote a real effect; its report already replaced our
           // burst on the pad — just drop our claim, no clearing write.
           tk_synth_on_[s].store(false, std::memory_order_relaxed);
+          tk_seq_[s].reset();
         } else if (scaled < 16 && now - tk_on_ms_[s] >= 45) {
-          send_trigger_report(s, false, 0, 0);
+          release_trigger(s, true);
           tk_synth_on_[s].store(false, std::memory_order_relaxed);
-        } else {
-          // Track the envelope while the burst holds (3-bit steps, rate-limited).
+        } else if (now - tk_send_ms_[s] >= 30) {
+          // While the burst holds, follow both the envelope (3-bit steps) and
+          // the pull: a multi-stage kick hands over to its next stage as the
+          // trigger travels. emit_kick() writes only on an actual change, and
+          // the 30 ms floor keeps the effect from chattering on the pad.
           const int sv = std::min(7, std::max(scaled, 16) >> 5);
-          if (sv != tk_last_amp_[s].load(std::memory_order_relaxed) &&
-              now - tk_send_ms_[s] >= 30) {
-            send_trigger_report(s, true, sv, freq);
-            tk_last_amp_[s].store(sv, std::memory_order_relaxed);
-            tk_send_ms_[s] = now;
-          }
+          if (emit_kick(s, style, zone, sv, freq, false)) tk_send_ms_[s] = now;
         }
       }
       // Telemetry, at most every 30 s and only while the counters move.
       const uint32_t k = tk_kicks_.load(std::memory_order_relaxed);
       const uint32_t y = tk_yields_.load(std::memory_order_relaxed);
-      if ((k != tk_log_kicks_ || y != tk_log_yields_) && now - tk_log_ms_ >= 30000) {
-        BOOST_LOG(info) << "ds5-kick: kicks=" << k << " yields=" << y;
+      const uint32_t r = tk_stage_rejects_.load(std::memory_order_relaxed);
+      if ((k != tk_log_kicks_ || y != tk_log_yields_ || r != tk_log_rejects_) &&
+          now - tk_log_ms_ >= 30000) {
+        BOOST_LOG(info) << "ds5-kick: kicks=" << k << " yields=" << y
+                        << " stage-rejects=" << r;
         tk_log_kicks_ = k;
         tk_log_yields_ = y;
+        tk_log_rejects_ = r;
         tk_log_ms_ = now;
       }
     }
@@ -947,16 +1063,23 @@ namespace platf::ds5_bridge {
     // Trigger-kick state. Envelope + ownership cross the usbip server thread
     // (on_game_output) and the session thread (trigger_kick_tick) — atomics.
     // tk_on_ms_/tk_send_ms_/tk_log_* are session-thread-only.
+    // Index order for all tk_* pairs is the bridge's side order: 0 = R2, 1 = L2.
     const std::atomic<uint32_t> *kick_cfg_ {nullptr};
     std::atomic<int> tk_rumble_env_ {0};
     std::atomic<int64_t> tk_rumble_ms_ {0};
     std::atomic<int64_t> tk_game_ffb_ms_[2] {0, 0};  // last real game FFB (R2, L2)
     std::atomic<bool> tk_synth_on_[2] {false, false};
-    std::atomic<int> tk_last_amp_[2] {0, 0};
+    std::atomic<uint8_t> tk_pos_[2] {};  // live analog trigger travel, 0-255
+    // The block the pad is currently holding, for the on_game_output re-assert
+    // and for suppressing unchanged writes. Written on the session thread, read
+    // on the usbip server thread.
+    std::mutex tk_ffb_mtx_;
+    trigger_fx::ffb_t tk_held_[2] {};
+    trigger_fx::sequencer tk_seq_[2];  // session-thread only
     int64_t tk_on_ms_[2] {0, 0};
     int64_t tk_send_ms_[2] {0, 0};
-    std::atomic<uint32_t> tk_kicks_ {0}, tk_yields_ {0};
-    uint32_t tk_log_kicks_ {0}, tk_log_yields_ {0};
+    std::atomic<uint32_t> tk_kicks_ {0}, tk_yields_ {0}, tk_stage_rejects_ {0};
+    uint32_t tk_log_kicks_ {0}, tk_log_yields_ {0}, tk_log_rejects_ {0};
     int64_t tk_log_ms_ {0};
     std::atomic<uint32_t> dbg_out_n_ {0};
     uint8_t dbg_rgb_[3] {};

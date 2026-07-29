@@ -416,16 +416,28 @@ namespace config {
     std::string lightbar_color {"0000ff"};
 
     // Trigger-kick synthesis (concept: artzox/DS5Dongle, MIT): on rumble/haptic
-    // transients the bridge briefly switches an adaptive trigger to a vibration
-    // burst (a static resistance change is barely felt under a holding finger).
-    // Only fires while the game itself drives no effect on that trigger, so
-    // DS5-native titles are never overridden — the win is XInput-era titles
-    // that only rumble.
+    // transients the bridge briefly drives an adaptive trigger with a real
+    // trigger effect (a static resistance change is barely felt under a holding
+    // finger — the transition is what reads as recoil). Only fires while the
+    // game itself drives no effect on that trigger, so DS5-native titles are
+    // never overridden — the win is XInput-era titles that only rumble.
     bool trigger_kick {false};
     int trigger_kick_strength {70};              // envelope scale, 0-100
     int trigger_kick_freq {35};                  // burst carrier Hz; lower = heavier knock
     std::string trigger_kick_source {"both"};    // haptic | rumble | both
     std::string trigger_kick_side {"r2"};        // r2 | l2 | both
+    // Which trigger effect the kick fires:
+    //   vibration - 0x26 buzz across the whole travel (felt at any pull depth)
+    //   bow       - 0x22 snap force pushing the trigger BACK against the finger,
+    //               the only true mechanical recoil the pad can produce
+    //   break     - 0x25 wall with a hardware-sharp snap-through, then a buzz
+    //               past the break point (two stages, played by trigger travel)
+    std::string trigger_kick_style {"vibration"};
+    // Travel zone (0-9, roughly 10% of the pull each) where the mechanical
+    // styles place their wall/draw. Ignored by the vibration style, which
+    // always covers the full travel. Hardware clamps apply (see
+    // ds5_trigger_fx.h): a weapon-break wall lands in 2-7, a bow draw in 0-7.
+    int trigger_kick_zone {4};
   };
 
   namespace flag {

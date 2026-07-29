@@ -1860,6 +1860,8 @@ namespace config {
       int_between_f(vars, "ds5_trigger_kick_freq", ds5b.trigger_kick_freq, {10, 200});
       string_f(vars, "ds5_trigger_kick_source", ds5b.trigger_kick_source);
       string_f(vars, "ds5_trigger_kick_side", ds5b.trigger_kick_side);
+      string_f(vars, "ds5_trigger_kick_style", ds5b.trigger_kick_style);
+      int_between_f(vars, "ds5_trigger_kick_zone", ds5b.trigger_kick_zone, {0, 9});
     }
 
     path_f(vars, "pkey", nvhttp.pkey);

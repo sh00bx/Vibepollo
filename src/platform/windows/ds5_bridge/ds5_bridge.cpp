@@ -65,15 +65,22 @@ namespace ds5_bridge_provider {
           lightbar = config::ds5b.lightbar_color;
           // Trigger-kick config, packed for the sessions' lock-free live read:
           // bit0 enable, bit1 R2, bit2 L2, bit3 haptic source, bit4 rumble
-          // source, bits 8-15 carrier freq, bits 16-23 strength.
+          // source, bits 5-6 effect style, bits 8-15 carrier freq, bits 16-23
+          // strength, bits 24-27 start zone.
           if (config::ds5b.trigger_kick) {
             const auto &side = config::ds5b.trigger_kick_side;
             const auto &src = config::ds5b.trigger_kick_source;
+            const auto &style = config::ds5b.trigger_kick_style;
             kick = 1u;
             kick |= (side == "l2") ? 4u : (side == "both") ? 6u : 2u;
             kick |= (src == "haptic") ? 8u : (src == "rumble") ? 16u : 24u;
+            // Unknown style names fall back to the vibration burst: it is the
+            // one effect that is felt at any pull depth, so a typo degrades to
+            // the safe default rather than to a trigger that never reacts.
+            kick |= (style == "bow") ? (1u << 5) : (style == "break") ? (2u << 5) : 0u;
             kick |= (uint32_t) (config::ds5b.trigger_kick_freq & 0xFF) << 8;
             kick |= (uint32_t) (config::ds5b.trigger_kick_strength & 0xFF) << 16;
+            kick |= (uint32_t) (config::ds5b.trigger_kick_zone & 0x0F) << 24;
           }
         }
         {
