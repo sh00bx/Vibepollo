@@ -288,8 +288,13 @@ namespace platf::ds5_bridge {
       cfg.input_report_len = caps.input_report_len;
       cfg.output_report_len = BT_OUTPUT_LEN;
       cfg.feature_report_len = caps.feature_report_len;
-      cfg.paced_report_count = 1;
+      // Advertise BOTH audio report forms as paced. Which one this session emits
+      // is fixed at session creation (audio_batched_), but advertising both is
+      // free (the list holds 16) and keeps the advertisement correct no matter
+      // when the HELLO arrives relative to the builder's construction.
+      cfg.paced_report_count = 2;
       cfg.paced_report_ids[0] = 0x36;
+      cfg.paced_report_ids[1] = 0x39;
       send_msg(CTMB_MSG_HOST_CONFIG, CTMB_FLAG_OK, 0,
                reinterpret_cast<const uint8_t *>(&cfg), sizeof(cfg));
 
@@ -491,11 +496,15 @@ namespace platf::ds5_bridge {
       std::deque<std::vector<uint8_t>> pending;
       { std::lock_guard<std::mutex> lk(out_mtx_); pending.swap(outbox_); }
       for (auto &bt : pending) {
-        // 0x36 audio/haptic reports are paced (HOST_CONFIG advertises them); the
+        // Audio/haptic reports are paced (HOST_CONFIG advertises them); the
         // TV drains its PACED queue onto the raw-ACL injector at min(bt_pace_us,
         // 8 ms) (~125/s cap), so on-air cadence is arrival-limited to our 100/s.
+        // BOTH forms must be listed: with ds5_native_audio_batched the report id
+        // is 0x39, and tagging only 0x36 would send the whole batched stream
+        // down the TV's unpaced path (the rate servo would have no queue to act
+        // on). The rare standalone 0x32 SetState stays unpaced on purpose.
         uint32_t flags = CTMB_FLAG_OK;
-        if (!bt.empty() && bt[0] == 0x36) flags |= CTMB_FLAG_PACED;
+        if (!bt.empty() && (bt[0] == 0x36 || bt[0] == 0x39)) flags |= CTMB_FLAG_PACED;
         send_msg(CTMB_MSG_OUTPUT_REPORT, flags, 0, bt.data(), (uint32_t) bt.size());
       }
     }
@@ -537,8 +546,13 @@ namespace platf::ds5_bridge {
       // one is lost, and it keeps the "never fight the game's own writes"
       // property of the inline block (same audio-only payload).
       uint8_t setstate[DS5_0X32_LEN];
-      int setstate_ticks = 0;
       const int setstate_every = pace_base_us > 0 ? (1000000 / pace_base_us) : 47;
+      // Primed to fire on the FIRST report: unlike the 0x36 form, which carries
+      // the SetState inline on every tick, the batched form has to assert the
+      // audio Allow bits separately — starting the counter at 0 would leave the
+      // pad without them for the first ~1 s of every session (it drops the audio
+      // it has not been told to route).
+      int setstate_ticks = setstate_every;
       while (!pacer_stop_.load() && !stop_.load()) {
         int64_t now_ms = duration_cast<milliseconds>(
           steady_clock::now().time_since_epoch()).count();

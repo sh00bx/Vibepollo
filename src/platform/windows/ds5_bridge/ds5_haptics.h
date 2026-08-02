@@ -236,6 +236,10 @@ namespace platf::ds5_bridge {
     // production cadence to tolerate URB jitter (ds5_av_play.c uses 15 ms on lossy
     // WiFi; our feed is local + paced, so jitter is low, but keep headroom).
     static constexpr auto HAPTIC_STALE = std::chrono::milliseconds(30);
+    // Same idea for the batched form, whose report period is ~21.33 ms: a
+    // perfectly healthy snapshot can be that old at build time, so the 30 ms
+    // window would read a live feed as stalled every other report.
+    static constexpr auto HAPTIC_STALE_BATCHED = std::chrono::milliseconds(45);
     // Idle-gate on real signal activity so the DS5 falls quiet after true silence
     // (no idle hum) rather than on buffer state. Driven by haptic OR speaker.
     static constexpr auto GRACE = std::chrono::milliseconds(300);
