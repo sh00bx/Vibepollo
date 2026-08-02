@@ -53,6 +53,7 @@ namespace ds5_bridge_provider {
       bool started = false;
       while (!st.stop_requested()) {
         bool enable, haptics, audio_batched;
+        int audio_cushion;
         int port;
         std::string lightbar;
         {
@@ -61,6 +62,7 @@ namespace ds5_bridge_provider {
           port = config::ds5b.port;
           haptics = config::ds5b.native_haptics;
           audio_batched = config::ds5b.native_audio_batched;
+          audio_cushion = config::ds5b.native_audio_cushion_frames;
           lightbar = config::ds5b.lightbar_color;
         }
 
@@ -71,6 +73,7 @@ namespace ds5_bridge_provider {
 
         host().set_haptics(haptics);
         host().set_audio_batched(audio_batched);
+        host().set_audio_cushion(audio_cushion);
         host().set_lightbar(parse_lightbar(lightbar));
         if (want && !started) {
           started = host().start(port);

@@ -127,6 +127,20 @@ namespace platf::ds5_bridge {
     /// flip would hand the pad a report whose counters jump by a different step).
     void set_batched(bool on) {
       batched_ = on;
+      recompute_cushion();   // the cushion floor depends on frames-per-tick
+    }
+
+    /// Speaker jitter cushion in 10.67 ms frames (set before the pacer starts).
+    /// Lower = less pad-speaker latency, less tolerance for a late feed chunk;
+    /// watch spkplc in the ds5-haptics line, which reports the cost directly.
+    void set_cushion_frames(int n) {
+      cushion_frames_ = n;
+      recompute_cushion();
+    }
+
+    /// The clamped cushion actually in force (frames).
+    int cushion_frames() const {
+      return eff_cushion_;
     }
 
     bool batched() const {
@@ -245,8 +259,31 @@ namespace platf::ds5_bridge {
     static constexpr double SPK_RMS = 0.0005;       // speaker activity squelch (ds5_av_capture.cpp)
     static constexpr int SPK_CONCEAL = 8;           // max consecutive PLC-driven sends (~85 ms)
     static constexpr int SPK_RING_FRAMES = 9600;    // ~200 ms of stereo cushion cap
-    static constexpr size_t SPK_LAT_TARGET = 4 * OPUS_FRAME;  // ~40 ms jitter floor
-    static constexpr size_t SPK_LAT_DRAIN = 8 * OPUS_FRAME;   // drain above ~80 ms
+    // Speaker jitter cushion, in 10.67 ms frames. Historically a hard 4 (~43 ms) with
+    // drain at 2x. It is pure LATENCY on the pad speaker, so it is worth tuning down —
+    // but the usable margin is NOT the cushion itself: the pacer pops
+    // spk_frames_per_tick() frames at once, so what absorbs late production is
+    // (cushion - frames_per_tick) frames. At the default 4 that is 32 ms for 0x36 but
+    // only 21 ms for 0x39. Hence the floor below.
+    static constexpr int SPK_CUSHION_DEFAULT = 4;
+    static constexpr int SPK_CUSHION_MAX = 16;
+    int cushion_frames_ = SPK_CUSHION_DEFAULT;
+    size_t spk_lat_target_ = (size_t) SPK_CUSHION_DEFAULT * OPUS_FRAME;
+    size_t spk_lat_drain_ = (size_t) (2 * SPK_CUSHION_DEFAULT) * OPUS_FRAME;
+    /// Clamp the requested cushion to something the pop pattern can actually sustain
+    /// and derive the drain threshold. Floor is frames-per-tick + 1: a cushion that
+    /// only covers the pops themselves leaves ZERO margin for a late feed chunk and
+    /// degenerates into prime/underrun alternation (that is the 50 % PLC failure the
+    /// batched path already hit once, from the other direction).
+    void recompute_cushion() {
+      const int floor_n = spk_frames_per_tick() + 1;
+      int n = cushion_frames_ < floor_n ? floor_n : cushion_frames_;
+      if (n > SPK_CUSHION_MAX) n = SPK_CUSHION_MAX;
+      spk_lat_target_ = (size_t) n * OPUS_FRAME;
+      spk_lat_drain_ = (size_t) (2 * n) * OPUS_FRAME;
+      eff_cushion_ = n;
+    }
+    int eff_cushion_ = SPK_CUSHION_DEFAULT;
     std::mutex spk_mtx_;
     std::array<int16_t, SPK_RING_FRAMES * 2> spk_ring_ {};  // interleaved stereo
     size_t spk_head_ = 0, spk_count_ = 0;                   // frames (L+R pairs)

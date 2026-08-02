@@ -58,10 +58,10 @@ namespace platf::ds5_bridge {
   class bridge_session {
   public:
     bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, bool haptics,
-                   bool audio_batched,
+                   bool audio_batched, int audio_cushion,
                    const std::atomic<uint32_t> *lightbar_rgb):
         usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport),
-        audio_batched_(audio_batched),
+        audio_batched_(audio_batched), audio_cushion_(audio_cushion),
         lightbar_rgb_(lightbar_rgb) { haptics_want_.store(haptics); }
 
     /// Control thread, on every BRIDGE_START for this session (incl. adopts).
@@ -233,10 +233,15 @@ namespace platf::ds5_bridge {
         // audio packet counter whose step encodes how many frames a report
         // carries, so flipping mid-stream would hand it a discontinuity.
         hap_->set_batched(audio_batched_);
+        hap_->set_cushion_frames(audio_cushion_);   // after set_batched: the floor depends on it
         if (audio_batched_) {
           BOOST_LOG(info) << "ds5-bridge: audio downlink = batched 0x39 ("sv
                           << DS5_0X39_LEN << " B, two frames + two coil blocks per report)"sv;
         }
+        BOOST_LOG(info) << "ds5-bridge: speaker cushion = "sv << hap_->cushion_frames()
+                        << " frames (~"sv << (hap_->cushion_frames() * 1067 / 100) << " ms), requested "sv
+                        << audio_cushion_ << ", usable margin "sv
+                        << ((hap_->cushion_frames() - hap_->spk_frames_per_tick()) * 1067 / 100) << " ms"sv;
         slot_->on_iso_out = [this](const uint8_t *pcm, size_t len) {
           if (hap_ && haptics_on_.load(std::memory_order_relaxed)) hap_->feed_pcm(pcm, len);
         };
@@ -788,6 +793,7 @@ namespace platf::ds5_bridge {
     std::atomic<bool> haptics_want_ {false};
     // Report form for this session's whole lifetime (see set_batched).
     const bool audio_batched_ {false};
+    const int audio_cushion_ {4};
     std::atomic<bool> haptics_on_ {false};
 
     std::unique_ptr<ds5_haptic_builder> hap_;   // Phase 2 0x36 builder (gated by haptics_on_)
@@ -977,7 +983,8 @@ namespace platf::ds5_bridge {
         return "OK";
       }
       auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, haptics_.load(),
-                                                  audio_batched_.load(), &lightbar_rgb_);
+                                                  audio_batched_.load(), audio_cushion_.load(),
+                                                  &lightbar_rgb_);
       sess->start();
       sessions_[dport] = std::move(sess);
       BOOST_LOG(info) << "ds5-bridge: BRIDGE_START ds5 port="sv << dport << " busid="sv << busid;
