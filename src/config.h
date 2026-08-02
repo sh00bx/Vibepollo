@@ -416,8 +416,14 @@ namespace config {
     // still fits one 3-DH3 EDR packet, which is why the ladder stops there.
     // Costs +10.67 ms of downlink buffering, and the per-frame audio SetState
     // no longer fits in the report, so it is re-asserted as a separate 0x32.
-    // OFF by default: this is an A/B knob against the proven 0x36 path.
-    bool native_audio_batched {false};
+    // ON by default since 2026-08-02: the A/B against 0x36 is done. Measured on a
+    // live session: -31.3% bytes and -48.9% packets per audio frame, daemon
+    // `outstanding` mean 4.27 -> 2.38, stall-episode p90 897ms -> 114ms, servo
+    // adj 0us and drop/backoff unmoved over ~39k injects. The +10.67 ms of
+    // buffering is not a net latency cost either: a 0x39 carries twice the audio
+    // per packet, so the pad needs ~10.67 ms LESS jitter buffer for the same
+    // robustness (see the B + 21.33 ms underrun threshold in ds5_haptics.h).
+    bool native_audio_batched {true};
     // Speaker jitter cushion in 10.67 ms frames. Pure latency on the pad speaker,
     // so it is worth trimming; the usable margin is (cushion - frames per report),
     // and the builder clamps anything below that floor. Watch spkplc in the
