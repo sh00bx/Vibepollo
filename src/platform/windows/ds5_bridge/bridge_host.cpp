@@ -271,8 +271,8 @@ namespace platf::ds5_bridge {
       // HOST_CONFIG (see client_ready_).
       client_ready_.store(false, std::memory_order_relaxed);
       // A re-HELLO can mean a re-paired BT link whose firmware re-latched the
-      // lightbar-setup gate — re-arm so the release is folded again.
-      lb_released_.store(false, std::memory_order_relaxed);
+      // lightbar-setup gate — restart the re-assert window (see lb_in_release_window).
+      lb_connect_ms_.store(now_ms(), std::memory_order_relaxed);
 
       // Always (re)answer the handshake: the client waits for HOST_CONFIG on every
       // (re)connect (needs_host_config), so this must be sent each HELLO.
@@ -398,12 +398,11 @@ namespace platf::ds5_bridge {
       std::memcpy(common, eff, USB_OUTPUT_COMMON_LEN);
       // The HELLO-time lightbar-setup release can arrive before the pad has
       // switched to extended BT mode (the 0x05/0x09/0x20 feature reads do the
-      // unlock, asynchronously). Fold the release into the game's own first
-      // reports too — SDL ships it combined with color/rumble the same way.
-      if (!lb_released_.load(std::memory_order_relaxed)) {
+      // unlock, asynchronously). Fold the release into the game's own reports
+      // too — SDL ships it combined with color/rumble the same way.
+      if (lb_in_release_window()) {
         common[38] |= 0x02;  // valid_flag2: LIGHTBAR_SETUP_CONTROL_ENABLE
         common[41] = 0x02;   // lightbar_setup: LIGHT_OUT
-        lb_released_.store(true, std::memory_order_relaxed);
       }
       // Synthetic lightbar: libScePad titles write the lightbar once at pad
       // init — to black — and never again (on the PS5 the OS supplies the
@@ -457,6 +456,31 @@ namespace platf::ds5_bridge {
         std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    // Whether outgoing reports should still carry the BT lightbar-setup release.
+    //
+    // This used to be a one-shot latch, set the moment the release was FOLDED
+    // into a frame -- i.e. on the optimistic assumption that it arrived and
+    // took effect. It cannot be observed: the pad reports no lightbar state, so
+    // there is nothing to confirm against. When the assumption was wrong the
+    // bar stayed under firmware control for the entire connect, because every
+    // later frame was colour-only and the gate silently dropped it.
+    //
+    // The reproducible case is a pad that was charging over USB: it connects
+    // with the firmware charge indication owning the bar, the game's very first
+    // output report spends the one-shot release before the pad has finished
+    // switching to extended BT mode, and the bar stays orange until unplug.
+    //
+    // So re-assert for a bounded window after each (re)connect instead. The
+    // release is idempotent and rides along in reports that are sent anyway, so
+    // repeating it costs nothing; bounding it keeps a game that legitimately
+    // drives the bar from fighting a permanent re-assert.
+    static constexpr int64_t LB_RELEASE_WINDOW_MS = 60000;
+
+    bool lb_in_release_window() const {
+      const int64_t t0 = lb_connect_ms_.load(std::memory_order_relaxed);
+      return t0 != 0 && (now_ms() - t0) < LB_RELEASE_WINDOW_MS;
+    }
+
     // Session thread: repaint the synthetic lightbar color every few seconds
     // while connected and no game owns the bar (see on_game_output).
     void maybe_repaint_lightbar() {
@@ -468,11 +492,11 @@ namespace platf::ds5_bridge {
       if (now - lb_last_paint_ms_.load(std::memory_order_relaxed) < 5000) return;
       lb_last_paint_ms_.store(now, std::memory_order_relaxed);
       uint8_t common[USB_OUTPUT_COMMON_LEN] = {0};
-      // Keep folding the BT lightbar-setup release until a game output latches
-      // it: a re-paired BT link re-latches the firmware gate, and without the
-      // release every color-only repaint is silently ignored — the very
+      // Keep folding the BT lightbar-setup release for the whole re-assert
+      // window: a re-paired BT link re-latches the firmware gate, and without
+      // the release every color-only repaint is silently ignored — the very
       // scenario this keep-alive exists for.
-      if (!lb_released_.load(std::memory_order_relaxed)) {
+      if (lb_in_release_window()) {
         common[38] = 0x02;  // valid_flag2: LIGHTBAR_SETUP_CONTROL_ENABLE
         common[41] = 0x02;  // lightbar_setup: LIGHT_OUT
       }
@@ -695,7 +719,9 @@ namespace platf::ds5_bridge {
       { std::lock_guard<std::mutex> lk(out_mtx_); outbox_.clear(); }
       // Fresh link may be a fresh pad connect: re-arm the lightbar-setup
       // release, lightbar ownership and the per-connect output diagnostics.
-      lb_released_.store(false, std::memory_order_relaxed);
+      // Zero (not now_ms()) so the window opens at the next HELLO -- there is
+      // no link to carry the release while disconnected.
+      lb_connect_ms_.store(0, std::memory_order_relaxed);
       lb_game_owned_.store(false, std::memory_order_relaxed);
       dbg_out_n_.store(0, std::memory_order_relaxed);
       // Servo: the next session may be a fresh daemon run (drop_total restarts)
@@ -848,7 +874,8 @@ namespace platf::ds5_bridge {
     // Lightbar state crosses the usbip server thread (on_game_output), the
     // session thread (HELLO paint, keep-alive, reset_transport) and the control
     // thread — all flags atomic. dbg_rgb_/dbg_rgb_log_ms_ are usbip-thread-only.
-    std::atomic<bool> lb_released_ {false};
+    // Start of the current connect's lightbar-setup re-assert window (0 = none).
+    std::atomic<int64_t> lb_connect_ms_ {0};
     std::atomic<bool> lb_game_owned_ {false};
     std::atomic<int64_t> lb_last_paint_ms_ {0};
     const std::atomic<uint32_t> *lightbar_rgb_ {nullptr};
