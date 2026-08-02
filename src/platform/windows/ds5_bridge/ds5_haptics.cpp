@@ -223,9 +223,16 @@ namespace platf::ds5_bridge {
         // The outgoing snapshot is retained as prev_frame_ so the batched form can
         // send two CONSECUTIVE coil blocks (21.33 ms) instead of the same block
         // twice; the 0x36 path never reads it.
-        if (have_haptic_) {
+        // Only a snapshot that is still fresh is a genuine PREDECESSOR of the one
+        // arriving now. After a feed gap (game silent, endpoint closed) the old
+        // latest_frame_ is seconds stale; carrying it forward unconditionally
+        // would make the first 0x39 after every gap replay it as its first
+        // 10.67 ms — an audible click at the start of each effect.
+        if (have_haptic_ && (now - latest_ts_) < HAPTIC_STALE_BATCHED) {
           std::memcpy(prev_frame_.data(), latest_frame_.data(), HAPTIC_BYTES);
           have_prev_ = true;
+        } else {
+          have_prev_ = false;
         }
         std::memcpy(latest_frame_.data(), snap.data(), HAPTIC_BYTES);
         latest_ts_ = now;
@@ -544,11 +551,7 @@ namespace platf::ds5_bridge {
 
     bool spk_active = (now - last_spk_ts_) < GRACE && plc_run_ <= SPK_CONCEAL;
 
-    // Staleness window scales with the report period: at ~21.33 ms per report a
-    // perfectly healthy snapshot can be that old at build time, so the 0x36
-    // window (30 ms) would read a live feed as stalled every other tick.
-    constexpr auto HAPTIC_STALE_BATCHED = std::chrono::milliseconds(45);
-
+    // Staleness window scales with the report period (HAPTIC_STALE_BATCHED).
     bool hap_active = false;
     {
       std::lock_guard<std::mutex> lk(hap_mtx_);
