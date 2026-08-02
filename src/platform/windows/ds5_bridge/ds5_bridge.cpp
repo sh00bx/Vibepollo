@@ -52,7 +52,7 @@ namespace ds5_bridge_provider {
       using namespace std::chrono_literals;
       bool started = false;
       while (!st.stop_requested()) {
-        bool enable, haptics;
+        bool enable, haptics, audio_batched;
         int port;
         std::string lightbar;
         {
@@ -60,6 +60,7 @@ namespace ds5_bridge_provider {
           enable = config::ds5b.native_bridge;
           port = config::ds5b.port;
           haptics = config::ds5b.native_haptics;
+          audio_batched = config::ds5b.native_audio_batched;
           lightbar = config::ds5b.lightbar_color;
         }
 
@@ -69,6 +70,7 @@ namespace ds5_bridge_provider {
         bool want = enable;
 
         host().set_haptics(haptics);
+        host().set_audio_batched(audio_batched);
         host().set_lightbar(parse_lightbar(lightbar));
         if (want && !started) {
           started = host().start(port);

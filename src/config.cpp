@@ -2012,6 +2012,7 @@ namespace config {
       bool_f(vars, "ds5_native_bridge", ds5b.native_bridge);
       int_between_f(vars, "ds5_bridge_port", ds5b.port, {1, 65535});
       bool_f(vars, "ds5_native_haptics", ds5b.native_haptics);
+      bool_f(vars, "ds5_native_audio_batched", ds5b.native_audio_batched);
       string_f(vars, "ds5_lightbar_color", ds5b.lightbar_color);
     }
 

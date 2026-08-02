@@ -401,6 +401,17 @@ namespace config {
     // default; opt-in for A/B against CTM. Read when a controller connects.
     bool native_haptics {false};
 
+    // Batched audio/haptic downlink: emit the DS5's 0x39 report (547 B: TWO
+    // 10 ms Opus frames + TWO 64-byte coil blocks) at ~47/s instead of 0x36
+    // (398 B, one of each) at ~94/s. Same audio, half the on-air ACL packets
+    // and ~31% fewer bytes — the DS5 BT output reports 0x31..0x39 are a size
+    // ladder in 64-byte steps, and 0x39 is the largest whose L2CAP PDU (552 B)
+    // still fits one 3-DH3 EDR packet, which is why the ladder stops there.
+    // Costs +10.67 ms of downlink buffering, and the per-frame audio SetState
+    // no longer fits in the report, so it is re-asserted as a separate 0x32.
+    // OFF by default: this is an A/B knob against the proven 0x36 path.
+    bool native_audio_batched {false};
+
     // Synthetic lightbar color, hex "RRGGBB" (empty/"off" disables). PC games
     // via libScePad set the lightbar to black at pad init and never write a
     // real color — on the PS5 the OS supplies the player color — so without
