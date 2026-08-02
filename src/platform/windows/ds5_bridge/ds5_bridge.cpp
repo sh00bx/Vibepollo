@@ -53,7 +53,7 @@ namespace ds5_bridge_provider {
       bool warned_conflict = false;
       bool started = false;
       while (!st.stop_requested()) {
-        bool enable, ctm_enable, haptics;
+        bool enable, ctm_enable, haptics, audio_batched;
         int port;
         std::string lightbar;
         uint32_t kick = 0;
@@ -62,6 +62,7 @@ namespace ds5_bridge_provider {
           enable = config::ds5b.native_bridge;
           port = config::ds5b.port;
           haptics = config::ds5b.native_haptics;
+          audio_batched = config::ds5b.native_audio_batched;
           lightbar = config::ds5b.lightbar_color;
           // Trigger-kick config, packed for the sessions' lock-free live read:
           // bit0 enable, bit1 R2, bit2 L2, bit3 haptic source, bit4 rumble
@@ -104,6 +105,7 @@ namespace ds5_bridge_provider {
         }
 
         host().set_haptics(haptics);
+        host().set_audio_batched(audio_batched);
         host().set_lightbar(parse_lightbar(lightbar));
         host().set_trigger_kick(kick);
         if (want && !started) {

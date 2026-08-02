@@ -59,9 +59,11 @@ namespace platf::ds5_bridge {
   class bridge_session {
   public:
     bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, bool haptics,
+                   bool audio_batched,
                    const std::atomic<uint32_t> *lightbar_rgb,
                    const std::atomic<uint32_t> *trigger_kick):
         usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport),
+        audio_batched_(audio_batched),
         lightbar_rgb_(lightbar_rgb), kick_cfg_(trigger_kick) { haptics_want_.store(haptics); }
 
     /// Control thread, on every BRIDGE_START for this session (incl. adopts).
@@ -236,6 +238,14 @@ namespace platf::ds5_bridge {
         // of an adopted session without racing the usbip iso callback. Wire the
         // hook before the attach below (which is when the game starts writing).
         hap_ = std::make_unique<ds5_haptic_builder>();
+        // Report form is fixed for the life of the builder: the pad tracks an
+        // audio packet counter whose step encodes how many frames a report
+        // carries, so flipping mid-stream would hand it a discontinuity.
+        hap_->set_batched(audio_batched_);
+        if (audio_batched_) {
+          BOOST_LOG(info) << "ds5-bridge: audio downlink = batched 0x39 ("sv
+                          << DS5_0X39_LEN << " B, two frames + two coil blocks per report)"sv;
+        }
         slot_->on_iso_out = [this](const uint8_t *pcm, size_t len) {
           if (hap_ && haptics_on_.load(std::memory_order_relaxed)) hap_->feed_pcm(pcm, len);
         };
@@ -369,7 +379,8 @@ namespace platf::ds5_bridge {
       if (fb.fifo_count > dbg_fb_fifo_max_) dbg_fb_fifo_max_ = fb.fifo_count;
       if (++dbg_fb_n_ >= 40) {
         BOOST_LOG(info) << "ds5-pace: adj=" << adj << "us ("
-                        << (DS5_PACE_BASE_US + adj) << "us/tick) fifo_max="
+                        << ((hap_ ? hap_->pace_base_us() : DS5_PACE_BASE_US) + adj)
+                        << "us/tick) fifo_max="
                         << dbg_fb_fifo_max_ << " q=" << (int) fb.outstanding
                         << "/" << fb.maxq << " drops+=" << dbg_fb_drops_
                         << " inj=" << fb.inj_total;
@@ -769,15 +780,31 @@ namespace platf::ds5_bridge {
       // (expired deadlines pass through), but only at the cost of ~1.6-report
       // bursts per wake; the high-res timer removes the bursting.
       auto hpt = platf::create_high_precision_timer();
-      uint8_t rep[DS5_0X36_LEN];
+      uint8_t rep[DS5_AUDIO_REPORT_MAX];
+      // Form-dependent geometry, read once: set_batched() is called before this
+      // thread starts and never changes afterwards.
+      const int rep_len = hap_ ? hap_->report_len() : DS5_0X36_LEN;
+      const int pace_base_us = hap_ ? hap_->pace_base_us() : DS5_PACE_BASE_US;
+      const int pace_scale = pace_base_us / DS5_PACE_BASE_US;  // 1 (0x36) or 2 (0x39)
+      // Batched mode only: the audio SetState no longer rides every report, so
+      // re-assert it ~1/s as a standalone 0x32. Cheap (142 B), self-healing if
+      // one is lost, and it keeps the "never fight the game's own writes"
+      // property of the inline block (same audio-only payload).
+      uint8_t setstate[DS5_0X32_LEN];
+      int setstate_ticks = 0;
+      const int setstate_every = pace_base_us > 0 ? (1000000 / pace_base_us) : 47;
       while (!pacer_stop_.load() && !stop_.load()) {
         int64_t now_ms = duration_cast<milliseconds>(
           steady_clock::now().time_since_epoch()).count();
         bool fb_live = (now_ms - fb_last_ms_.load(std::memory_order_relaxed)) < 2000;
         int adj = fb_live ? pace_adj_us_.load(std::memory_order_relaxed)
                           : DS5_PACE_FALLBACK_ADJ_US;
-        const auto period = microseconds(DS5_PACE_BASE_US + adj);
-        if (hap_) hap_->set_pace_us(DS5_PACE_BASE_US + adj);
+        // The servo's adj is a RELATIVE rate offset expressed in microseconds of
+        // the 0x36 period; a batched report covers two of those, so scale it or
+        // the same feedback would only stretch the wire rate half as much.
+        const int adj_scaled = adj * pace_scale;
+        const auto period = microseconds(pace_base_us + adj_scaled);
+        if (hap_) hap_->set_pace_us(pace_base_us + adj_scaled);
         next += period;
         auto now = steady_clock::now();
         if (now - next > milliseconds(100)) next = now;  // genuine stall: no catch-up burst
@@ -787,9 +814,14 @@ namespace platf::ds5_bridge {
         // overtake a lost HOST_CONFIG (reliable ch0) and hard-fail the TV's
         // handshake. Wait for the first post-HELLO inbound frame instead; the
         // dropped frames are disposable.
-        if (hap_->build_0x36(rep) && client_ready_.load(std::memory_order_relaxed)) {
+        if (hap_->build_audio(rep) && client_ready_.load(std::memory_order_relaxed)) {
           std::lock_guard<std::mutex> lk(out_mtx_);
-          if (outbox_.size() < 256) outbox_.emplace_back(rep, rep + DS5_0X36_LEN);
+          if (outbox_.size() < 256) outbox_.emplace_back(rep, rep + rep_len);
+          if (hap_->batched() && ++setstate_ticks >= setstate_every) {
+            setstate_ticks = 0;
+            hap_->build_setstate_0x32(setstate);
+            if (outbox_.size() < 256) outbox_.emplace_back(setstate, setstate + DS5_0X32_LEN);
+          }
         }
       }
     }
@@ -1016,6 +1048,8 @@ namespace platf::ds5_bridge {
     // the documented "takes effect on the next connect" A/B semantics hold even
     // though adopted sessions never re-run the constructor.
     std::atomic<bool> haptics_want_ {false};
+    // Report form for this session's whole lifetime (see set_batched).
+    const bool audio_batched_ {false};
     std::atomic<bool> haptics_on_ {false};
 
     std::unique_ptr<ds5_haptic_builder> hap_;   // Phase 2 0x36 builder (gated by haptics_on_)
@@ -1225,7 +1259,8 @@ namespace platf::ds5_bridge {
                         << busid << " (reconnect; adopted live session on this port)"sv;
         return "OK";
       }
-      auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, haptics_.load(), &lightbar_rgb_, &trigger_kick_);
+      auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, haptics_.load(),
+                                                  audio_batched_.load(), &lightbar_rgb_, &trigger_kick_);
       sess->start();
       sessions_[dport] = std::move(sess);
       BOOST_LOG(info) << "ds5-bridge: BRIDGE_START ds5 port="sv << dport << " busid="sv << busid;

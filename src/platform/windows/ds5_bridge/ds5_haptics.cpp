@@ -25,6 +25,13 @@ namespace platf::ds5_bridge {
     constexpr int OFF_HAPTIC = 78;     // voice-coil (0x12) payload
     constexpr int OFF_OPUS = 144;      // Opus speaker (0x13) payload
 
+    // Batched 0x39 geometry (see the ladder note in ds5_haptics.h). No SetState
+    // block fits here — it goes out as a periodic standalone 0x32.
+    constexpr int OFF39_HAPTIC_A = 12;    // first  64-byte coil block
+    constexpr int OFF39_HAPTIC_B = 76;    // second 64-byte coil block
+    constexpr int OFF39_OPUS_A = 142;     // first  200-byte Opus frame
+    constexpr int OFF39_OPUS_B = 342;     // second 200-byte Opus frame
+
     // Non-destructive "audio-only" SetState (0x10) payload: asserts only the
     // audio Allow bits so it never fights Moonlight's own trigger/rumble/LED
     // writes on the same pad (ds5_av_play.c, DS5Dongle state layout). 63 bytes.
@@ -213,6 +220,13 @@ namespace platf::ds5_bridge {
         }
         std::lock_guard<std::mutex> lk(hap_mtx_);
         // Latest-wins: overwrite the newest snapshot; the pacer sends it next tick.
+        // The outgoing snapshot is retained as prev_frame_ so the batched form can
+        // send two CONSECUTIVE coil blocks (21.33 ms) instead of the same block
+        // twice; the 0x36 path never reads it.
+        if (have_haptic_) {
+          std::memcpy(prev_frame_.data(), latest_frame_.data(), HAPTIC_BYTES);
+          have_prev_ = true;
+        }
         std::memcpy(latest_frame_.data(), snap.data(), HAPTIC_BYTES);
         latest_ts_ = now;
         have_haptic_ = true;
@@ -258,9 +272,11 @@ namespace platf::ds5_bridge {
       rs_pend_[(base + i) * 2 + 1] = fr[SPK_R];
     }
     // Elastic ratio (audio-clock recovery): one 480-sample frame is consumed
-    // per pace_us_ tick, so the output rate is 480e6/pace_us_ Hz and the input
-    // step per output sample follows the live servo period.
-    const double pace_us = (double) pace_us_.load(std::memory_order_relaxed);
+    // per frame period, so the output rate is 480e6/frame_us Hz and the input
+    // step per output sample follows the live servo period. The frame period is
+    // the pacer tick divided by the frames the tick carries (2 for 0x39).
+    const double pace_us = (double) pace_us_.load(std::memory_order_relaxed) /
+                           (double) spk_frames_per_tick();
     const double step = (double) SR * pace_us / ((double) OPUS_FRAME * 1e6);
     const size_t npend = rs_pend_.size() / 2;
     const int C = RS_TAPS / 2;  // output at i0+a reads inputs i0-C+1 .. i0+C
@@ -361,13 +377,57 @@ namespace platf::ds5_bridge {
     std::memcpy(buf + OFF_SETSTATE, state_audio_data, 63);
     buf[76] = 0x12 | 0x80; buf[77] = HAPTIC_BYTES;     // voice-coil (0x12) sub-packet
     buf[142] = 0x13 | 0x80; buf[143] = OPUS_BYTES;     // Opus speaker (0x13) sub-packet
+
+    // Batched 547-byte 0x39 skeleton. Differences to 0x36, all forced by the
+    // 546-byte payload ceiling:
+    //  - the 0x91 timing payload is the SHORT form (6 bytes: presence bitmask +
+    //    four buffer-length bytes + the audio counter at buf[9]) instead of
+    //    [0xFE][latency x5][counter],
+    //  - the coil and Opus sub-blocks set bit 6 in their id (0xD2 / 0xD3) to mark
+    //    a doubled payload while the length byte keeps naming ONE block, and
+    //  - there is no room for the SetState block, so the audio Allow bits ride a
+    //    separate periodic 0x32 (build_setstate_0x32).
+    skeleton39_.fill(0);
+    uint8_t *b39 = skeleton39_.data();
+    b39[0] = 0x39;
+    b39[2] = 0x11 | 0x80; b39[3] = 6; b39[4] = 0x7E;
+    b39[5] = b39[6] = b39[7] = b39[8] = 100;           // latency ms (TV patches [5..8])
+    b39[10] = 0x12 | 0xC0; b39[11] = HAPTIC_BYTES;     // two coil blocks follow
+    b39[140] = 0x13 | 0xC0; b39[141] = OPUS_BYTES;     // two Opus frames follow
   }
 
-  bool ds5_haptic_builder::build_0x36(uint8_t out[DS5_0X36_LEN]) {
-    std::memcpy(out, skeleton_.data(), DS5_0X36_LEN);
+  // DS5 BT output CRC: CRC32 over the 0xA2 seed byte + bytes [0 .. len-4).
+  void ds5_haptic_builder::sign_report(uint8_t *out, int len) {
+    const uint8_t seed = PS_OUTPUT_CRC_SEED;
+    uint32_t crc = ds5_crc32_update(0xFFFFFFFFu, &seed, 1);
+    crc = ds5_crc32_update(crc, out, len - 4);
+    crc = ~crc;
+    out[len - 4] = (uint8_t) (crc & 0xFF);
+    out[len - 3] = (uint8_t) ((crc >> 8) & 0xFF);
+    out[len - 2] = (uint8_t) ((crc >> 16) & 0xFF);
+    out[len - 1] = (uint8_t) ((crc >> 24) & 0xFF);
+  }
 
-    auto now = std::chrono::steady_clock::now();
+  // Standalone audio SetState. Same 63-byte payload the 0x36 carries inline, in
+  // the 142-byte 0x32 report the pad also accepts (0x32 = the 141-byte rung of
+  // the same output-report ladder). Sent rarely and re-asserted, so a lost one
+  // self-heals; the TV patches its volume/route bytes exactly as it does for the
+  // inline block (ds5_patch_output already accepts 0x32).
+  void ds5_haptic_builder::build_setstate_0x32(uint8_t out[DS5_0X32_LEN]) {
+    std::memset(out, 0, DS5_0X32_LEN);
+    out[0] = 0x32;
+    out[1] = (uint8_t) ((out_seq_ & 0x0F) << 4);
+    out_seq_++;
+    out[2] = 0x10 | 0x80; out[3] = 63;
+    std::memcpy(out + 4, state_audio_data, 63);
+    sign_report(out, DS5_0X32_LEN);
+  }
 
+  // One speaker frame into @p dst: pop 480 stereo (or conceal), Opus-encode.
+  // Split out of build_0x36 unchanged so the batched form can call it twice —
+  // the encoder is stateful, so two frames per report must be encoded in order
+  // through the SAME encoder, which is exactly what two calls do.
+  void ds5_haptic_builder::encode_speaker_frame(uint8_t *dst, std::chrono::steady_clock::time_point now) {
     // ---- Speaker (0x13): pop 480 stereo, PLC on underrun, Opus-encode. -----
     // Encode EVERY tick so the encoder state stays continuous and in-order
     // (Opus is stateful — a dropped/duplicated frame desyncs the DS5 decoder).
@@ -402,10 +462,20 @@ namespace platf::ds5_bridge {
       dbg_spk_plc_.fetch_add(1, std::memory_order_relaxed);
     }
     if (enc_) {
-      int n = opus_encode_float(enc_, pcm_f, OPUS_FRAME, out + OFF_OPUS, OPUS_BYTES);
-      if (n < 0) std::memset(out + OFF_OPUS, 0, OPUS_BYTES);
-      else if (n < OPUS_BYTES) std::memset(out + OFF_OPUS + n, 0, OPUS_BYTES - n);
+      int n = opus_encode_float(enc_, pcm_f, OPUS_FRAME, dst, OPUS_BYTES);
+      if (n < 0) std::memset(dst, 0, OPUS_BYTES);
+      else if (n < OPUS_BYTES) std::memset(dst + n, 0, OPUS_BYTES - n);
     }
+  }
+
+  bool ds5_haptic_builder::build_0x36(uint8_t out[DS5_0X36_LEN]) {
+    std::memcpy(out, skeleton_.data(), DS5_0X36_LEN);
+
+    auto now = std::chrono::steady_clock::now();
+
+    // ---- Speaker (0x13): one frame per tick (see encode_speaker_frame). ---
+    encode_speaker_frame(out + OFF_OPUS, now);
+
     // Active while audible signal is inside the grace tail AND the ring is not
     // in a sustained underrun (SPK_CONCEAL caps how long PLC alone may keep
     // driving the link if the feed stalls — CTM conceals ~8 frames, then quiets).
@@ -437,15 +507,7 @@ namespace platf::ds5_bridge {
       out[1] = (uint8_t) ((out_seq_ & 0x0F) << 4);
       out_seq_++;
       out[10] = pktctr_++;
-      // DS5 BT output CRC: CRC32 over the 0xA2 seed byte + bytes [0 .. len-4).
-      const uint8_t seed = PS_OUTPUT_CRC_SEED;
-      uint32_t crc = ds5_crc32_update(0xFFFFFFFFu, &seed, 1);
-      crc = ds5_crc32_update(crc, out, DS5_0X36_LEN - 4);
-      crc = ~crc;
-      out[394] = (uint8_t) (crc & 0xFF);
-      out[395] = (uint8_t) ((crc >> 8) & 0xFF);
-      out[396] = (uint8_t) ((crc >> 16) & 0xFF);
-      out[397] = (uint8_t) ((crc >> 24) & 0xFF);
+      sign_report(out, DS5_0X36_LEN);
     }
 
     if (++dbg_build_ctr_ >= 200) {  // ~every 2 s at 100 Hz
@@ -453,6 +515,72 @@ namespace platf::ds5_bridge {
       double maxh;
       { std::lock_guard<std::mutex> lk(hap_mtx_); maxh = dbg_max_hrms_; dbg_max_hrms_ = 0.0; }
       BOOST_LOG(info) << "ds5-haptics: feedframes=" << dbg_feed_frames_.exchange(0)
+                      << " blocks=" << dbg_blocks_.exchange(0)
+                      << " gate=" << dbg_gate_blocks_.exchange(0)
+                      << " sends=" << dbg_sends_.exchange(0)
+                      << " stale=" << dbg_stale_.exchange(0)
+                      << " spkpop=" << dbg_spk_pop_.exchange(0)
+                      << " spkplc=" << dbg_spk_plc_.exchange(0)
+                      << " maxhrms=" << maxh;
+    }
+    return should_send;
+  }
+
+  // Batched form: one report = two consecutive 0x36 ticks. Everything that makes
+  // the 0x36 path correct is preserved and simply applied twice:
+  //  - two IN-ORDER encoder calls (Opus is stateful; skipping or reordering a
+  //    frame desyncs the pad's decoder),
+  //  - the coil pair is [prev, latest] so 21.33 ms of real signal goes out rather
+  //    than the newest block played twice,
+  //  - the audio counter advances by TWO, matching the two frames carried, and
+  //  - the idle gate, grace window and seq handling are unchanged.
+  bool ds5_haptic_builder::build_0x39(uint8_t out[DS5_0X39_LEN]) {
+    std::memcpy(out, skeleton39_.data(), DS5_0X39_LEN);
+
+    auto now = std::chrono::steady_clock::now();
+
+    encode_speaker_frame(out + OFF39_OPUS_A, now);
+    encode_speaker_frame(out + OFF39_OPUS_B, now);
+
+    bool spk_active = (now - last_spk_ts_) < GRACE && plc_run_ <= SPK_CONCEAL;
+
+    // Staleness window scales with the report period: at ~21.33 ms per report a
+    // perfectly healthy snapshot can be that old at build time, so the 0x36
+    // window (30 ms) would read a live feed as stalled every other tick.
+    constexpr auto HAPTIC_STALE_BATCHED = std::chrono::milliseconds(45);
+
+    bool hap_active = false;
+    {
+      std::lock_guard<std::mutex> lk(hap_mtx_);
+      hap_active = have_haptic_ && (now - last_signal_ts_) < GRACE;
+      bool fresh = have_haptic_ && (now - latest_ts_) < HAPTIC_STALE_BATCHED;
+      if (hap_active && fresh) {
+        // Without a previous block (first report after a gap) the older half
+        // stays silent rather than duplicating the newer one.
+        if (have_prev_) {
+          std::memcpy(out + OFF39_HAPTIC_A, prev_frame_.data(), HAPTIC_BYTES);
+        }
+        std::memcpy(out + OFF39_HAPTIC_B, latest_frame_.data(), HAPTIC_BYTES);
+      } else if (hap_active) {
+        dbg_stale_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+
+    bool should_send = hap_active || spk_active;
+    if (should_send) {
+      dbg_sends_.fetch_add(1, std::memory_order_relaxed);
+      out[1] = (uint8_t) ((out_seq_ & 0x0F) << 4);
+      out_seq_++;
+      out[9] = pktctr_;
+      pktctr_ = (uint8_t) (pktctr_ + 2);
+      sign_report(out, DS5_0X39_LEN);
+    }
+
+    if (++dbg_build_ctr_ >= 100) {  // ~every 2 s at 47 Hz
+      dbg_build_ctr_ = 0;
+      double maxh;
+      { std::lock_guard<std::mutex> lk(hap_mtx_); maxh = dbg_max_hrms_; dbg_max_hrms_ = 0.0; }
+      BOOST_LOG(info) << "ds5-haptics(0x39): feedframes=" << dbg_feed_frames_.exchange(0)
                       << " blocks=" << dbg_blocks_.exchange(0)
                       << " gate=" << dbg_gate_blocks_.exchange(0)
                       << " sends=" << dbg_sends_.exchange(0)

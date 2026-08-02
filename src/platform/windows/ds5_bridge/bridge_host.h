@@ -57,6 +57,12 @@ namespace platf::ds5_bridge {
     /// controller connect), so flipping it takes effect on the next connect.
     void set_haptics(bool on) { haptics_.store(on); }
 
+    /// Batched audio downlink (0x39 instead of 0x36). Like set_haptics, it is
+    /// read when a session is created, so a config flip lands on the next
+    /// controller connect rather than mid-stream (the pad's audio packet
+    /// counter steps by frames-per-report, so the form must not change under it).
+    void set_audio_batched(bool on) { audio_batched_.store(on); }
+
     /// Synthetic lightbar color (0x00RRGGBB) or LIGHTBAR_OFF. Sessions read it
     /// live on every game output, so config changes apply immediately.
     void set_lightbar(uint32_t rgb) { lightbar_rgb_.store(rgb); }
@@ -73,6 +79,7 @@ namespace platf::ds5_bridge {
     std::atomic<bool> running_ {false};
     std::atomic<bool> stop_ {false};
     std::atomic<bool> haptics_ {false};
+    std::atomic<bool> audio_batched_ {false};
     std::atomic<uint32_t> lightbar_rgb_ {LIGHTBAR_OFF};
     std::atomic<uint32_t> trigger_kick_ {0};
     int port_ {48054};

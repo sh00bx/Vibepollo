@@ -43,6 +43,26 @@ namespace platf::ds5_bridge {
   // rejects a shorter report (no audio/haptics). Geometry from ds5_av_play.c.
   constexpr int DS5_0X36_LEN = 398;
 
+  // Batched audio/haptic report. The DS5's BT output reports 0x31..0x39 are a
+  // SIZE LADDER in 64-byte steps (payload 77/141/205/269/333/397/461/525/546 per
+  // the BT HID report descriptor); 0x39 is the top and the only step that is not
+  // +64, because its L2CAP PDU (4 + 1 HID prefix + 547 = 552 B) is exactly the
+  // payload maximum of one 3-DH3 EDR baseband packet. It carries TWO 10 ms Opus
+  // frames and TWO 64-byte coil blocks under sub-block headers whose bit 6 marks
+  // the doubling (0x12|0xC0 = 0xD2 with length byte 64 => 128 bytes on the wire).
+  //
+  // Same audio, ~47 reports/s instead of ~94: half the on-air ACL packets and
+  // ~31% fewer bytes, which is aimed straight at the TV-link queue ratchet. The
+  // costs are +10.67 ms of buffering and that the per-frame audio SetState no
+  // longer fits — it moves to a periodic 0x32 (DS5_0X32_LEN).
+  //
+  // Layout cross-checked against two independent implementations (awalol
+  // DS5Dongle src/audio.cpp, Kodzinho DualSense-Bluetooth-Audio); no vendor spec
+  // exists, so it is a hypothesis until the pad is measured.
+  constexpr int DS5_0X39_LEN = 547;
+  constexpr int DS5_0X32_LEN = 142;   // standalone audio SetState (batched mode)
+  constexpr int DS5_AUDIO_REPORT_MAX = DS5_0X39_LEN;  // pacer buffer sizing
+
   // Speaker clocking, shared with the session pacer (bridge_host.cpp).
   //
   // The DS5 drains one 480-sample 0x36 per ~10.667 ms — an effective ~45 kHz
@@ -63,6 +83,10 @@ namespace platf::ds5_bridge {
   // DS5_PACE_FALLBACK_ADJ_US margin — the pre-servo behavior.
   constexpr int DS5_SPK_FRAME = 480;      // samples/ch per 0x36 Opus frame
   constexpr int DS5_PACE_BASE_US = 10667;         // true 93.75/s drain cadence
+  // Batched cadence: one 0x39 carries two frames, so the report period doubles
+  // while the audio/haptic sample rate the pad drains is unchanged. The servo
+  // adjustment (pace_adj_us_) keeps its meaning — it is a per-report stretch.
+  constexpr int DS5_PACE_BASE_BATCHED_US = 2 * DS5_PACE_BASE_US;  // ~46.9/s
   constexpr int DS5_PACE_ADJ_MAX_US = 140;        // slowest: ~92.5/s (-1.3%)
   constexpr int DS5_PACE_FALLBACK_ADJ_US = 35;    // no-feedback static margin (-0.33%)
 
@@ -88,6 +112,49 @@ namespace platf::ds5_bridge {
     /// the report carries live haptic content (within the grace window); the
     /// pacer stops driving once this goes false (DS5 falls quiet, no idle hum).
     bool build_0x36(uint8_t out[DS5_0X36_LEN]);
+
+    /// Batched form: the same content as two consecutive 0x36 ticks packed into
+    /// one 547-byte 0x39 (two Opus frames, two coil blocks). Same return
+    /// semantics as build_0x36.
+    bool build_0x39(uint8_t out[DS5_0X39_LEN]);
+
+    /// Build the current report form; @p out must hold DS5_AUDIO_REPORT_MAX.
+    bool build_audio(uint8_t *out) {
+      return batched_ ? build_0x39(out) : build_0x36(out);
+    }
+
+    /// Select the report form. Set once before the pacer starts (a mid-stream
+    /// flip would hand the pad a report whose counters jump by a different step).
+    void set_batched(bool on) {
+      batched_ = on;
+    }
+
+    bool batched() const {
+      return batched_;
+    }
+
+    /// Wire length of the current report form.
+    int report_len() const {
+      return batched_ ? DS5_0X39_LEN : DS5_0X36_LEN;
+    }
+
+    /// Base pacer period for the current report form (before the rate servo).
+    int pace_base_us() const {
+      return batched_ ? DS5_PACE_BASE_BATCHED_US : DS5_PACE_BASE_US;
+    }
+
+    /// Speaker frames the pacer consumes per tick: 0x36 carries one 0x13 block,
+    /// 0x39 carries two. The feed's rate match runs on the per-FRAME period, so
+    /// it must divide the tick period by this — see the RATE MATCH note below.
+    int spk_frames_per_tick() const {
+      return batched_ ? 2 : 1;
+    }
+
+    /// Standalone audio SetState (0x32, 142 B). In batched mode the 0x39 has no
+    /// room for the per-frame SetState block, so the audio Allow bits/volumes are
+    /// re-asserted with this report instead — same payload, just carried
+    /// separately and rarely. Always fills @p out and signs it.
+    void build_setstate_0x32(uint8_t out[DS5_0X32_LEN]);
 
     /// Rate-servo hook (pacer thread): the live pacer period. The speaker
     /// resample ratio follows it so production == consumption at any servo
@@ -151,6 +218,14 @@ namespace platf::ds5_bridge {
     static constexpr int HAPTIC_BYTES = 64;
     std::mutex hap_mtx_;
     std::array<int8_t, HAPTIC_BYTES> latest_frame_ {};  // newest coil snapshot
+    // Previous snapshot, kept only for the batched form: a 0x39 needs TWO
+    // consecutive coil blocks (21.33 ms of signal). Sending the latest one twice
+    // would replay the same 10.67 ms and read as a time-stretched buzz, so the
+    // pair is [prev, latest] in production order. Under the normal 1:1 cadence
+    // (feed ~93.75 blocks/s, pacer ~46.9 reports/s) both are fresh; if only one
+    // is, the report falls back to latest-only and the first half stays silent.
+    std::array<int8_t, HAPTIC_BYTES> prev_frame_ {};
+    bool have_prev_ = false;
     std::chrono::steady_clock::time_point latest_ts_ {};       // when it was produced
     std::chrono::steady_clock::time_point last_signal_ts_ {};  // last above-squelch block
     bool have_haptic_ = false;
@@ -173,7 +248,10 @@ namespace platf::ds5_bridge {
     // RATE MATCH: the feed resamples 48 kHz onto the DS5's effective drain
     // clock, derived from the LIVE pacer period (pace_us_, rate-servo'd by the
     // session) so production, wire rate and device drain stay coupled at any
-    // servo setting — see the clocking block at namespace scope.
+    // servo setting — see the clocking block at namespace scope. The drain clock
+    // is one frame per pace_us_/spk_frames_per_tick(), NOT per tick: 0x39 pops
+    // two frames per tick, and feeding it the tick period would produce at half
+    // the consumed rate (chronic underrun, ~50 % PLC).
     static constexpr int OPUS_FRAME = DS5_SPK_FRAME;  // one 0x13 frame (samples/ch, nominal 48k)
     std::atomic<int> pace_us_ {DS5_PACE_BASE_US + DS5_PACE_FALLBACK_ADJ_US};
     static constexpr int OPUS_BYTES = 200;          // 0x13 payload size (fixed, 160k CBR)
@@ -223,8 +301,20 @@ namespace platf::ds5_bridge {
     // -- 398-byte 0x36 skeleton (sub-packet headers + audio SetState) --------
     // The 0x12 haptic and 0x13 Opus payloads are written per tick in build_0x36.
     std::array<uint8_t, DS5_0X36_LEN> skeleton_ {};
+    // -- 547-byte 0x39 skeleton (batched; no SetState block — see 0x32) ------
+    std::array<uint8_t, DS5_0X39_LEN> skeleton39_ {};
+    bool batched_ = false;
     uint8_t out_seq_ = 0;
     uint8_t pktctr_ = 0;
+
+    /// One speaker frame: pop 480 stereo (or PLC), Opus-encode into @p dst.
+    /// Updates last_spk_ts_/plc_run_ exactly as the single-frame path did.
+    /// Pacer thread only.
+    void encode_speaker_frame(uint8_t *dst, std::chrono::steady_clock::time_point now);
+
+    /// DS5 BT output CRC over the 0xA2 seed byte + bytes [0 .. len-4), written
+    /// into the last four bytes. Same for every report form.
+    static void sign_report(uint8_t *out, int len);
 
     void build_skeleton();
   };
