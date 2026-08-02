@@ -418,6 +418,11 @@ namespace config {
     // no longer fits in the report, so it is re-asserted as a separate 0x32.
     // OFF by default: this is an A/B knob against the proven 0x36 path.
     bool native_audio_batched {false};
+    // Speaker jitter cushion in 10.67 ms frames. Pure latency on the pad speaker,
+    // so it is worth trimming; the usable margin is (cushion - frames per report),
+    // and the builder clamps anything below that floor. Watch spkplc in the
+    // ds5-haptics log line -- it reports the cost of going too low directly.
+    int native_audio_cushion_frames {4};
 
     // Synthetic lightbar color, hex "RRGGBB" (empty/"off" disables). PC games
     // via libScePad set the lightbar to black at pad init and never write a

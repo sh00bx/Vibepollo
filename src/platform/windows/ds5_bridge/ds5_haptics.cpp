@@ -332,8 +332,8 @@ namespace platf::ds5_bridge {
     // Latency drain: if the queue ratcheted above the drain threshold, skip whole
     // 10 ms frames back to target so speaker latency stays tight to the haptic.
     // Hysteresis (target < drain) avoids dropping every tick.
-    if (spk_count_ > SPK_LAT_DRAIN) {
-      size_t drop = spk_count_ - SPK_LAT_TARGET;
+    if (spk_count_ > spk_lat_drain_) {
+      size_t drop = spk_count_ - spk_lat_target_;
       drop -= drop % OPUS_FRAME;
       spk_head_ = (spk_head_ + drop) % SPK_RING_FRAMES;
       spk_count_ -= drop;
@@ -341,7 +341,7 @@ namespace platf::ds5_bridge {
     // Prime: after start/underrun, hold silence until a target cushion rebuilds,
     // so one late chunk can't re-trigger underruns mid-effect.
     if (spk_priming_) {
-      if (spk_count_ < SPK_LAT_TARGET) return 0;
+      if (spk_count_ < spk_lat_target_) return 0;
       spk_priming_ = false;
     }
     if (spk_count_ < (size_t) OPUS_FRAME) {
