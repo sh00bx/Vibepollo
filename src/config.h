@@ -419,8 +419,12 @@ namespace config {
     bool native_audio_batched {true};
     // Speaker jitter cushion in 10.67 ms frames. Pure latency on the pad speaker,
     // so it is worth trimming; the usable margin is (cushion - frames per report),
-    // and the builder clamps anything below that floor. Watch spkplc in the
-    // ds5-haptics log line -- it reports the cost of going too low directly.
+    // and the builder clamps anything below that floor (frames per report + 1)
+    // and above 9. The cap exists because the speaker ring holds 20 frames and
+    // the latency-drain valve fires at 2*cushion frames -- that threshold must
+    // stay below the ring capacity or the valve could never trigger. Watch
+    // spkplc in the ds5-haptics log line -- it reports the cost of going too
+    // low directly.
     int native_audio_cushion_frames {4};
 
     // Synthetic lightbar color, hex "RRGGBB" (empty/"off" disables). PC games

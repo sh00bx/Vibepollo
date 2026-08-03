@@ -205,6 +205,7 @@ namespace platf::ds5_bridge {
       std::memcpy(&caps, payload, sizeof(caps));
       caps.serial[sizeof(caps.serial) - 1] = '\0';
       std::string serial = caps.serial[0] ? caps.serial : label();
+      const bool client_0x39 = (caps.flags & CTMB_DEVCAP_DS5_AUDIO_0X39) != 0;
 
       // First HELLO on this session: register the virtual DualSense (its output +
       // feature callbacks run on a usbip server thread) and attach the vhci once.
@@ -232,11 +233,20 @@ namespace platf::ds5_bridge {
         // Report form is fixed for the life of the builder: the pad tracks an
         // audio packet counter whose step encodes how many frames a report
         // carries, so flipping mid-stream would hand it a discontinuity.
-        hap_->set_batched(audio_batched_);
+        // Batched 0x39 is caps-gated: a pre-0x39 client (CTMB_VERSION never
+        // bumped) would silently drop the reports, so without the caps bit the
+        // session falls back to unbatched 0x36 regardless of config.
+        const bool batched = audio_batched_ && client_0x39;
+        hap_->set_batched(batched);
         hap_->set_cushion_frames(audio_cushion_);   // after set_batched: the floor depends on it
-        if (audio_batched_) {
+        if (batched) {
           BOOST_LOG(info) << "ds5-bridge: audio downlink = batched 0x39 ("sv
                           << DS5_0X39_LEN << " B, two frames + two coil blocks per report)"sv;
+        } else if (audio_batched_) {
+          BOOST_LOG(info) << "ds5-bridge: audio downlink = unbatched 0x36 (config wants batched, but client caps 0x"sv
+                          << std::hex << caps.flags << std::dec << " lack CTMB_DEVCAP_DS5_AUDIO_0X39)"sv;
+        } else {
+          BOOST_LOG(info) << "ds5-bridge: audio downlink = unbatched 0x36 (per config)"sv;
         }
         BOOST_LOG(info) << "ds5-bridge: speaker cushion = "sv << hap_->cushion_frames()
                         << " frames (~"sv << (hap_->cushion_frames() * 1067 / 100) << " ms), requested "sv
@@ -254,6 +264,18 @@ namespace platf::ds5_bridge {
         attach_thread_ = std::thread([this, busid] { vhci_port_.store(vhci_attach(busid)); });
         BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " up (serial="sv
                         << serial << ", usbip busid="sv << busid << ")"sv;
+      }
+
+      // Re-HELLO of an adopted session: the builder's report form is fixed for
+      // its lifetime (the pacer also caches report_len/pace at thread start), so
+      // a client that re-HELLOs WITHOUT the 0x39 caps bit into a batched session
+      // cannot be downgraded live — it will silently drop every 0x39 report.
+      // Make that state loudly diagnosable instead of dark: audio stays dead
+      // until the session is torn down (app/stream restart), not forever.
+      if (slot_ && hap_ && hap_->batched() && !client_0x39) {
+        BOOST_LOG(warning) << "ds5-bridge: re-HELLO from a client without CTMB_DEVCAP_DS5_AUDIO_0X39 (caps 0x"sv
+                           << std::hex << caps.flags << std::dec
+                           << ") into a batched-0x39 session — speaker/haptics will be SILENT until this session is recreated"sv;
       }
 
       // Latch the configured haptics state for this connect (see haptics_want_).
@@ -289,7 +311,7 @@ namespace platf::ds5_bridge {
       cfg.output_report_len = BT_OUTPUT_LEN;
       cfg.feature_report_len = caps.feature_report_len;
       // Advertise BOTH audio report forms as paced. Which one this session emits
-      // is fixed at session creation (audio_batched_), but advertising both is
+      // is fixed at session creation (audio_batched_, caps-gated above), but advertising both is
       // free (the list holds 16) and keeps the advertisement correct no matter
       // when the HELLO arrives relative to the builder's construction.
       cfg.paced_report_count = 2;
