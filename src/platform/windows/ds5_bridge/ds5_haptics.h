@@ -283,7 +283,12 @@ namespace platf::ds5_bridge {
     // (cushion - frames_per_tick) frames. At the default 4 that is 32 ms for 0x36 but
     // only 21 ms for 0x39. Hence the floor below.
     static constexpr int SPK_CUSHION_DEFAULT = 4;
-    static constexpr int SPK_CUSHION_MAX = 16;
+    // Cap so the latency-drain threshold (2*n frames, see recompute_cushion)
+    // stays below the ring capacity (SPK_RING_FRAMES = 9600 sample-frames
+    // = 20 Opus frames): spk_push
+    // drops-oldest at that cap, so spk_count_ never exceeds it and for n >= 10
+    // the drain condition `spk_count_ > spk_lat_drain_` could never fire.
+    static constexpr int SPK_CUSHION_MAX = 9;
     int cushion_frames_ = SPK_CUSHION_DEFAULT;
     size_t spk_lat_target_ = (size_t) SPK_CUSHION_DEFAULT * OPUS_FRAME;
     size_t spk_lat_drain_ = (size_t) (2 * SPK_CUSHION_DEFAULT) * OPUS_FRAME;
@@ -296,6 +301,11 @@ namespace platf::ds5_bridge {
       const int floor_n = spk_frames_per_tick() + 1;
       int n = cushion_frames_ < floor_n ? floor_n : cushion_frames_;
       if (n > SPK_CUSHION_MAX) n = SPK_CUSHION_MAX;
+      // Belt and braces to SPK_CUSHION_MAX: keep the drain threshold at least
+      // one poppable frame below the ring cap, so the valve stays reachable
+      // even if the constants above drift.
+      const int drain_max_n = (SPK_RING_FRAMES - OPUS_FRAME) / (2 * OPUS_FRAME);
+      if (n > drain_max_n) n = drain_max_n;
       spk_lat_target_ = (size_t) n * OPUS_FRAME;
       spk_lat_drain_ = (size_t) (2 * n) * OPUS_FRAME;
       eff_cushion_ = n;

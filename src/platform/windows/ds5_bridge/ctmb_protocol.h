@@ -47,6 +47,10 @@ namespace platf::ds5_bridge {
   // ctmb_host_config_t.reserved[0] capability bits (0 on a CTM host).
   constexpr uint8_t CTMB_HOSTCFG_PACE_FEEDBACK = 0x01;
 
+  // ctmb_device_caps_t.flags capability bits (0x0001 is the client's existing
+  // baseline flag): client accepts batched 0x39 DS5 audio output reports.
+  constexpr uint16_t CTMB_DEVCAP_DS5_AUDIO_0X39 = 0x0002;
+
 #pragma pack(push, 1)
   struct ctmb_header_t {
     uint32_t magic;
