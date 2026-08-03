@@ -308,10 +308,15 @@ namespace platf::ds5_bridge {
       // Always (re)answer the handshake: the client waits for HOST_CONFIG on every
       // (re)connect (needs_host_config), so this must be sent each HELLO.
       ctmb_host_config_t cfg {};
-      // TV drain pace for its paced queue; the client clamps this to <=8 ms
-      // (125/s) anyway, so its queue drains faster than our ~93.4/s arrival and
-      // the real bottleneck stays the NOCP-paced injector queue in ds5_txd.
-      cfg.bt_pace_us = 10667;
+      // TV drain pace for its paced queue: advertise the TRUE emission cadence
+      // (10667 us unbatched 0x36, 21334 us batched 0x39). A pre-08-03 client
+      // clamps anything above 8 ms down to 8 ms; a newer client paces the
+      // daemon-free hidraw drain at 3/4 of this advert — for the legacy 10667
+      // that is exactly the old 8000 us, so both directions stay compatible
+      // without a lockstep deploy. hap_ exists by the time any HELLO is
+      // answered (created above on session setup); the fallback only covers a
+      // re-HELLO racing teardown.
+      cfg.bt_pace_us = hap_ ? (uint32_t) hap_->pace_base_us() : 10667;
       // Advertise the rate-servo capability: a client that sees this forwards
       // the daemon's inject-queue telemetry as CTMB_MSG_PACE_FEEDBACK. Old
       // clients ignore reserved bytes and simply never send it.
