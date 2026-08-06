@@ -4105,13 +4105,17 @@ namespace video {
     return nullptr;
   }
 
+  // NB: `probing` carries its default HERE, not on the definition below. The
+  // legacy-AMF caller a few lines down predates the definition and only passes
+  // five arguments, so the default has to be visible at that call site; C++
+  // forbids repeating it on the definition.
   std::unique_ptr<platf::encode_device_t> make_encode_device(
     platf::display_t &disp,
     const encoder_t &encoder,
     const config_t &config,
     hdr_latch_t *hdr_latch,
     bool deferred_avcodec,
-    bool probing);
+    bool probing = false);
 
   void abandon_quarantined_session(
     std::unique_ptr<encode_session_t> &session,
@@ -5073,7 +5077,7 @@ namespace video {
     const config_t &config,
     hdr_latch_t *hdr_latch = nullptr,
     bool deferred_avcodec = false,
-    bool probing = false) {
+    bool probing) {
     std::unique_ptr<platf::encode_device_t> result;
 
 #ifdef _WIN32
