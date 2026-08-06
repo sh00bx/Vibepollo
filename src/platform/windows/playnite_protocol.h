@@ -55,6 +55,7 @@ namespace platf::playnite {
     std::string working_dir;  ///< Working directory (Playnite JSON key: workingDir).
     std::string install_dir;  ///< Game install directory (Playnite JSON key: installDir).
     std::vector<std::string> categories;  ///< Category names attached to the game.
+    std::vector<std::string> platforms;  ///< Platform names attached to the game (Playnite JSON key: platforms).
     std::string plugin_id;  ///< Library plugin identifier that owns the game.
     std::string plugin_name;  ///< Library plugin display name (best effort).
     uint64_t playtime_minutes = 0;  ///< Total playtime in minutes (playtimeMinutes).

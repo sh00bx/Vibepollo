@@ -3087,6 +3087,12 @@ namespace nvhttp {
 
           app_node.put("IsHdrSupported"s, is_hdr_supported ? 1 : 0);
           app_node.put("AppTitle"s, app_name);
+          // Optional, and only present for Playnite-managed apps: lets a client
+          // group its app list the way Playnite groups the library. Clients that
+          // don't know the element ignore it.
+          if (!app.playnite_platform.empty()) {
+            app_node.put("Platform"s, app.playnite_platform);
+          }
           app_node.put("UUID", app.uuid);
           app_node.put("IDX", app.idx);
           app_node.put("ID", app.id);

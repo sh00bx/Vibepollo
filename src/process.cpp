@@ -3837,6 +3837,14 @@ namespace proc {
             ctx.playnite_id.clear();
           }
         }
+        ctx.playnite_platform.clear();
+        if (app_node.contains("playnite-platform") && app_node["playnite-platform"].is_string()) {
+          try {
+            ctx.playnite_platform = parse_env_val(this_env, app_node["playnite-platform"].get<std::string>());
+          } catch (...) {
+            ctx.playnite_platform.clear();
+          }
+        }
         ctx.playnite_fullscreen = false;
         if (app_node.contains("playnite-fullscreen")) {
           try {

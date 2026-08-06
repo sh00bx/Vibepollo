@@ -135,6 +135,9 @@ namespace proc {
     std::vector<std::string> id_aliases;
     // When present, this app should be launched via Playnite instead of direct cmd.
     std::string playnite_id;
+    // Playnite's platform for this game (e.g. "PC (Windows)", "Nintendo Switch").
+    // Advertised to clients so they can group the app list by platform.
+    std::string playnite_platform;
     // When true, launch Playnite in fullscreen mode via the helper.
     bool playnite_fullscreen;
     bool frame_gen_limiter_fix;

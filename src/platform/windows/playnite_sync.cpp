@@ -562,6 +562,15 @@ namespace platf::playnite::sync {
         app.erase("playnite-plugin-name");
       }
     } catch (...) {}
+    try {
+      // Playnite allows several platforms per game (a title released on both PC
+      // and console); the first one is the one clients group by.
+      if (!g.platforms.empty() && !g.platforms.front().empty()) {
+        app["playnite-platform"] = g.platforms.front();
+      } else if (app.contains("playnite-platform")) {
+        app.erase("playnite-platform");
+      }
+    } catch (...) {}
   }
 
   void apply_game_metadata_to_app(const Game &g, nlohmann::json &app) {

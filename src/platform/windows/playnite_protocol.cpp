@@ -81,6 +81,7 @@ namespace platf::playnite {
           game.working_dir = g.value("workingDir", "");
           game.install_dir = g.value("installDir", "");
           game.categories = to_string_list(g.value("categories", json::array()));
+          game.platforms = to_string_list(g.value("platforms", json::array()));
           game.plugin_id = g.value("pluginId", "");
           game.plugin_name = g.value("pluginName", "");
           // playtimeMinutes may arrive as number or string
