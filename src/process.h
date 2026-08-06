@@ -138,6 +138,10 @@ namespace proc {
     // Playnite's platform for this game (e.g. "PC (Windows)", "Nintendo Switch").
     // Advertised to clients so they can group the app list by platform.
     std::string playnite_platform;
+    // Playnite library plugin this game came from ("Steam", "GOG", ...); empty for
+    // manually added entries. Advertised alongside the platform so a client can
+    // group store libraries separately from the bare platform.
+    std::string playnite_library;
     // When true, launch Playnite in fullscreen mode via the helper.
     bool playnite_fullscreen;
     bool frame_gen_limiter_fix;

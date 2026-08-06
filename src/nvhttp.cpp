@@ -3093,6 +3093,9 @@ namespace nvhttp {
           if (!app.playnite_platform.empty()) {
             app_node.put("Platform"s, app.playnite_platform);
           }
+          if (!app.playnite_library.empty()) {
+            app_node.put("Library"s, app.playnite_library);
+          }
           app_node.put("UUID", app.uuid);
           app_node.put("IDX", app.idx);
           app_node.put("ID", app.id);

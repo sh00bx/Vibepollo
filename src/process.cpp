@@ -3845,6 +3845,14 @@ namespace proc {
             ctx.playnite_platform.clear();
           }
         }
+        ctx.playnite_library.clear();
+        if (app_node.contains("playnite-plugin-name") && app_node["playnite-plugin-name"].is_string()) {
+          try {
+            ctx.playnite_library = parse_env_val(this_env, app_node["playnite-plugin-name"].get<std::string>());
+          } catch (...) {
+            ctx.playnite_library.clear();
+          }
+        }
         ctx.playnite_fullscreen = false;
         if (app_node.contains("playnite-fullscreen")) {
           try {
