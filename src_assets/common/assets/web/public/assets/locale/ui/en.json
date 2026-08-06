@@ -1536,6 +1536,10 @@
         "input_repeat": {
           "title": "Keyboard repeat"
         },
+        "input_ds5_bridge": {
+          "title": "DualSense bridge",
+          "description": "Present a real DualSense connected to your Moonlight device to games as a native USB controller."
+        },
         "network_access": {
           "title": "Access and connectivity"
         },

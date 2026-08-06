@@ -573,6 +573,19 @@ export const settingsCategories: SettingsCategory[] = [
           number('key_repeat_frequency', { min: 0.1, step: 0.1 }),
         ],
       },
+      {
+        id: 'input_ds5_bridge',
+        fields: [
+          boolean('ds5_native_bridge', { platform: 'windows', restartRequired: true }),
+          number('ds5_bridge_port', {
+            min: 1,
+            max: 65535,
+            step: 1,
+            platform: 'windows',
+            visibleWhen: { key: 'ds5_native_bridge', equals: true },
+          }),
+        ],
+      },
     ],
   },
   {
