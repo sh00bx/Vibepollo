@@ -1973,6 +1973,35 @@ namespace nvhttp {
       }
       BOOST_LOG(info) << "Display mode for client ["sv << verified_client->name << "] requested to ["sv << requested_mode_text << ']';
 
+      // A client that cannot put a fractional rate into `mode` may still advertise
+      // the exact one as a launch hint: Aurora rounds the mode string at 4K -- a
+      // fractional one blanks the video plane on some LG sets -- and sends
+      // displayRefreshRateMillihertz / clientRefreshRateX100 next to it. Honour
+      // that so the virtual display and the frame limiter run on the real cadence
+      // instead of a rounded one. Only a fractional hint counts (an integer one can
+      // only restate what `mode` already said), it has to agree with the mode's
+      // whole fps, and the host-side per-client override below still wins.
+      if (launch_session->fps > 0) {
+        constexpr std::int64_t kMinHintMillihz = 10'000;
+        constexpr std::int64_t kMaxHintMillihz = 1'000'000;
+        auto hint_millihz = util::from_view(get_arg(args, "displayRefreshRateMillihertz", "0"));
+        if (hint_millihz <= 0) {
+          hint_millihz = util::from_view(get_arg(args, "clientRefreshRateX100", "0")) * 10;
+        }
+        if (hint_millihz >= kMinHintMillihz && hint_millihz <= kMaxHintMillihz && hint_millihz % 1000 != 0) {
+          const auto hint_fps = (int) std::lround((double) hint_millihz / 1000.0);
+          const auto mode_fps = (int) std::lround((double) launch_session->fps / 1000.0);
+          if (hint_fps == mode_fps) {
+            launch_session->client_display_refresh_millihz = static_cast<std::uint32_t>(hint_millihz);
+            BOOST_LOG(info) << "Client ["sv << verified_client->name << "] advertised an exact refresh of "sv
+                            << ((double) hint_millihz / 1000.0) << " Hz alongside the rounded launch mode."sv;
+          } else {
+            BOOST_LOG(warning) << "Ignoring client refresh hint "sv << hint_millihz
+                               << " millihertz; it disagrees with the launch mode fps ("sv << mode_fps << ")."sv;
+          }
+        }
+      }
+
       if (verified_client->display_mode.empty()) {
         launch_session->client_display_mode_override = false;
       } else if (const auto display_mode = parse_display_mode(verified_client->display_mode)) {
