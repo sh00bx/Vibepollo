@@ -3346,6 +3346,26 @@ namespace stream {
         session->stream_fps = (int) std::lround((double) fps_millihz / 1000.0);
         session->stream_fps_scaled = fps_millihz;
       }
+      // The launch `mode=` string is not always the client's exact cadence: a
+      // client may deliberately round it and carry the true rate in
+      // clientRefreshRateX100 instead (Aurora does this at 4K, where a
+      // fractional mode string blanks the video plane on some LG sets). The
+      // encoder already paces off framerateX100; without this the frame limiter
+      // would still see the rounded mode value and cap a 59.94 stream at a flat
+      // 60. Only a fractional value may override — an integer one must never
+      // clobber a fractional mode string — and it has to agree with the mode's
+      // whole-fps, on top of the maxFPS consistency check RTSP already applied.
+      if (session->config.monitor.framerateX100 > 0 &&
+          session->config.monitor.framerateX100 % 100 != 0) {
+        const int fps_from_x100 = (int) std::lround(session->config.monitor.framerateX100 / 100.0);
+        if (fps_from_x100 == session->stream_fps) {
+          session->stream_fps_scaled = session->config.monitor.framerateX100 * 10;
+        } else {
+          BOOST_LOG(warning) << "clientRefreshRateX100 ("sv << session->config.monitor.framerateX100
+                             << ") disagrees with the launch mode fps ("sv << session->stream_fps
+                             << "); keeping the launch mode cadence for the frame limiter."sv;
+        }
+      }
       session->client_display_refresh_millihz = launch_session.client_display_refresh_millihz;
 
 #ifdef _WIN32
