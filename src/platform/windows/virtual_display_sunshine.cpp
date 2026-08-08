@@ -7553,13 +7553,54 @@ VDISPLAY_SUNSHINE::ensure_display_result VDISPLAY_SUNSHINE::ensure_display(
       )) {
     result.tracks_temporary_for_probe = true;
     wait_for_sunshine_ensure_target(result, std::chrono::seconds(3));
-    BOOST_LOG(info) << "Reusing retained temporary virtual display for encoder probing (failure_count="
-                    << retained_failure_count << ", readiness="
-                    << static_cast<int>(result.readiness)
-                    << ", display_name='"
-                    << (result.display_name.empty() ? std::string("<pending>") : result.display_name)
-                    << "').";
-    return result;
+
+    if (result.ready_for_probe()) {
+      BOOST_LOG(info) << "Reusing retained temporary virtual display for encoder probing (failure_count="
+                      << retained_failure_count << ", readiness="
+                      << static_cast<int>(result.readiness)
+                      << ", display_name='"
+                      << (result.display_name.empty() ? std::string("<pending>") : result.display_name)
+                      << "').";
+      return result;
+    }
+
+    // The retained target exists but never became enumerable. Retiring it is
+    // cleanup_ensure_display()'s job, and that only ages the retention out once a
+    // probe has actually run — but a caller that finds the target unready defers
+    // probing entirely, so it never gets there. A display created at a moment when
+    // Windows could not enumerate it (booted with no monitor attached, say) would
+    // therefore be handed back for the rest of the process lifetime, deferring
+    // every future probe on its behalf, and no amount of reconnecting or turning
+    // the monitor back on would clear it. Charge the deferral itself to the
+    // existing retry budget so the dead target retires on its own.
+    int deferred_failures = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_ensure_display_state_mutex);
+      if (g_ensure_display_retained && guid_equal(g_ensure_display_guid, result.temporary_guid)) {
+        deferred_failures = ++g_ensure_display_failure_count;
+      }
+    }
+
+    if (deferred_failures > 0 && deferred_failures < ENSURE_DISPLAY_MAX_RETRY_FAILURES) {
+      BOOST_LOG(info) << "Reusing retained temporary virtual display for encoder probing (failure_count="
+                      << deferred_failures << ", readiness="
+                      << static_cast<int>(result.readiness)
+                      << ", display_name='"
+                      << (result.display_name.empty() ? std::string("<pending>") : result.display_name)
+                      << "').";
+      return result;
+    }
+
+    BOOST_LOG(warning) << "Retained temporary virtual display never became enumerable after "
+                       << deferred_failures << " attempts; discarding it and creating a fresh one.";
+    // Fall through to the stale-retention teardown below, which removes the dead
+    // display and clears the retention state before a fresh one is created. Only
+    // the fields the readiness wait just populated are rolled back; the GUID is
+    // still needed to identify what to remove.
+    result.tracks_temporary_for_probe = false;
+    result.readiness = ensure_display_readiness_e::unavailable;
+    result.display_name.clear();
+    result.device_id.clear();
   }
 
   if (retained_ensure_display) {

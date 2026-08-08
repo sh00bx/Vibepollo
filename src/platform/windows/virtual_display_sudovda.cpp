@@ -5201,13 +5201,46 @@ VDISPLAY_SUDOVDA::ensure_display_result VDISPLAY_SUDOVDA::ensure_display(
       )) {
     result.tracks_temporary_for_probe = true;
     wait_for_sudovda_ensure_target(result, std::chrono::seconds(3));
-    BOOST_LOG(info) << "Reusing retained temporary virtual display for encoder probing (failure_count="
-                    << retained_failure_count << ", readiness="
-                    << static_cast<int>(result.readiness)
-                    << ", display_name='"
-                    << (result.display_name.empty() ? std::string("<pending>") : result.display_name)
-                    << "').";
-    return result;
+
+    if (result.ready_for_probe()) {
+      BOOST_LOG(info) << "Reusing retained temporary virtual display for encoder probing (failure_count="
+                      << retained_failure_count << ", readiness="
+                      << static_cast<int>(result.readiness)
+                      << ", display_name='"
+                      << (result.display_name.empty() ? std::string("<pending>") : result.display_name)
+                      << "').";
+      return result;
+    }
+
+    // Same deferral trap as the Sunshine driver path: cleanup_ensure_display()
+    // only ages the retention out after a probe has run, and an unready target
+    // makes callers defer probing altogether, so a display created while Windows
+    // could not enumerate it would be handed back forever. Charge the deferral to
+    // the retry budget so it retires on its own.
+    int deferred_failures = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_ensure_display_state_mutex);
+      if (g_ensure_display_retained && guid_equal(g_ensure_display_guid, result.temporary_guid)) {
+        deferred_failures = ++g_ensure_display_failure_count;
+      }
+    }
+
+    if (deferred_failures > 0 && deferred_failures < ENSURE_DISPLAY_MAX_RETRY_FAILURES) {
+      BOOST_LOG(info) << "Reusing retained temporary virtual display for encoder probing (failure_count="
+                      << deferred_failures << ", readiness="
+                      << static_cast<int>(result.readiness)
+                      << ", display_name='"
+                      << (result.display_name.empty() ? std::string("<pending>") : result.display_name)
+                      << "').";
+      return result;
+    }
+
+    BOOST_LOG(warning) << "Retained temporary virtual display never became enumerable after "
+                       << deferred_failures << " attempts; discarding it and creating a fresh one.";
+    result.tracks_temporary_for_probe = false;
+    result.readiness = ensure_display_readiness_e::unavailable;
+    result.display_name.clear();
+    result.device_id.clear();
   }
 
   if (retained_ensure_display) {
