@@ -10,6 +10,10 @@
 
   #include <array>
   #include <cstring>
+  #include <filesystem>
+  #include <fstream>
+  #include <sstream>
+  #include <string>
 
 namespace {
   constexpr GUID kClientGuid {
@@ -25,6 +29,23 @@ namespace {
     0x477a,
     {0x9b, 0x7a, 0x79, 0x45, 0x0b, 0x81, 0x2d, 0x60}
   };
+
+  std::string read_source(const std::filesystem::path &relative_path) {
+    const auto path = std::filesystem::path {SUNSHINE_SOURCE_DIR} / relative_path;
+    std::ifstream file {path, std::ios::binary};
+    if (!file) {
+      ADD_FAILURE() << "Failed to open " << path.string();
+      return {};
+    }
+
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+  }
+
+  void expect_contains(const std::string &content, const std::string &needle) {
+    EXPECT_NE(content.find(needle), std::string::npos) << "missing: " << needle;
+  }
 }  // namespace
 
 TEST(SunshineVirtualDisplay, ClientUuidDisplayIdIsStableAndNonZero) {
@@ -82,16 +103,24 @@ TEST(SunshineVirtualDisplay, StableVirtualDisplayUuidDerivesNonCanonicalClientId
   EXPECT_NE(VDISPLAY::client_uuid_to_virtual_display_id(first_guid), 0u);
 }
 
-TEST(SunshineVirtualDisplay, TemporaryCreationDoesNotPersistSessionGuidAsSharedIdentity) {
-  EXPECT_TRUE(VDISPLAY::policy::persists_identity(
-    VDISPLAY::policy::display_identity_role::persistent_shared
-  ));
-  EXPECT_FALSE(VDISPLAY::policy::persists_identity(
-    VDISPLAY::policy::display_identity_role::per_client
-  ));
-  EXPECT_FALSE(VDISPLAY::policy::persists_identity(
-    VDISPLAY::policy::display_identity_role::encoder_probe
-  ));
+TEST(SunshineVirtualDisplay, PersistentIdentityUsesTheReservedEnsureStableId) {
+  const auto persistent = VDISPLAY::persistentVirtualDisplayUuid();
+  EXPECT_EQ(
+    persistent,
+    VDISPLAY::virtualDisplayUuidFromStableId(std::string {VDISPLAY::policy::ensure_display_stable_id})
+  );
+  EXPECT_NE(persistent, VDISPLAY::virtualDisplayUuidFromStableId("C19912B3-2432-D020-368E-65EC0EDD3C72"));
+}
+
+TEST(SunshineVirtualDisplay, SharedPersistentGuidUsesTheReservedUuidBytes) {
+  const auto persistent = VDISPLAY::persistentVirtualDisplayUuid();
+  GUID expected {};
+  std::memcpy(&expected, persistent.b8, sizeof(expected));
+
+  const auto shared = VDISPLAY::sharedVirtualDisplayGuid();
+  const auto repeated = VDISPLAY::sharedVirtualDisplayGuid();
+  EXPECT_EQ(0, std::memcmp(&shared, &expected, sizeof(shared)));
+  EXPECT_EQ(0, std::memcmp(&shared, &repeated, sizeof(shared)));
 }
 
 TEST(SunshineVirtualDisplay, EnsureDisplayReservedIdentityNeverCollidesWithClients) {
@@ -137,9 +166,9 @@ TEST(SunshineVirtualDisplay, ActivePhysicalDisplayDetectionIsScopedToConfiguredA
 
   const auto misc_source = read_source("src/platform/windows/misc.cpp");
   expect_contains(misc_source, "bool configured_capture_adapter_has_output(");
-  expect_contains(misc_source, "std::optional<bool> adapter_drives_any_output(");
+  expect_contains(misc_source, "adapter_output_match_e adapter_drives_any_output(");
   // Hosts without a configured adapter must keep the legacy adapter-agnostic answer.
-  expect_contains(misc_source, "if (configured.empty()) {");
+  expect_contains(misc_source, "if (config::video.adapter_name.empty()) {");
 }
 
 TEST(SunshineVirtualDisplay, ConfiguredRenderAdapterIsNeverSilentlyReplaced) {
@@ -148,29 +177,26 @@ TEST(SunshineVirtualDisplay, ConfiguredRenderAdapterIsNeverSilentlyReplaced) {
          std::string {"src/platform/windows/virtual_display_sudovda.cpp"},
        }) {
     const auto source = read_source(relative_path);
-    const auto preference_pos = source.find("void apply_configured_render_adapter_preference(");
-    ASSERT_NE(preference_pos, std::string::npos) << relative_path;
-
-    const auto branch_pos = source.find("if (!config::video.adapter_name.empty())", preference_pos);
-    ASSERT_NE(branch_pos, std::string::npos) << relative_path;
-    const auto return_pos = source.find("return;", branch_pos);
-    const auto error_pos = source.find("BOOST_LOG(error)", branch_pos);
-    const auto fallback_pos = source.find("setRenderAdapterWithMostDedicatedMemory", branch_pos);
-    ASSERT_NE(return_pos, std::string::npos) << relative_path;
-    ASSERT_NE(error_pos, std::string::npos) << relative_path;
-    ASSERT_NE(fallback_pos, std::string::npos) << relative_path;
-
-    // An unusable configured adapter must be reported loudly...
-    EXPECT_LT(error_pos, return_pos) << relative_path << " does not log an error for an unusable adapter";
-    // ...and the highest-VRAM auto-selection must stay unreachable once adapter_name is set.
-    EXPECT_LT(return_pos, fallback_pos) << relative_path << " can fall back to another GPU despite an explicit adapter_name";
+    expect_contains(source, "return VDISPLAY::applyConfiguredRenderAdapterPreference(context);");
   }
+
+  // The driver-specific wrappers delegate to the shared policy, which reports
+  // an unusable preference and never substitutes a highest-VRAM adapter.
+  const auto shared_source = read_source("src/platform/windows/virtual_display.cpp");
+  const auto preference_pos = shared_source.find("bool applyConfiguredRenderAdapterPreference(");
+  ASSERT_NE(preference_pos, std::string::npos);
+  const auto preference_end = shared_source.find("bool configuredRenderAdapterMatchesVirtualDisplay(", preference_pos);
+  ASSERT_NE(preference_end, std::string::npos);
+  const auto preference_body = shared_source.substr(preference_pos, preference_end - preference_pos);
+  expect_contains(preference_body, "BOOST_LOG(error)");
+  expect_contains(preference_body, "No fallback adapter will be used.");
+  EXPECT_EQ(preference_body.find("setRenderAdapterWithMostDedicatedMemory"), std::string::npos);
 
   // The capture path must name the exact reason a pinned adapter could not be honored.
   const auto display_base_source = read_source("src/platform/windows/display_base.cpp");
   expect_contains(display_base_source, "bool configured_adapter_present = false;");
   expect_contains(display_base_source, "bool configured_adapter_has_output = false;");
-  expect_contains(display_base_source, "does not match any GPU on this system.");
+  expect_contains(display_base_source, "does not match any GPU.");
   expect_contains(display_base_source, "has no display attached to the desktop.");
 }
 
@@ -199,6 +225,56 @@ TEST(SunshineVirtualDisplay, StreamStartRemovesRetainedProbeDisplayRegardlessOfS
 TEST(SunshineVirtualDisplay, StreamReadinessAllowsHelperToActivateEnumeratedDisplay) {
   EXPECT_FALSE(VDISPLAY::policy::accept_enumerated_target(std::chrono::milliseconds {499}));
   EXPECT_TRUE(VDISPLAY::policy::accept_enumerated_target(std::chrono::milliseconds {500}));
+}
+
+TEST(SunshineVirtualDisplay, InactiveRetainedDisplayReusesAdvertisedSessionMode) {
+  using action = VDISPLAY::policy::reclaimed_display_action;
+  constexpr std::array advertised_refreshes {60'000u, 120'000u, 240'000u};
+
+  for (const auto requested_refresh : {60'000u, 120'000u}) {
+    ASSERT_TRUE(VDISPLAY::policy::refresh_is_advertised(advertised_refreshes, requested_refresh));
+    const auto plan = VDISPLAY::policy::reclaimed_display_plan_for_session(
+      true,
+      true,
+      true,
+      true
+    );
+    EXPECT_EQ(plan.action, action::reuse);
+    EXPECT_TRUE(plan.preserve_device_identity);
+    EXPECT_TRUE(plan.activation_apply_required);
+  }
+}
+
+TEST(SunshineVirtualDisplay, InactiveRetainedDisplayRecreatesMissingSessionMode) {
+  using action = VDISPLAY::policy::reclaimed_display_action;
+  constexpr std::array advertised_refreshes {60'000u, 120'000u, 240'000u};
+  ASSERT_FALSE(VDISPLAY::policy::refresh_is_advertised(advertised_refreshes, 83'000u));
+
+  const auto plan = VDISPLAY::policy::reclaimed_display_plan_for_session(
+    true,
+    true,
+    false,
+    true
+  );
+  EXPECT_EQ(plan.action, action::recreate);
+  EXPECT_FALSE(plan.preserve_device_identity);
+  EXPECT_FALSE(plan.activation_apply_required);
+}
+
+TEST(SunshineVirtualDisplay, ActiveReplacementStillRecreatesModeDescriptor) {
+  using action = VDISPLAY::policy::reclaimed_display_action;
+  EXPECT_EQ(
+    VDISPLAY::policy::reclaimed_display_plan_for_session(true, false, true, true).action,
+    action::recreate
+  );
+}
+
+TEST(SunshineVirtualDisplay, RenderAdapterMismatchPreventsRetainedDisplayReuse) {
+  using action = VDISPLAY::policy::reclaimed_display_action;
+  EXPECT_EQ(
+    VDISPLAY::policy::reclaimed_display_plan_for_session(true, true, true, false).action,
+    action::recreate
+  );
 }
 
 TEST(SunshineVirtualDisplay, DetectsDriverIdentityFromDriverSignals) {
@@ -240,9 +316,153 @@ TEST(SunshineVirtualDisplay, HdrRequestedTemporaryDisplayFallsBackToSdr) {
   EXPECT_EQ(VDISPLAY::policy::hdr_failure_action(true, true, true), action::none);
 }
 
+TEST(SunshineVirtualDisplay, SdrRequestResetsPersistedHdrStateBeforeTheHelperRuns) {
+  EXPECT_TRUE(VDISPLAY::policy::should_reset_hdr_state_for_stream(false, true));
+  EXPECT_FALSE(VDISPLAY::policy::should_reset_hdr_state_for_stream(false, false));
+  EXPECT_FALSE(VDISPLAY::policy::should_reset_hdr_state_for_stream(true, true));
+}
+
 TEST(SunshineVirtualDisplay, AvailabilityChecksStayPassive) {
   EXPECT_TRUE(VDISPLAY::policy::passive_install_status(true));
   EXPECT_FALSE(VDISPLAY::policy::passive_install_status(false));
+}
+
+TEST(SunshineVirtualDisplay, ExactTargetActivationSelectsOnlyDriverReturnedIdentity) {
+  using action = VDISPLAY::policy::exact_target_activation_action;
+  using key = VDISPLAY::policy::display_config_target_key;
+  using path = VDISPLAY::policy::display_config_path_state;
+
+  constexpr key requested {0x1234u, 7, 42u};
+  constexpr std::array paths {
+    path {{0x9999u, 7, 42u}, true, true},
+    path {requested, false, true},
+    path {{0x1234u, 7, 43u}, false, true},
+  };
+
+  const auto plan = VDISPLAY::policy::plan_exact_target_activation(paths, requested);
+  EXPECT_EQ(plan.action, action::activate);
+  EXPECT_EQ(plan.path_index, 1u);
+}
+
+TEST(SunshineVirtualDisplay, ExactTargetActivationNoOpsOnlyWhenExactTargetIsActive) {
+  using action = VDISPLAY::policy::exact_target_activation_action;
+  using key = VDISPLAY::policy::display_config_target_key;
+  using path = VDISPLAY::policy::display_config_path_state;
+
+  constexpr key requested {0x1234u, -2, 42u};
+  constexpr std::array active_paths {
+    path {{0x9999u, -2, 42u}, true, true},
+    path {requested, true, true},
+  };
+  constexpr std::array unpublished_paths {
+    path {requested, false, false},
+  };
+
+  EXPECT_EQ(
+    VDISPLAY::policy::plan_exact_target_activation(active_paths, requested).action,
+    action::already_active
+  );
+  EXPECT_EQ(
+    VDISPLAY::policy::plan_exact_target_activation(unpublished_paths, requested).action,
+    action::retry
+  );
+}
+
+TEST(SunshineVirtualDisplay, ExactTargetActivationPrefersAnUnusedSource) {
+  using action = VDISPLAY::policy::exact_target_activation_action;
+  using key = VDISPLAY::policy::display_config_target_key;
+  using source = VDISPLAY::policy::display_config_source_key;
+  using path = VDISPLAY::policy::display_config_path_state;
+
+  constexpr key requested {0x1234u, 7, 42u};
+  constexpr source occupied {0x1234u, 7, 0u};
+  constexpr source spare {0x1234u, 7, 1u};
+
+  // QDC_ALL_PATHS pairs the requested target with every source on its adapter.
+  // The first candidate shares a source with a retained active path, so the plan
+  // must skip it rather than ask for one source in two clone groups.
+  constexpr std::array paths {
+    path {{0x1234u, 7, 99u}, true, true, occupied},
+    path {requested, false, true, occupied},
+    path {requested, false, true, spare},
+  };
+
+  const auto plan = VDISPLAY::policy::plan_exact_target_activation(paths, requested);
+  EXPECT_EQ(plan.action, action::activate);
+  EXPECT_EQ(plan.path_index, 2u);
+}
+
+TEST(SunshineVirtualDisplay, ExactTargetActivationStillActivatesWhenEverySourceIsBusy) {
+  using action = VDISPLAY::policy::exact_target_activation_action;
+  using key = VDISPLAY::policy::display_config_target_key;
+  using source = VDISPLAY::policy::display_config_source_key;
+  using path = VDISPLAY::policy::display_config_path_state;
+
+  constexpr key requested {0x1234u, 7, 42u};
+  constexpr source occupied {0x1234u, 7, 0u};
+
+  constexpr std::array paths {
+    path {{0x1234u, 7, 99u}, true, true, occupied},
+    path {requested, false, true, occupied},
+  };
+
+  // Degrading to the first available candidate keeps the plan no worse than
+  // asking nothing at all; activation is best-effort at the call site.
+  const auto plan = VDISPLAY::policy::plan_exact_target_activation(paths, requested);
+  EXPECT_EQ(plan.action, action::activate);
+  EXPECT_EQ(plan.path_index, 1u);
+}
+
+TEST(SunshineVirtualDisplay, DisplayConfigBufferSizesAcceptOrdinaryAllPathsTopologies) {
+  // A single-monitor host with a virtual display driver reports ~316 QDC_ALL_PATHS
+  // paths and ~948 modes. Rejecting those made every exact-target activation fail
+  // with ERROR_INVALID_DATA before SetDisplayConfig was ever reached.
+  EXPECT_TRUE(VDISPLAY::policy::display_config_buffer_sizes_are_sane(316u, 948u));
+  EXPECT_TRUE(VDISPLAY::policy::display_config_buffer_sizes_are_sane(
+    VDISPLAY::policy::max_display_config_paths,
+    VDISPLAY::policy::max_display_config_modes
+  ));
+  EXPECT_FALSE(VDISPLAY::policy::display_config_buffer_sizes_are_sane(
+    VDISPLAY::policy::max_display_config_paths + 1u,
+    VDISPLAY::policy::max_display_config_modes
+  ));
+  EXPECT_FALSE(VDISPLAY::policy::display_config_buffer_sizes_are_sane(
+    VDISPLAY::policy::max_display_config_paths,
+    VDISPLAY::policy::max_display_config_modes + 1u
+  ));
+}
+
+TEST(SunshineVirtualDisplay, ExactTargetActivationNeverIntroducesACloneGroup) {
+  // QueryDisplayConfig stamps DISPLAYCONFIG_PATH_CLONE_GROUP_INVALID on every
+  // path it returns, so the retained paths in the supplied configuration always
+  // carry the sentinel. Stamping a valid clone group id on the activation path
+  // (the old code derived 0 from "max retained id + 1") mixes valid ids with
+  // the sentinel, which SetDisplayConfig(SDC_VIRTUAL_MODE_AWARE) rejects with
+  // ERROR_INVALID_PARAMETER before considering anything else in the payload.
+  EXPECT_EQ(
+    VDISPLAY::policy::exact_target_activation_clone_group_id(),
+    VDISPLAY::policy::display_config_clone_group_invalid
+  );
+  EXPECT_EQ(VDISPLAY::policy::display_config_clone_group_invalid, 0xffffu);
+}
+
+TEST(SunshineVirtualDisplay, ExactTargetActivationPreservesExistingActivePaths) {
+  using key = VDISPLAY::policy::display_config_target_key;
+  using path = VDISPLAY::policy::display_config_path_state;
+
+  constexpr key requested {0x1234u, 7, 42u};
+  EXPECT_TRUE(VDISPLAY::policy::path_active_after_exact_target_activation(
+    path {{0x9999u, 1, 8u}, true, true},
+    requested
+  ));
+  EXPECT_TRUE(VDISPLAY::policy::path_active_after_exact_target_activation(
+    path {requested, false, true},
+    requested
+  ));
+  EXPECT_FALSE(VDISPLAY::policy::path_active_after_exact_target_activation(
+    path {{0x9999u, 1, 9u}, false, true},
+    requested
+  ));
 }
 
 TEST(SunshineVirtualDisplay, LeaseAndTransportFailuresKeepProtocolMeaning) {

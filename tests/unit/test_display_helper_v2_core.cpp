@@ -10,9 +10,9 @@
 #include "src/platform/windows/display_helper_v2/runtime_support.h"
 #include "src/platform/windows/display_helper_v2/snapshot.h"
 #include "src/platform/windows/display_helper_v2/staged_settings.h"
+#include "src/platform/windows/display_helper_v2/topology_policy.h"
 
 #include <algorithm>
-#include <filesystem>
 #include <future>
 #include <set>
 
@@ -199,22 +199,6 @@ namespace {
     return snapshot;
   }
 
-  struct TempDir {
-    std::filesystem::path path;
-
-    TempDir() {
-      std::error_code ec;
-      const auto base = std::filesystem::temp_directory_path(ec);
-      const auto token = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-      path = (ec ? std::filesystem::path(".") : base) / ("sunshine_display_helper_v2_test_" + token);
-      std::filesystem::create_directories(path, ec);
-    }
-
-    ~TempDir() {
-      std::error_code ec;
-      std::filesystem::remove_all(path, ec);
-    }
-  };
 }  // namespace
 
 TEST(DisplayHelperV2Queue, PushPopOrder) {
@@ -427,10 +411,12 @@ TEST(DisplayHelperV2StagedSettingsState, RebasePreservesOriginalSettings) {
     current_initial,
     current_initial.m_topology);
 
-  EXPECT_EQ(rebased.m_initial, current_initial);
+  EXPECT_TRUE(display_helper::v2::topology::equal_initial(rebased.m_initial, current_initial));
   EXPECT_EQ(rebased.m_modified.m_topology, current_initial.m_topology);
   EXPECT_EQ(rebased.m_modified.m_original_primary_device, "PHYSICAL");
-  EXPECT_EQ(rebased.m_modified.m_original_modes, previous.m_modified.m_original_modes);
+  EXPECT_TRUE(display_helper::v2::topology::equal_display_modes(
+    rebased.m_modified.m_original_modes,
+    previous.m_modified.m_original_modes));
   EXPECT_EQ(rebased.m_modified.m_original_hdr_states, previous.m_modified.m_original_hdr_states);
 }
 
@@ -450,7 +436,7 @@ TEST(DisplayHelperV2StagedSettingsState, ConsecutiveApplyUsesSessionTopologyBase
     devices);
   ASSERT_TRUE(base.has_value());
 
-  const auto [topology, target, duplicates] = display_device::win_utils::computeNewTopologyAndMetadata(
+  const auto [topology, target, duplicates] = display_helper::v2::topology::compute_new_topology_and_metadata(
     display_device::SingleDisplayConfiguration::DevicePreparation::EnsureActive,
     "NEW_VIRTUAL",
     *base);
@@ -896,13 +882,102 @@ TEST(DisplayHelperV2ApplyOperation, RestoresBaselineWhenSettingsStageFails) {
   display_device::SingleDisplayConfiguration config;
   config.m_device_id = "VIRTUAL";
   config.m_device_prep = display_device::SingleDisplayConfiguration::DevicePreparation::EnsureOnlyDisplay;
+  config.m_hdr_state = display_device::HdrState::Enabled;
   request.configuration = config;
   request.topology = display_device::ActiveTopology {{"VIRTUAL"}};
+  request.virtual_layout = "single";
 
   display_helper::v2::CancellationSource source;
   const auto outcome = operation.run(request, source.token());
 
   EXPECT_EQ(outcome.status, display_helper::v2::ApplyStatus::Retryable);
+  EXPECT_FALSE(outcome.display_may_have_changed);
+  EXPECT_EQ(display.topology, baseline);
+  EXPECT_EQ(display.apply_topology_calls, 2);
+  EXPECT_EQ(display.apply_snapshot_calls, 1);
+}
+
+TEST(DisplayHelperV2ApplyOperation, RetainsVirtualTopologyWhenHdrSettingsStageFails) {
+  FakeClock clock;
+  FakeDisplaySettings display;
+  const auto baseline = display_device::ActiveTopology {{"PHYSICAL"}};
+  const auto staged_topology = display_device::ActiveTopology {{"VIRTUAL"}};
+  display.topology = baseline;
+  display.snapshot = make_snapshot({"PHYSICAL"});
+  display.enumerated_devices = {make_active_device("PHYSICAL"), make_active_device("VIRTUAL")};
+  display.apply_status = display_helper::v2::ApplyStatus::HdrStateFailed;
+
+  display_helper::v2::ApplyOperation operation(display, clock);
+  display_helper::v2::ApplyRequest request;
+  display_device::SingleDisplayConfiguration config;
+  config.m_device_id = "VIRTUAL";
+  config.m_device_prep = display_device::SingleDisplayConfiguration::DevicePreparation::EnsureOnlyDisplay;
+  config.m_hdr_state = display_device::HdrState::Enabled;
+  request.configuration = config;
+  request.topology = staged_topology;
+  request.virtual_layout = "single";
+
+  display_helper::v2::CancellationSource source;
+  const auto outcome = operation.run(request, source.token());
+
+  EXPECT_EQ(outcome.status, display_helper::v2::ApplyStatus::HdrStateFailed);
+  EXPECT_TRUE(outcome.display_may_have_changed);
+  EXPECT_EQ(display.topology, staged_topology);
+  EXPECT_EQ(display.apply_topology_calls, 1);
+  EXPECT_EQ(display.apply_snapshot_calls, 0);
+}
+
+TEST(DisplayHelperV2ApplyOperation, RestoresBaselineWhenPhysicalHdrSettingsStageFails) {
+  FakeClock clock;
+  FakeDisplaySettings display;
+  const auto baseline = display_device::ActiveTopology {{"PHYSICAL_A"}};
+  display.topology = baseline;
+  display.snapshot = make_snapshot({"PHYSICAL_A"});
+  display.enumerated_devices = {make_active_device("PHYSICAL_A"), make_active_device("PHYSICAL_B")};
+  display.apply_status = display_helper::v2::ApplyStatus::HdrStateFailed;
+
+  display_helper::v2::ApplyOperation operation(display, clock);
+  display_helper::v2::ApplyRequest request;
+  display_device::SingleDisplayConfiguration config;
+  config.m_device_id = "PHYSICAL_B";
+  config.m_device_prep = display_device::SingleDisplayConfiguration::DevicePreparation::EnsureOnlyDisplay;
+  config.m_hdr_state = display_device::HdrState::Enabled;
+  request.configuration = config;
+  request.topology = display_device::ActiveTopology {{"PHYSICAL_B"}};
+
+  display_helper::v2::CancellationSource source;
+  const auto outcome = operation.run(request, source.token());
+
+  EXPECT_EQ(outcome.status, display_helper::v2::ApplyStatus::HdrStateFailed);
+  EXPECT_FALSE(outcome.display_may_have_changed);
+  EXPECT_EQ(display.topology, baseline);
+  EXPECT_EQ(display.apply_topology_calls, 2);
+  EXPECT_EQ(display.apply_snapshot_calls, 1);
+}
+
+TEST(DisplayHelperV2ApplyOperation, RestoresBaselineWhenVirtualSdrHdrStateRestoreFails) {
+  FakeClock clock;
+  FakeDisplaySettings display;
+  const auto baseline = display_device::ActiveTopology {{"PHYSICAL"}};
+  display.topology = baseline;
+  display.snapshot = make_snapshot({"PHYSICAL"});
+  display.enumerated_devices = {make_active_device("PHYSICAL"), make_active_device("VIRTUAL")};
+  display.apply_status = display_helper::v2::ApplyStatus::HdrStateFailed;
+
+  display_helper::v2::ApplyOperation operation(display, clock);
+  display_helper::v2::ApplyRequest request;
+  display_device::SingleDisplayConfiguration config;
+  config.m_device_id = "VIRTUAL";
+  config.m_device_prep = display_device::SingleDisplayConfiguration::DevicePreparation::EnsureOnlyDisplay;
+  config.m_hdr_state = display_device::HdrState::Disabled;
+  request.configuration = config;
+  request.topology = display_device::ActiveTopology {{"VIRTUAL"}};
+  request.virtual_layout = "single";
+
+  display_helper::v2::CancellationSource source;
+  const auto outcome = operation.run(request, source.token());
+
+  EXPECT_EQ(outcome.status, display_helper::v2::ApplyStatus::HdrStateFailed);
   EXPECT_FALSE(outcome.display_may_have_changed);
   EXPECT_EQ(display.topology, baseline);
   EXPECT_EQ(display.apply_topology_calls, 2);
@@ -1087,13 +1162,8 @@ TEST(DisplayHelperV2SnapshotService, MatchesCurrentUsesDisplayBackend) {
 }
 
 TEST(DisplayHelperV2FileSnapshotStorage, SaveLoadRoundTrip) {
-  TempDir temp;
-  display_helper::v2::SnapshotPaths paths {
-    temp.path / "current.json",
-    temp.path / "previous.json",
-    temp.path / "golden.json"
-  };
-  display_helper::v2::FileSnapshotStorage storage(paths);
+  display_helper::v2::InMemoryTextStorage text_storage;
+  display_helper::v2::TextSnapshotStorage storage({"current.json", "previous.json", "golden.json"}, text_storage);
 
   display_device::DisplaySettingsSnapshot snapshot;
   snapshot.m_topology = {{"A", "B"}};
@@ -1107,17 +1177,12 @@ TEST(DisplayHelperV2FileSnapshotStorage, SaveLoadRoundTrip) {
 
   auto loaded = storage.load(display_helper::v2::SnapshotTier::Current);
   ASSERT_TRUE(loaded.has_value());
-  EXPECT_EQ(*loaded, snapshot);
+  EXPECT_TRUE(display_helper::v2::topology::equal_snapshot(*loaded, snapshot));
 }
 
 TEST(DisplayHelperV2FileSnapshotStorage, ReportsMissingDevices) {
-  TempDir temp;
-  display_helper::v2::SnapshotPaths paths {
-    temp.path / "current.json",
-    temp.path / "previous.json",
-    temp.path / "golden.json"
-  };
-  display_helper::v2::FileSnapshotStorage storage(paths);
+  display_helper::v2::InMemoryTextStorage text_storage;
+  display_helper::v2::TextSnapshotStorage storage({"current.json", "previous.json", "golden.json"}, text_storage);
 
   display_device::DisplaySettingsSnapshot snapshot;
   snapshot.m_topology = {{"A", "B"}};

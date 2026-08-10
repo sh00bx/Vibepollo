@@ -55,6 +55,7 @@
 #include "update.h"
 #ifdef _WIN32
   #include "platform/windows/display.h"
+  #include "platform/windows/display_helper_request_policy.h"
   #include "platform/windows/display_helper_request_helpers.h"
   #include "platform/windows/misc.h"
   #include "platform/windows/virtual_display.h"
@@ -343,6 +344,9 @@ namespace nvhttp {
 #endif
 
       auto ensure_result = VDISPLAY::ensure_display(idle_virtual_required_adapter);
+      auto cleanup_probe_display = util::fail_guard([&ensure_result]() {
+        VDISPLAY::cleanup_ensure_display(ensure_result);
+      });
       if (!ensure_result.ready_for_probe()) {
         // A driver-accepted target without a Windows identity must not remain
         // indefinitely retained by an idle discovery request. Upstream charges
@@ -357,9 +361,6 @@ namespace nvhttp {
         return publish(std::move(caps), false, "target-pending");
       }
       caps = video::advertised_encoder_capabilities(true, &probe_complete);
-      if (ensure_result.tracks_temporary_for_probe) {
-        BOOST_LOG(debug) << "Retaining temporary virtual display created for HTTP encoder capability probing.";
-      }
       return publish(std::move(caps), probe_complete, "idle-probe");
     }
 
@@ -1152,6 +1153,40 @@ namespace nvhttp {
         }
         if (allow_display_changes) {
           apply_framegen_refresh_policy(request_virtual_display);
+
+          if (request_virtual_display) {
+            // A new virtual-display session supersedes the prior session's restore.
+            // Disarm it before any driver mutation; checking first used to return
+            // early and made the DISARM below unreachable in the exact race it was
+            // intended to prevent.
+            const bool virtual_display_mutation_allowed =
+              display_helper_integration::request_policy::supersede_restore_for_virtual_display(
+                [&] {
+                  (void) display_helper_integration::disarm_pending_restore(
+                    display_startup_cancelled,
+                    display_startup_deadline
+                  );
+                },
+                [&] {
+                  return display_helper_integration::restore_in_progress(
+                    display_startup_cancelled,
+                    display_startup_deadline
+                  );
+                }
+              );
+            if (!virtual_display_mutation_allowed) {
+              BOOST_LOG(warning) << "Display helper: virtual display creation deferred because physical display restoration is still in progress; using physical fallback for this session.";
+              launch_session->virtual_display = false;
+              launch_session->virtual_display_failed = true;
+              launch_session->virtual_display_guid_bytes.fill(0);
+              launch_session->virtual_display_device_id.clear();
+              launch_session->virtual_display_ready_since.reset();
+              launch_session->virtual_display_hdr_enabled.reset();
+              apply_framegen_refresh_policy(false);
+              return;
+            }
+          }
+
           apply_virtual_display_request(request_virtual_display);
           if (launch_session->virtual_display && !launch_session->virtual_display_device_id.empty()) {
             config::set_runtime_output_name_override(launch_session->virtual_display_device_id);
@@ -3534,7 +3569,12 @@ namespace nvhttp {
       }
 
         // Apply a per-client HDR profile to physical displays (virtual displays are handled at creation time).
-        if (!launch_session->virtual_display) {
+        const auto physical_hdr_profile_policy = display_helper_integration::request_policy::evaluate({
+          .virtual_display = launch_session->virtual_display,
+          .virtual_display_failed = launch_session->virtual_display_failed,
+          .hdr_profile_selected = launch_session->hdr_profile && !launch_session->hdr_profile->empty(),
+        });
+        if (physical_hdr_profile_policy.apply_hdr_profile_to_physical) {
           const auto active_output = config::get_active_output_name();
           VDISPLAY::applyHdrProfileToOutput(
             launch_session->client_name.c_str(),
@@ -3570,22 +3610,26 @@ namespace nvhttp {
 #ifdef _WIN32
       bool encoder_probe_failed = false;
       bool probe_display_unavailable = false;
-      VDISPLAY::ensure_display_result ensure_result {};
       if (!video::has_successful_encoder_probe()) {
-        if (!VDISPLAY::policy::should_ensure_probe_display(launch_session->virtual_display)) {
-          // Let APPLY settle when possible, but capability probing remains
-          // adapter-scoped and does not turn a soft display gate into a 503.
-          wait_for_probe_helper_settle(launch_session, display_startup_deadline);
-        } else {
-          ensure_result = VDISPLAY::ensure_display();
-          probe_display_unavailable = !ensure_result.ready_for_probe();
-        }
+        {
+          VDISPLAY::ensure_display_result ensure_result {};
+          auto cleanup_probe_display = util::fail_guard([&ensure_result]() {
+            VDISPLAY::cleanup_ensure_display(ensure_result);
+          });
+          if (!VDISPLAY::policy::should_ensure_probe_display(launch_session->virtual_display)) {
+            // Let APPLY settle when possible, but capability probing remains
+            // adapter-scoped and does not turn a soft display gate into a 503.
+            wait_for_probe_helper_settle(launch_session, display_startup_deadline);
+          } else {
+            ensure_result = VDISPLAY::ensure_display();
+            probe_display_unavailable = !ensure_result.ready_for_probe();
+          }
 
-        if (!probe_display_unavailable) {
-          encoder_probe_failed = video::probe_encoders();
-          VDISPLAY::cleanup_ensure_display(ensure_result, !encoder_probe_failed, false);
-        } else {
-          encoder_probe_failed = true;
+          if (!probe_display_unavailable) {
+            encoder_probe_failed = video::probe_encoders();
+          } else {
+            encoder_probe_failed = true;
+          }
         }
       } else {
         BOOST_LOG(debug) << "Launch encoder probe skipped (matching selected-GPU cache).";
@@ -4009,7 +4053,7 @@ namespace nvhttp {
                                                           "resume virtual-display recreation" :
                                                           "resume virtual-display refresh"))
                          << " for client '" << launch_session->client_name << "'.";
-        revert_display_configuration = allow_display_changes;
+        revert_display_configuration = allow_display_changes || launch_session->virtual_display_failed;
 
 #ifdef _WIN32
         const bool helper_session_available = display_helper_session_available();
@@ -4059,7 +4103,12 @@ namespace nvhttp {
         }
 
         // Apply a per-client HDR profile to physical displays (virtual displays are handled at creation time).
-        if (!launch_session->virtual_display) {
+        const auto physical_hdr_profile_policy = display_helper_integration::request_policy::evaluate({
+          .virtual_display = launch_session->virtual_display,
+          .virtual_display_failed = launch_session->virtual_display_failed,
+          .hdr_profile_selected = launch_session->hdr_profile && !launch_session->hdr_profile->empty(),
+        });
+        if (physical_hdr_profile_policy.apply_hdr_profile_to_physical) {
           const auto active_output = config::get_active_output_name();
           VDISPLAY::applyHdrProfileToOutput(
             launch_session->client_name.c_str(),
@@ -4095,20 +4144,24 @@ namespace nvhttp {
 #ifdef _WIN32
       bool encoder_probe_failed = false;
       bool probe_display_unavailable = false;
-      VDISPLAY::ensure_display_result ensure_result {};
       if (!video::has_successful_encoder_probe()) {
-        if (!VDISPLAY::policy::should_ensure_probe_display(launch_session->virtual_display)) {
-          wait_for_probe_helper_settle(launch_session, display_startup_deadline);
-        } else {
-          ensure_result = VDISPLAY::ensure_display();
-          probe_display_unavailable = !ensure_result.ready_for_probe();
-        }
+        {
+          VDISPLAY::ensure_display_result ensure_result {};
+          auto cleanup_probe_display = util::fail_guard([&ensure_result]() {
+            VDISPLAY::cleanup_ensure_display(ensure_result);
+          });
+          if (!VDISPLAY::policy::should_ensure_probe_display(launch_session->virtual_display)) {
+            wait_for_probe_helper_settle(launch_session, display_startup_deadline);
+          } else {
+            ensure_result = VDISPLAY::ensure_display();
+            probe_display_unavailable = !ensure_result.ready_for_probe();
+          }
 
-        if (!probe_display_unavailable) {
-          encoder_probe_failed = video::probe_encoders();
-          VDISPLAY::cleanup_ensure_display(ensure_result, !encoder_probe_failed, false);
-        } else {
-          encoder_probe_failed = true;
+          if (!probe_display_unavailable) {
+            encoder_probe_failed = video::probe_encoders();
+          } else {
+            encoder_probe_failed = true;
+          }
         }
       } else {
         BOOST_LOG(debug) << "Resume encoder probe skipped (matching selected-GPU cache).";

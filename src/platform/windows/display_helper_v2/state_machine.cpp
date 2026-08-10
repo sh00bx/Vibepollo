@@ -5,7 +5,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <utility>
 
-#include "src/logging.h"
+#include "src/platform/windows/display_helper_v2/diagnostics.h"
 
 namespace display_helper::v2 {
   namespace {
@@ -84,6 +84,8 @@ namespace display_helper::v2 {
           return "Retryable";
         case ApplyStatus::Fatal:
           return "Fatal";
+        case ApplyStatus::HdrStateFailed:
+          return "HdrStateFailed";
         default:
           return "Unknown";
       }
@@ -913,7 +915,8 @@ namespace display_helper::v2 {
     // before the generic mutation fence: otherwise DISARM would cancel the
     // recovery, then be ignored after its stale completion, leaving the state
     // machine stranded in Recovery with no worker.
-    if (restore_pending() &&
+    if (!command.force &&
+        restore_pending() &&
         restore_state_.restore_attempted_unconfirmed.load(std::memory_order_acquire)) {
       BOOST_LOG(info) << "DISARM command ignored because an unconfirmed restore attempt is still pending.";
       return;
@@ -1190,7 +1193,11 @@ namespace display_helper::v2 {
       }
     }
 
-    if (completed.status == ApplyStatus::Retryable || completed.status == ApplyStatus::VerificationFailed) {
+    const bool status_allows_bounded_retry =
+      completed.status == ApplyStatus::Retryable ||
+      completed.status == ApplyStatus::VerificationFailed ||
+      completed.status == ApplyStatus::HdrStateFailed;
+    if (status_allows_bounded_retry) {
       if (apply_.can_retry(apply_attempt_)) {
         const auto delay = apply_.retry_delay(apply_attempt_);
         ++apply_attempt_;
@@ -1204,7 +1211,7 @@ namespace display_helper::v2 {
       completed.virtual_display_requested &&
       current_request_.configuration &&
       current_request_.configuration->m_hdr_state == display_device::HdrState::Enabled &&
-      (completed.status == ApplyStatus::Retryable || completed.status == ApplyStatus::VerificationFailed);
+      status_allows_bounded_retry;
     if (can_fallback_virtual_hdr) {
       virtual_hdr_fallback_attempted_ = true;
       current_request_.configuration->m_hdr_state = display_device::HdrState::Disabled;
@@ -1395,10 +1402,13 @@ namespace display_helper::v2 {
     if (completed.success) {
       staged_state_prepared_ = false;
     }
-    BOOST_LOG(completed.success ? info : warning)
-      << "Display helper: reset staged SettingsManager state result="
-      << (completed.success ? "true" : "false")
-      << (was_stale ? " (completion followed a newer cancellation generation)" : "");
+    if (completed.success) {
+      BOOST_LOG(info) << "Display helper: reset staged SettingsManager state result=true"
+                      << (was_stale ? " (completion followed a newer cancellation generation)" : "");
+    } else {
+      BOOST_LOG(warning) << "Display helper: reset staged SettingsManager state result=false"
+                         << (was_stale ? " (completion followed a newer cancellation generation)" : "");
+    }
 
     const bool deferred_followup_mutation = std::any_of(
       deferred_mutation_commands_.begin(),

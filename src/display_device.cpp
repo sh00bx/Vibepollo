@@ -4,6 +4,7 @@
  */
 // header include
 #include "display_device.h"
+#include "display_device_policy.h"
 
 // lib includes
 #include <boost/algorithm/string.hpp>
@@ -180,7 +181,7 @@ namespace display_device {
      * const auto device_prep_option = parse_device_prep_option(video_config);
      * @examples_end
      */
-    std::optional<SingleDisplayConfiguration::DevicePreparation> parse_device_prep_option(const config::video_t &video_config) {
+    [[maybe_unused]] std::optional<SingleDisplayConfiguration::DevicePreparation> parse_device_prep_option(const config::video_t &video_config) {
       using enum config::video_t::dd_t::config_option_e;
       using enum SingleDisplayConfiguration::DevicePreparation;
 
@@ -215,7 +216,7 @@ namespace display_device {
      * const bool success = parse_resolution_option(video_config, *launch_session, config);
      * @examples_end
      */
-    bool parse_resolution_option(const config::video_t &video_config, const rtsp_stream::launch_session_t &session, SingleDisplayConfiguration &config) {
+    [[maybe_unused]] bool parse_resolution_option(const config::video_t &video_config, const rtsp_stream::launch_session_t &session, SingleDisplayConfiguration &config) {
       using resolution_option_e = config::video_t::dd_t::resolution_option_e;
 
       // An explicit launch resolution override takes highest priority.
@@ -299,7 +300,7 @@ namespace display_device {
      * const bool success = parse_refresh_rate_option(video_config, *launch_session, config);
      * @examples_end
      */
-    bool parse_refresh_rate_option(const config::video_t &video_config, const rtsp_stream::launch_session_t &session, SingleDisplayConfiguration &config) {
+    [[maybe_unused]] bool parse_refresh_rate_option(const config::video_t &video_config, const rtsp_stream::launch_session_t &session, SingleDisplayConfiguration &config) {
       using refresh_rate_option_e = config::video_t::dd_t::refresh_rate_option_e;
 
       // Client display_mode override takes highest priority
@@ -370,7 +371,7 @@ namespace display_device {
      * const auto hdr_option = parse_hdr_option(video_config, *launch_session);
      * @examples_end
      */
-    std::optional<HdrState> parse_hdr_option(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
+    [[maybe_unused]] std::optional<HdrState> parse_hdr_option(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
       using hdr_option_e = config::video_t::dd_t::hdr_option_e;
 
       if (rtsp_stream::rtx_hdr_enabled(video_config)) {
@@ -491,7 +492,7 @@ namespace display_device {
      * const bool success = remap_display_mode_if_needed(video_config, *launch_session, config);
      * @examples_end
      */
-    bool remap_display_mode_if_needed(const config::video_t &video_config, const rtsp_stream::launch_session_t &session, SingleDisplayConfiguration &config) {
+    [[maybe_unused]] bool remap_display_mode_if_needed(const config::video_t &video_config, const rtsp_stream::launch_session_t &session, SingleDisplayConfiguration &config) {
       // Client display_mode override takes highest priority - skip remapping
       if (session.client_display_mode_override) {
         BOOST_LOG(debug) << "Skipping display mode remapping because client has display mode override active.";
@@ -596,7 +597,7 @@ namespace display_device {
     return true;
   }
 
-  static std::string resolve_device_id(const std::string &output_name) {
+  [[maybe_unused]] static std::string resolve_device_id(const std::string &output_name) {
     if (output_name.empty()) {
       return output_name;
     }
@@ -623,7 +624,7 @@ namespace display_device {
     return output_name;
   }
 #else
-  static std::string resolve_device_id(const std::string &output_name) {
+  [[maybe_unused]] static std::string resolve_device_id(const std::string &output_name) {
     return output_name;
   }
 #endif
@@ -780,7 +781,45 @@ namespace display_device {
 #endif
   }
 
+  namespace {
+    policy::video_config_t to_policy_config(const config::video_t &video_config) {
+      policy::video_config_t result {};
+      result.output_name = config::get_active_output_name();
+      result.rtx_hdr_enabled = rtsp_stream::rtx_hdr_enabled(video_config);
+      result.dd.wa.dummy_plug_hdr10 = video_config.dd.wa.dummy_plug_hdr10;
+      result.dd.configuration_option = static_cast<policy::video_config_t::dd_t::config_option_e>(video_config.dd.configuration_option);
+      result.dd.resolution_option = static_cast<policy::video_config_t::dd_t::resolution_option_e>(video_config.dd.resolution_option);
+      result.dd.manual_resolution = video_config.dd.manual_resolution;
+      result.dd.refresh_rate_option = static_cast<policy::video_config_t::dd_t::refresh_rate_option_e>(video_config.dd.refresh_rate_option);
+      result.dd.manual_refresh_rate = video_config.dd.manual_refresh_rate;
+      result.dd.hdr_option = static_cast<policy::video_config_t::dd_t::hdr_option_e>(video_config.dd.hdr_option);
+      const auto copy_entries = [](const auto &source, auto &destination) {
+        for (const auto &entry : source) destination.push_back({entry.requested_resolution, entry.requested_fps, entry.final_resolution, entry.final_refresh_rate});
+      };
+      copy_entries(video_config.dd.mode_remapping.mixed, result.dd.mode_remapping.mixed);
+      copy_entries(video_config.dd.mode_remapping.resolution_only, result.dd.mode_remapping.resolution_only);
+      copy_entries(video_config.dd.mode_remapping.refresh_rate_only, result.dd.mode_remapping.refresh_rate_only);
+      return result;
+    }
+
+    policy::session_t to_policy_session(const rtsp_stream::launch_session_t &session) {
+      policy::session_t result {
+        .width = session.width, .height = session.height, .fps = session.fps,
+        .enable_hdr = session.enable_hdr, .prefer_sdr_10bit = session.prefer_sdr_10bit, .force_sdr = session.force_sdr,
+        .client_display_mode_override = session.client_display_mode_override,
+        .client_display_refresh_millihz = session.client_display_refresh_millihz,
+        .framegen_refresh_rate = session.framegen_refresh_rate,
+        .framegen_refresh_millihz = session.framegen_refresh_millihz,
+      };
+      if (session.resolution_override) result.resolution_override = {{session.resolution_override->width, session.resolution_override->height}};
+      return result;
+    }
+  }  // namespace
+
   bool refresh_rate_override_active(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
+    return policy::refresh_rate_override_active(to_policy_config(video_config), to_policy_session(session));
+
+#if 0
     using refresh_rate_option_e = config::video_t::dd_t::refresh_rate_option_e;
     if (video_config.dd.refresh_rate_option == refresh_rate_option_e::manual) {
       return true;
@@ -833,9 +872,23 @@ namespace display_device {
     }
 
     return false;
+#endif
   }
 
   std::variant<failed_to_parse_tag_t, configuration_disabled_tag_t, SingleDisplayConfiguration> parse_configuration(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
+    const auto parsed = policy::parse_configuration(to_policy_config(video_config), to_policy_session(session));
+    if (std::holds_alternative<policy::failed_to_parse_tag_t>(parsed)) return failed_to_parse_tag_t {};
+    if (std::holds_alternative<policy::configuration_disabled_tag_t>(parsed)) return configuration_disabled_tag_t {};
+    const auto &policy_result = std::get<policy::configuration_t>(parsed);
+    SingleDisplayConfiguration result {};
+    result.m_device_id = policy_result.m_device_id;
+    result.m_device_prep = static_cast<SingleDisplayConfiguration::DevicePreparation>(policy_result.m_device_prep);
+    if (policy_result.m_resolution) result.m_resolution = Resolution {policy_result.m_resolution->m_width, policy_result.m_resolution->m_height};
+    if (policy_result.m_refresh_rate) result.m_refresh_rate = Rational {policy_result.m_refresh_rate->m_numerator, policy_result.m_refresh_rate->m_denominator};
+    if (policy_result.m_hdr_state) result.m_hdr_state = static_cast<HdrState>(*policy_result.m_hdr_state);
+    return result;
+
+#if 0
     const auto device_prep {parse_device_prep_option(video_config)};
     if (!device_prep) {
       return configuration_disabled_tag_t {};
@@ -862,5 +915,6 @@ namespace display_device {
     }
 
     return config;
+#endif
   }
 }  // namespace display_device

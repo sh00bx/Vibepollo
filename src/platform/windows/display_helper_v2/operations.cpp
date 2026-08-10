@@ -1,11 +1,12 @@
 #include "src/platform/windows/display_helper_v2/operations.h"
+#include "src/platform/windows/display_helper_v2/topology_policy.h"
 
 #include <algorithm>
 #include <sstream>
 
 #include <boost/algorithm/string/predicate.hpp>
 
-#include "src/logging.h"
+#include "src/platform/windows/display_helper_v2/diagnostics.h"
 
 namespace display_helper::v2 {
   namespace {
@@ -59,26 +60,6 @@ namespace display_helper::v2 {
           return boost::iequals(active_id, device_id);
         });
       });
-    }
-
-    std::optional<std::string> missing_topology_device(
-      const ActiveTopology &topology,
-      const EnumeratedDeviceList &devices) {
-      for (const auto &group : topology) {
-        for (const auto &requested_id : group) {
-          if (requested_id.empty()) {
-            continue;
-          }
-          const auto found = std::any_of(devices.begin(), devices.end(), [&](const auto &device) {
-            return (!device.m_device_id.empty() && boost::iequals(device.m_device_id, requested_id)) ||
-                   (!device.m_display_name.empty() && boost::iequals(device.m_display_name, requested_id));
-          });
-          if (!found) {
-            return requested_id;
-          }
-        }
-      }
-      return std::nullopt;
     }
 
     bool resolved_target_remains_active(
@@ -239,24 +220,25 @@ namespace display_helper::v2 {
       outcome.status = ApplyStatus::InvalidRequest;
       return outcome;
     }
-    const auto enumerated_devices = display_.enumerate(display_device::DeviceEnumerationDetail::Minimal);
-    if (enumerated_devices.empty()) {
-      BOOST_LOG(warning) << "Display helper v2: device enumeration is unavailable; retrying topology transition without recovery.";
-      outcome.status = ApplyStatus::Retryable;
-      return outcome;
-    }
-    if (const auto missing_device = missing_topology_device(topology, enumerated_devices)) {
-      BOOST_LOG(warning) << "Display helper v2: requested topology references unavailable device '"
-                         << *missing_device << "'; skipping global display-stack recovery.";
-      outcome.status = ApplyStatus::InvalidRequest;
-      return outcome;
-    }
-    if (auto ready = topology_ready(topology, activation_target, false)) {
-      outcome.status = ApplyStatus::Ok;
-      outcome.applied_topology = std::move(ready);
-      return outcome;
+
+    // An APPLY that already has the exact requested topology does not need a
+    // SetDisplayConfig mutation. Keep this structural no-op fast path free of
+    // enumeration: a newly requested path may be visible to capture before
+    // Windows publishes it to the device list. Targetless RESTORE deliberately
+    // stays on the strict post-activation path below.
+    if (validation_mode == TopologyValidationMode::StrictApply) {
+      const auto current = display_.capture_topology();
+      if (display_.topology_is_valid(current) && display_.is_topology_same(topology, current)) {
+        outcome.status = ApplyStatus::Ok;
+        outcome.applied_topology = current;
+        return outcome;
+      }
     }
 
+    // Capture can expose a requested path before Windows makes it enumerable.
+    // Readiness therefore belongs after SetDisplayConfig, not in an APPLY
+    // preflight that would turn a valid delayed-publication transition into a
+    // recovery path.
     bool mutation_boundary_reached = false;
     const auto arm_mutation_boundary = [&]() {
       if (mutation_boundary_reached) {
@@ -322,7 +304,8 @@ namespace display_helper::v2 {
       // actually landed, so readiness is the authoritative result. A successful
       // call may also yield a valid OS-adjusted topology; accept it when the
       // configured target remains active, matching WinDisplayDevice/v1.
-      const bool allow_os_adjustment = apply_status == ApplyStatus::Ok;
+      const bool allow_os_adjustment = validation_mode == TopologyValidationMode::StrictApply &&
+                                       apply_status == ApplyStatus::Ok;
       if (auto applied_topology = wait_until_ready(
             topology,
             activation_target,
@@ -554,6 +537,15 @@ namespace display_helper::v2 {
     if (outcome.status == ApplyStatus::Ok) {
       apply_monitor_positions(request, token);
       apply_refresh_rate_overrides(request, token);
+    } else if (request.virtual_layout.has_value() &&
+               request.configuration->m_hdr_state == display_device::HdrState::Enabled &&
+               outcome.status == ApplyStatus::HdrStateFailed) {
+      // SettingsManager unwinds primary, mode, and HDR mutations before
+      // reporting this failure, and its topology guard returns to the topology
+      // present at entry: the staged virtual topology accepted above. Retain
+      // that topology for the bounded in-place HDR retry instead of bouncing
+      // the desktop back to the physical pre-APPLY baseline.
+      BOOST_LOG(warning) << "Display helper v2: virtual-display HDR settings failed; retaining the staged topology for retry.";
     } else if (have_rollback_baseline && restore_baseline_after_failed_apply(baseline_snapshot, token)) {
       BOOST_LOG(warning) << "Display helper v2: SettingsManager stage failed; restored the pre-APPLY display baseline.";
       outcome.display_may_have_changed = false;
@@ -710,10 +702,15 @@ namespace display_helper::v2 {
     unsigned int denominator
   ) {
     const bool success = display_.set_device_refresh_rate(device_id, numerator, denominator);
-    BOOST_LOG(success ? info : warning)
-      << "Display helper: refresh-only request device=" << device_id
-      << " rate=" << numerator << '/' << denominator
-      << " result=" << (success ? "true" : "false");
+    if (success) {
+      BOOST_LOG(info) << "Display helper: refresh-only request device=" << device_id
+                      << " rate=" << numerator << '/' << denominator
+                      << " result=true";
+    } else {
+      BOOST_LOG(warning) << "Display helper: refresh-only request device=" << device_id
+                         << " rate=" << numerator << '/' << denominator
+                         << " result=false";
+    }
     return success;
   }
 
@@ -841,7 +838,7 @@ namespace display_helper::v2 {
       auto cur = display_.capture_snapshot();
       // Heuristic: treat completely empty topology+modes as transient
       const bool emptyish = cur.m_topology.empty() && cur.m_modes.empty();
-      if (have_last && !emptyish && (cur == last)) {
+      if (have_last && !emptyish && topology::equal_snapshot(cur, last)) {
         out = std::move(cur);
         return true;
       }
@@ -872,7 +869,7 @@ namespace display_helper::v2 {
       if (!read_stable_snapshot(cur, std::chrono::milliseconds(2000), std::chrono::milliseconds(150), token)) {
         return false;
       }
-      if (!(cur == base)) {
+      if (!topology::equal_snapshot(cur, base)) {
         // topology changed during quiet period
         return false;
       }
@@ -1060,6 +1057,37 @@ namespace display_helper::v2 {
     return false;
   }
 
+  bool RecoveryOperation::golden_restore_is_pending() {
+    auto loaded = storage_.load_with_metadata(SnapshotTier::Golden);
+    if (!loaded) {
+      return false;
+    }
+
+    const auto devices = display_.enumerate(display_device::DeviceEnumerationDetail::Minimal);
+    if (codec::filter_loaded_snapshot(
+          *loaded,
+          devices,
+          state_.exclusions(),
+          "golden-pending-check")) {
+      return true;
+    }
+
+    // A filtered load can fail because a required monitor is temporarily
+    // absent. Keep the restore pending in that case, matching the legacy
+    // helper's raw golden-file pending check. Explicit exclusions remain an
+    // intentional exception and must not keep recovery armed forever.
+    const auto available = known_present_devices();
+    const auto snapshot_devices = codec::snapshot_device_set(loaded->snapshot);
+    const auto exclusions = state_.exclusions();
+    return std::any_of(snapshot_devices.begin(), snapshot_devices.end(), [&](const auto &device_id) {
+      const auto normalized = codec::normalize_device_id(device_id);
+      const bool excluded = std::any_of(exclusions.begin(), exclusions.end(), [&](const auto &excluded_id) {
+        return codec::normalize_device_id(excluded_id) == normalized;
+      });
+      return !excluded && !available.contains(normalized);
+    });
+  }
+
   void RecoveryOperation::clear_session_snapshots_after_golden() {
     const bool removed_current = storage_.remove(SnapshotTier::Current);
     const bool removed_previous = storage_.remove(SnapshotTier::Previous);
@@ -1198,7 +1226,7 @@ namespace display_helper::v2 {
         return outcome;
       }
 
-      if (load_filtered(SnapshotTier::Golden, "golden-pending-check")) {
+      if (golden_restore_is_pending()) {
         const auto fallback_count = state_.golden_pending_session_fallbacks.fetch_add(1, std::memory_order_acq_rel) + 1;
         if (fallback_count < kGoldenFallbackCompletionThreshold) {
           BOOST_LOG(info) << "Restore: session fallback applied while golden snapshot remains pending; continuing polling (attempt "

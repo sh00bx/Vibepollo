@@ -12,34 +12,16 @@
   #include "src/platform/windows/display_helper_v2/operations.h"
   #include "src/platform/windows/display_helper_v2/snapshot.h"
   #include "src/platform/windows/display_helper_v2/snapshot_codec.h"
+  #include "src/platform/windows/display_helper_v2/topology_policy.h"
 
   #include <chrono>
-  #include <filesystem>
   #include <functional>
-  #include <fstream>
 
   #include <nlohmann/json.hpp>
 
 namespace codec = display_helper::v2::codec;
 
 namespace {
-  struct TempDir {
-    std::filesystem::path path;
-
-    TempDir() {
-      std::error_code ec;
-      const auto base = std::filesystem::temp_directory_path(ec);
-      const auto token = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-      path = (ec ? std::filesystem::path(".") : base) / ("sunshine_display_helper_v2_restore_test_" + token);
-      std::filesystem::create_directories(path, ec);
-    }
-
-    ~TempDir() {
-      std::error_code ec;
-      std::filesystem::remove_all(path, ec);
-    }
-  };
-
   display_device::DisplaySettingsSnapshot make_snapshot(const std::vector<std::vector<std::string>> &topology) {
     display_device::DisplaySettingsSnapshot snapshot;
     snapshot.m_topology = topology;
@@ -132,7 +114,7 @@ TEST(DisplayHelperV2Codec, SerializeParseRoundTrip) {
   EXPECT_TRUE(loaded.has_layout_data);
   EXPECT_EQ(loaded.layout_rotations, layouts);
   EXPECT_TRUE(codec::equal_snapshots_strict(loaded.snapshot, snap));
-  EXPECT_EQ(loaded.snapshot.m_origins, snap.m_origins);
+  EXPECT_TRUE(display_helper::v2::topology::equal_origins(loaded.snapshot.m_origins, snap.m_origins));
 }
 
 TEST(DisplayHelperV2Codec, LegacyV1SchemaParsesWithoutLayouts) {
@@ -331,22 +313,22 @@ TEST(DisplayHelperV2Codec, FilterSaveRejectsAllExcluded) {
 // --- golden health (8f062f99: stale warnings only after failures persist) ---
 
 TEST(DisplayHelperV2GoldenHealth, WarnsOnlyAfterThresholdAndWindow) {
-  TempDir temp;
-  const auto status_path = temp.path / "display_golden_restore_status.json";
+  display_helper::v2::InMemoryTextStorage status_storage;
+  const std::string status_key = "display_golden_restore_status.json";
 
   long long fake_now_ms = 1'000'000;
-  display_helper::v2::GoldenHealth health(status_path, [&]() {
+  display_helper::v2::GoldenHealth health(status_storage, status_key, [&]() {
     return fake_now_ms;
   });
 
   auto read_status = [&]() {
-    std::ifstream file(status_path, std::ios::binary);
-    return nlohmann::json::parse(file, nullptr, false);
+    const auto text = status_storage.read(status_key);
+    return text ? nlohmann::json::parse(*text, nullptr, false) : nlohmann::json {};
   };
 
   // No issue noted: nothing written.
   health.register_unresolved("noop");
-  EXPECT_FALSE(std::filesystem::exists(status_path));
+  EXPECT_FALSE(status_storage.exists(status_key));
 
   // Two failures inside the window: marker exists but no out-of-date warning.
   health.note_issue("restore_not_confirmed");
@@ -354,7 +336,7 @@ TEST(DisplayHelperV2GoldenHealth, WarnsOnlyAfterThresholdAndWindow) {
   health.note_issue("restore_not_confirmed");
   health.register_unresolved("test");
 
-  ASSERT_TRUE(std::filesystem::exists(status_path));
+  ASSERT_TRUE(status_storage.exists(status_key));
   auto status = read_status();
   ASSERT_TRUE(status.is_object());
   EXPECT_FALSE(status["snapshot_out_of_date"].get<bool>());
@@ -371,7 +353,7 @@ TEST(DisplayHelperV2GoldenHealth, WarnsOnlyAfterThresholdAndWindow) {
 
   // Confirmed restore clears the marker.
   health.clear_status("restore confirmed");
-  EXPECT_FALSE(std::filesystem::exists(status_path));
+  EXPECT_FALSE(status_storage.exists(status_key));
 }
 
 // --- recovery engine semantics (legacy try_restore_once_if_valid) ---
@@ -506,8 +488,8 @@ namespace {
     EngineClock clock;
     EngineDisplayFake display;
     display_helper::v2::InMemorySnapshotStorage storage;
-    TempDir temp;
-    display_helper::v2::GoldenHealth golden_health {temp.path / "golden_status.json"};
+    display_helper::v2::InMemoryTextStorage golden_status_storage;
+    display_helper::v2::GoldenHealth golden_health {golden_status_storage, "golden_status.json"};
     display_helper::v2::RestoreState state;
     display_helper::v2::RecoveryOperation recovery {display, storage, golden_health, state, clock};
     display_helper::v2::CancellationSource cancellation;
@@ -633,16 +615,31 @@ TEST(DisplayHelperV2RecoveryEngine, GoldenFirstAcceptsSessionFallbackAfterThreeM
   EXPECT_EQ(harness.state.golden_pending_session_fallbacks.load(), 0u);
 }
 
+// The golden file must remain pending when a required baseline device is
+// temporarily unavailable. A filtered load rejects that golden snapshot, but
+// the unfiltered snapshot is still present and must keep recovery unresolved.
+TEST(DisplayHelperV2RecoveryEngine, KeepsGoldenPendingWhenBaselineDeviceIsMissing) {
+  RecoveryHarness harness;
+  harness.add_device("A");
+
+  harness.state.always_restore_from_golden.store(true);
+  ASSERT_TRUE(harness.storage.save(display_helper::v2::SnapshotTier::Golden, make_snapshot({{"A"}, {"B"}})));
+  ASSERT_TRUE(harness.storage.save(display_helper::v2::SnapshotTier::Current, make_snapshot({{"A"}})));
+  harness.display.current = make_snapshot({{"X"}});
+
+  const auto outcome = harness.recovery.run(harness.cancellation.token());
+
+  EXPECT_FALSE(outcome.success);
+  EXPECT_EQ(harness.state.golden_pending_session_fallbacks.load(), 1u);
+  EXPECT_TRUE(harness.storage.exists(display_helper::v2::SnapshotTier::Golden));
+}
+
 // --- storage round trip in the legacy file format ---
 
 TEST(DisplayHelperV2FileStorage, LegacyFormatRoundTripWithLayouts) {
-  TempDir temp;
-  display_helper::v2::SnapshotPaths paths {
-    temp.path / "display_session_current.json",
-    temp.path / "display_session_previous.json",
-    temp.path / "display_golden_restore.json",
-  };
-  display_helper::v2::FileSnapshotStorage storage(paths);
+  display_helper::v2::InMemoryTextStorage text_storage;
+  display_helper::v2::TextSnapshotStorage storage(
+    {"display_session_current.json", "display_session_previous.json", "display_golden_restore.json"}, text_storage);
 
   auto snap = make_snapshot({{"A", "B"}});
   snap.m_hdr_states["A"] = display_device::HdrState::Enabled;
@@ -659,7 +656,7 @@ TEST(DisplayHelperV2FileStorage, LegacyFormatRoundTripWithLayouts) {
   EXPECT_TRUE(loaded->has_layout_data);
   EXPECT_EQ(loaded->layout_rotations, layouts);
   EXPECT_TRUE(codec::equal_snapshots_strict(loaded->snapshot, snap));
-  EXPECT_EQ(loaded->snapshot.m_origins, snap.m_origins);
+  EXPECT_TRUE(display_helper::v2::topology::equal_origins(loaded->snapshot.m_origins, snap.m_origins));
 
   EXPECT_TRUE(storage.remove(display_helper::v2::SnapshotTier::Golden));
   EXPECT_FALSE(storage.exists(display_helper::v2::SnapshotTier::Golden));
