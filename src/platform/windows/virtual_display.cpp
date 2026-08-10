@@ -927,16 +927,4 @@ namespace VDISPLAY {
     VDISPLAY_SUNSHINE::cleanup_retained_ensure_display();
     VDISPLAY_SUDOVDA::cleanup_retained_ensure_display();
   }
-
-  void cleanup_retained_ensure_display() {
-    if (!has_retained_ensure_display()) {
-      return;
-    }
-
-    ensure_display_result result {};
-    result.tracks_temporary_for_probe = true;
-    const auto uuid = persistentVirtualDisplayUuid();
-    std::memcpy(&result.temporary_guid, uuid.b8, sizeof(result.temporary_guid));
-    cleanup_ensure_display(result, true, true);
-  }
 }  // namespace VDISPLAY

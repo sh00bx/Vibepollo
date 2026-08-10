@@ -295,13 +295,6 @@ namespace VDISPLAY {
   void cleanup_retained_ensure_display();
 
   /**
-   * @brief Removes the retained encoder-probe temporary display, if any.
-   * @details Includes a display accepted by the driver before Windows publishes
-   * a monitor identity.
-   */
-  void cleanup_retained_ensure_display();
-
-  /**
    * @brief Returns true when ensure_display() is currently retaining a temporary display for probe retries.
    */
   bool has_retained_ensure_display();
