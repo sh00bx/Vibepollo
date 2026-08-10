@@ -1151,7 +1151,14 @@ namespace nvhttp {
             }
           }
         }
-        if (allow_display_changes) {
+        // virtual_display_recreated_on_demand belongs in this gate for the same
+        // reason it already gates should_apply_display_request further down: the
+        // resume path only sets it after it has proven there is no reusable
+        // virtual display, and without it the branch above announces a recreation
+        // that never happens. The reconnect-latency win of the
+        // same_app_already_running path is untouched — that path returns early
+        // from its preserve branch and never reaches this point.
+        if (allow_display_changes || launch_session->virtual_display_recreated_on_demand) {
           apply_framegen_refresh_policy(request_virtual_display);
 
           if (request_virtual_display) {
