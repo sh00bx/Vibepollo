@@ -82,8 +82,8 @@ namespace platf::playnite::sync {
     try {
       // Playnite allows several platforms per game (a title released on both PC
       // and console); the first one is the one clients group by.
-      if (!g.platforms.empty() && !g.platforms.front().empty()) {
-        app["playnite-platform"] = g.platforms.front();
+      if (!game.platforms.empty() && !game.platforms.front().empty()) {
+        app["playnite-platform"] = game.platforms.front();
       } else if (app.contains("playnite-platform")) {
         app.erase("playnite-platform");
       }
