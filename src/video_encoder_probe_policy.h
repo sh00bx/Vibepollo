@@ -49,6 +49,54 @@ namespace video::encoder_probe_policy {
     return owned_key;
   }
 
+  template<class adapter_t>
+  struct capture_output_t {
+    std::string display_name;
+    adapter_t adapter;
+  };
+
+  template<class adapter_t>
+  struct probe_output_choice_t {
+    std::string display_name;
+    adapter_t adapter;
+    bool from_fallback = false;
+  };
+
+  /**
+   * Choose the output an encoder probe runs on when a virtual display is
+   * pending. The adapter hint that scoped the search names the adapter the
+   * driver was asked to render on, not the one Windows enumerates the display
+   * under, so the scoped search is an optimisation rather than a requirement:
+   * when it comes up empty, probing any capture-ready output beats deferring
+   * the probe. The fallback then carries its OWN adapter — never the hint —
+   * so the post-initialization adapter check downstream agrees with what was
+   * actually probed. The fallback search is only performed when the scoped one
+   * fails, so a successful scoped probe costs no extra output enumeration.
+   */
+  template<class adapter_t, class resolve_fallback_output_t>
+  std::optional<probe_output_choice_t<adapter_t>> choose_probe_output(
+    const std::optional<capture_output_t<adapter_t>> &scoped_output,
+    resolve_fallback_output_t &&resolve_fallback_output
+  ) {
+    if (scoped_output) {
+      return probe_output_choice_t<adapter_t> {
+        .display_name = scoped_output->display_name,
+        .adapter = scoped_output->adapter,
+        .from_fallback = false,
+      };
+    }
+
+    const std::optional<capture_output_t<adapter_t>> fallback_output = resolve_fallback_output();
+    if (!fallback_output) {
+      return std::nullopt;
+    }
+    return probe_output_choice_t<adapter_t> {
+      .display_name = fallback_output->display_name,
+      .adapter = fallback_output->adapter,
+      .from_fallback = true,
+    };
+  }
+
   inline bool cache_key_matches(
     const cache_key_t &requested_key,
     const std::optional<cache_key_t> &cached_key

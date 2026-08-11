@@ -8,6 +8,7 @@
 namespace {
   using video::encoder_probe_policy::cache_key_matches;
   using video::encoder_probe_policy::cache_key_t;
+  using video::encoder_probe_policy::choose_probe_output;
   using video::encoder_probe_policy::own_successful_cache_key;
   using video::encoder_probe_policy::probe_observation_t;
 
@@ -16,6 +17,21 @@ namespace {
       .encoder_configuration = "encoder=nvenc|hevc=auto|av1=auto",
       .adapter_identity = std::move(adapter),
       .adapter_identity_resolved = true,
+    };
+  }
+
+  // The probe output policy is adapter-type agnostic; the identity string
+  // stands in for platf::adapter_id_t here.
+  using adapter_t = std::string;
+  using capture_output_t = video::encoder_probe_policy::capture_output_t<adapter_t>;
+
+  std::optional<capture_output_t> output(std::string display_name, adapter_t adapter) {
+    return capture_output_t {std::move(display_name), std::move(adapter)};
+  }
+
+  auto no_output() {
+    return []() {
+      return std::optional<capture_output_t> {std::nullopt};
     };
   }
 }  // namespace
@@ -93,4 +109,46 @@ TEST(EncoderProbePolicy, CapabilitiesRemainAssociatedWithObservedKey) {
   EXPECT_EQ(cached.second.hevc_mode, 3);
   EXPECT_TRUE(cached.second.hdr);
   EXPECT_FALSE(cache_key_matches(key("luid=amd"), cached.first));
+}
+
+TEST(EncoderProbeOutputPolicy, ScopedOutputWinsAndIsNotChargedForAFallbackSearch) {
+  bool fallback_searched = false;
+
+  const auto chosen = choose_probe_output<adapter_t>(
+    output("scoped-output", "luid=nvidia"),
+    [&]() {
+      fallback_searched = true;
+      return output("any-output", "luid=amd");
+    }
+  );
+
+  ASSERT_TRUE(chosen);
+  EXPECT_EQ(chosen->display_name, "scoped-output");
+  EXPECT_EQ(chosen->adapter, "luid=nvidia");
+  EXPECT_FALSE(chosen->from_fallback);
+  EXPECT_FALSE(fallback_searched);
+}
+
+TEST(EncoderProbeOutputPolicy, FallbackOutputCarriesItsOwnAdapterNotTheHint) {
+  // The regression this guards: at the logon screen the hinted render adapter
+  // owns no output while the display sits on another adapter. Probing that
+  // display under the hint's adapter would fail the downstream adapter check.
+  const auto chosen = choose_probe_output<adapter_t>(
+    std::optional<capture_output_t> {std::nullopt},
+    [&]() {
+      return output("any-output", "luid=igpu");
+    }
+  );
+
+  ASSERT_TRUE(chosen);
+  EXPECT_EQ(chosen->display_name, "any-output");
+  EXPECT_EQ(chosen->adapter, "luid=igpu");
+  EXPECT_TRUE(chosen->from_fallback);
+}
+
+TEST(EncoderProbeOutputPolicy, NoCaptureReadyOutputAtAllYieldsNoChoice) {
+  EXPECT_FALSE(choose_probe_output<adapter_t>(
+    std::optional<capture_output_t> {std::nullopt},
+    no_output()
+  ));
 }

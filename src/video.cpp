@@ -523,27 +523,32 @@ namespace video {
         // requirement. When it comes up empty, probe the display that is
         // actually there rather than deferring — and require the adapter that
         // really owns it, so the post-init adapter check downstream agrees.
-        struct probe_output_choice_t {
-          std::string display_name;
-          platf::adapter_id_t adapter;
-          bool from_fallback = false;
-        };
-        auto resolve_scoped_or_any_output = [&]() -> std::optional<probe_output_choice_t> {
-          if (const auto scoped_output = platf::dxgi::resolve_automatic_capture_output(
-                platf::mem_type_e::dxgi,
-                pending_adapter
-              )) {
-            return probe_output_choice_t {scoped_output->output_name, scoped_output->adapter_id, false};
-          }
-          const auto any_output = platf::dxgi::resolve_automatic_capture_output(platf::mem_type_e::dxgi);
-          if (!any_output) {
+        using probe_output_choice_t = encoder_probe_policy::probe_output_choice_t<platf::adapter_id_t>;
+        using capture_output_t = encoder_probe_policy::capture_output_t<platf::adapter_id_t>;
+        const auto as_capture_output =
+          [](const std::optional<platf::dxgi::capture_output_identity_t> &output) -> std::optional<capture_output_t> {
+          if (!output) {
             return std::nullopt;
           }
-          BOOST_LOG(info)
-            << "Pending virtual-display adapter " << adapter_cache_identity(pending_adapter)
-            << " has no capture output; probing " << any_output->output_name
-            << " on " << adapter_cache_identity(any_output->adapter_id) << " instead.";
-          return probe_output_choice_t {any_output->output_name, any_output->adapter_id, true};
+          return capture_output_t {output->output_name, output->adapter_id};
+        };
+        auto resolve_scoped_or_any_output = [&]() -> std::optional<probe_output_choice_t> {
+          auto chosen = encoder_probe_policy::choose_probe_output<platf::adapter_id_t>(
+            as_capture_output(platf::dxgi::resolve_automatic_capture_output(
+              platf::mem_type_e::dxgi,
+              pending_adapter
+            )),
+            [&]() {
+              return as_capture_output(platf::dxgi::resolve_automatic_capture_output(platf::mem_type_e::dxgi));
+            }
+          );
+          if (chosen && chosen->from_fallback) {
+            BOOST_LOG(info)
+              << "Pending virtual-display adapter " << adapter_cache_identity(pending_adapter)
+              << " has no capture output; probing " << chosen->display_name
+              << " on " << adapter_cache_identity(chosen->adapter) << " instead.";
+          }
+          return chosen;
         };
 
         std::optional<LUID> observed_adapter;
