@@ -73,7 +73,7 @@ using namespace std::literals;
 
 namespace nvhttp {
 
-  static constexpr std::string_view EMPTY_PROPERTY_TREE_ERROR_MSG = "Property tree is empty. Probably, control flow got interrupted by an unexpected C++ exception. This is a bug in Sunshine. Moonlight-qt will report Malformed XML (missing root element)."sv;
+  static constexpr std::string_view EMPTY_PROPERTY_TREE_ERROR_MSG = "Property tree is empty. Probably, control flow got interrupted by an unexpected C++ exception. This is a bug in Sunshine. The response guard answers 500 so the client reports a named failure instead of Malformed XML (missing root element)."sv;
 
   namespace fs = std::filesystem;
   namespace pt = boost::property_tree;
@@ -83,6 +83,30 @@ namespace nvhttp {
   using verified_client_t = std::optional<crypto::named_cert_t>;
 
   namespace {
+    /**
+     * @brief Guarantee a response tree carries a status_code before it is written.
+     *
+     * launch() and resume() arm a fail guard that writes `tree` on *every* exit,
+     * and each known path sets a status_code explicitly. A throw between the
+     * first tree.put() and that status_code — anywhere in the launch session,
+     * virtual display or probe work — would otherwise publish a <root> without
+     * the attribute, or no root at all. The client then reports malformed XML
+     * instead of a failure it can name. Explicit puts always win: they run long
+     * before the guard fires.
+     */
+    void ensure_response_status_code(pt::ptree &tree, int fallback_code, std::string_view fallback_message) {
+      if (tree.get_optional<int>("root.<xmlattr>.status_code")) {
+        return;
+      }
+
+      BOOST_LOG(error) << "Response left without a status_code; answering "sv << fallback_code
+                       << " ["sv << fallback_message << "]."sv;
+      // A status_message without a code is malformed in its own right, so set
+      // the pair rather than the code alone.
+      tree.put("root.<xmlattr>.status_code", fallback_code);
+      tree.put("root.<xmlattr>.status_message", std::string {fallback_message});
+    }
+
     std::int64_t now_seconds() {
       return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch()
@@ -3243,6 +3267,11 @@ namespace nvhttp {
       pt::ptree tree;
       bool revert_display_configuration = false;
       auto g = util::fail_guard([&]() {
+        if (tree.empty()) {
+          BOOST_LOG(error) << EMPTY_PROPERTY_TREE_ERROR_MSG;
+        }
+        ensure_response_status_code(tree, 500, "The launch failed unexpectedly"sv);
+
         std::ostringstream data;
 
         pt::write_xml(data, tree);
@@ -3812,6 +3841,7 @@ namespace nvhttp {
       if (tree.empty()) {
         BOOST_LOG(error) << EMPTY_PROPERTY_TREE_ERROR_MSG;
       }
+      ensure_response_status_code(tree, 500, "The resume failed unexpectedly"sv);
 
       pt::write_xml(data, tree);
       response->write(data.str());
