@@ -333,13 +333,29 @@ namespace nvhttp {
       }
 
 #ifdef _WIN32
-      // Startup probing already waits for the interactive desktop. Keep idle
-      // HTTP discovery on the same side of that boundary so a pre-login
-      // request cannot create a probe display that Windows cannot enumerate.
-      // Stream-initiated probing remains independent of this gate.
+      // This used to defer the idle probe until the input desktop was
+      // "Default", on the assumption that a pre-login request could only
+      // create a probe display Windows would refuse to enumerate. On this
+      // hardware that assumption does not hold: at the logon screen the
+      // driver creates the display, Windows enumerates it, and its
+      // duplication test passes in well under a frame.
+      //
+      // The assumption cost more than it bought. A client asking /serverinfo
+      // before anyone has logged in got no advertised encoder at all, so its
+      // first connection attempt always failed — and the only way through was
+      // to try again and let the stream path, which deliberately ignores this
+      // gate, do the probe instead. Sitting at the Windows logon screen and
+      // signing in over the stream is exactly what this host is for, so the
+      // probe now runs there too.
+      //
+      // Nothing downstream loses a guard by this: ready_for_probe() below
+      // still defers a target Windows has not given an identity to, and
+      // ensure_display()'s attempt budget is per call, so an idle probe
+      // cannot spend the budget a later launch depends on. Once a probe
+      // succeeds the cache answers subsequent polls, so this does not churn
+      // the display topology once per request.
       if (!platf::is_default_input_desktop_active()) {
-        BOOST_LOG(info) << "HTTP encoder capability probe deferred until the interactive desktop is ready.";
-        return publish(std::move(caps), false, "interactive-desktop");
+        BOOST_LOG(info) << "Probing encoder capabilities before the interactive desktop is ready.";
       }
 #endif
 
