@@ -513,6 +513,39 @@ namespace video {
       }
       if (pending_virtual_display_adapter_hint) {
         const auto pending_adapter = adapter_id_from_luid(*pending_virtual_display_adapter_hint);
+
+        // The hint names the adapter we asked the driver to render on, not the
+        // one Windows ends up enumerating the virtual display under. Those
+        // differ in practice: the same display shows up under the render GPU
+        // or under the iGPU depending on how DXGI happens to order adapters,
+        // and at the lock screen the render GPU can carry no output at all.
+        // Scoping the search to the hint is therefore an optimisation, not a
+        // requirement. When it comes up empty, probe the display that is
+        // actually there rather than deferring — and require the adapter that
+        // really owns it, so the post-init adapter check downstream agrees.
+        struct probe_output_choice_t {
+          std::string display_name;
+          platf::adapter_id_t adapter;
+          bool from_fallback = false;
+        };
+        auto resolve_scoped_or_any_output = [&]() -> std::optional<probe_output_choice_t> {
+          if (const auto scoped_output = platf::dxgi::resolve_automatic_capture_output(
+                platf::mem_type_e::dxgi,
+                pending_adapter
+              )) {
+            return probe_output_choice_t {scoped_output->output_name, scoped_output->adapter_id, false};
+          }
+          const auto any_output = platf::dxgi::resolve_automatic_capture_output(platf::mem_type_e::dxgi);
+          if (!any_output) {
+            return std::nullopt;
+          }
+          BOOST_LOG(info)
+            << "Pending virtual-display adapter " << adapter_cache_identity(pending_adapter)
+            << " has no capture output; probing " << any_output->output_name
+            << " on " << adapter_cache_identity(any_output->adapter_id) << " instead.";
+          return probe_output_choice_t {any_output->output_name, any_output->adapter_id, true};
+        };
+
         std::optional<LUID> observed_adapter;
         std::string_view observed_source;
         if (current_wgc_identity) {
@@ -538,22 +571,26 @@ namespace video {
           const bool reuse_observed_output =
             matches_pending && mapped_output_matches_adapter(*pending_virtual_display_adapter_hint);
           std::string probe_output;
+          auto probe_adapter = pending_adapter;
+          auto probe_identity = luid_cache_identity(*pending_virtual_display_adapter_hint);
+          std::string output_source = reuse_observed_output ? "-active-match" : "-automatic-output";
           if (reuse_observed_output) {
             probe_output = mapped_output;
-          } else if (const auto scoped_output = platf::dxgi::resolve_automatic_capture_output(
-                       platf::mem_type_e::dxgi,
-                       pending_adapter
-                     )) {
-            probe_output = scoped_output->output_name;
+          } else if (const auto chosen = resolve_scoped_or_any_output()) {
+            probe_output = chosen->display_name;
+            if (chosen->from_fallback) {
+              probe_adapter = chosen->adapter;
+              probe_identity = adapter_cache_identity(chosen->adapter);
+              output_source = "-fallback-output";
+            }
           }
           return probe_target_t {
             .display_name = std::move(probe_output),
-            .required_adapter = pending_adapter,
+            .required_adapter = probe_adapter,
             .adapter_identity = probe_adapter_identity_t {
-              .identity = luid_cache_identity(*pending_virtual_display_adapter_hint),
+              .identity = std::move(probe_identity),
               .source =
-                "pending-virtual-display-lookup-" + std::string(observed_source) +
-                (reuse_observed_output ? "-active-match" : "-automatic-output"),
+                "pending-virtual-display-lookup-" + std::string(observed_source) + output_source,
               .resolved = true,
             },
           };
@@ -563,20 +600,25 @@ namespace video {
         // producers replace it with the adapter returned by the initialized
         // probe display before update_probe_cache() is called.
         std::string probe_output;
-        if (const auto scoped_output = platf::dxgi::resolve_automatic_capture_output(
-              platf::mem_type_e::dxgi,
-              pending_adapter
-            )) {
-          probe_output = scoped_output->output_name;
+        auto probe_adapter = pending_adapter;
+        auto probe_identity = luid_cache_identity(*pending_virtual_display_adapter_hint);
+        std::string probe_source = pending_virtual_display_adapter_hint_ready_for_verification ?
+                                     "pending-virtual-display-adapter-awaiting-observation" :
+                                     "pending-virtual-display-adapter-before-publication";
+        if (const auto chosen = resolve_scoped_or_any_output()) {
+          probe_output = chosen->display_name;
+          if (chosen->from_fallback) {
+            probe_adapter = chosen->adapter;
+            probe_identity = adapter_cache_identity(chosen->adapter);
+            probe_source = "pending-virtual-display-adapter-fallback-output";
+          }
         }
         return probe_target_t {
           .display_name = std::move(probe_output),
-          .required_adapter = pending_adapter,
+          .required_adapter = probe_adapter,
           .adapter_identity = probe_adapter_identity_t {
-            .identity = luid_cache_identity(*pending_virtual_display_adapter_hint),
-            .source = pending_virtual_display_adapter_hint_ready_for_verification ?
-                        "pending-virtual-display-adapter-awaiting-observation" :
-                        "pending-virtual-display-adapter-before-publication",
+            .identity = std::move(probe_identity),
+            .source = std::move(probe_source),
             .resolved = true,
           },
         };
