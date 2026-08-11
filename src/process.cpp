@@ -1303,6 +1303,13 @@ namespace proc {
       const bool skip_display_revert = launch_session && launch_session->display_config_preapplied;
       terminate(false, false, skip_display_revert, true);
     }
+    // Our own terminate() above bumped the generation exactly once (it is the
+    // only bump on this path). Adopt that bump as ours, otherwise the deferred
+    // gate below would compare against a value we ourselves invalidated and
+    // treat every session as superseded. Accounting for exactly one bump keeps
+    // the fence intact: a *foreign* terminate()/execute() landing in the gap
+    // adds a bump of its own, so the gate still trips on it.
+    ++my_session_generation;
 
     {
       std::scoped_lock lk(_apps_mutex);
