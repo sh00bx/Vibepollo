@@ -221,7 +221,10 @@ namespace platf::ds5_bridge {
         std::memcpy(latest_frame_.data(), snap.data(), HAPTIC_BYTES);
         latest_ts_ = now;
         have_haptic_ = true;
-        if (hrms > ACTIVE_RMS) last_signal_ts_ = now;
+        if (hrms > ACTIVE_RMS) {
+          last_signal_ts_ = now;
+          coil_ever_.store(true, std::memory_order_relaxed);
+        }
         if (hrms > dbg_max_hrms_) dbg_max_hrms_ = hrms;
         dec_n_ = 0;
       }

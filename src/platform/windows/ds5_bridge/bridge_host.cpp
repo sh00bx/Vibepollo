@@ -423,6 +423,37 @@ namespace platf::ds5_bridge {
       if (!hello_seen_.load(std::memory_order_relaxed)) return;  // pre-handshake: drop (state refreshes)
       uint8_t common[USB_OUTPUT_COMMON_LEN];
       std::memcpy(common, eff, USB_OUTPUT_COMMON_LEN);
+      // ---- Rumble-vs-haptics flag override -----------------------------------
+      // valid_flag0 bit0 = RUMBLE_EMULATION (motor bytes valid), bit1 =
+      // USE_RUMBLE_NOT_HAPTICS (drive the coils from the motor emulation and
+      // IGNORE the 0x12 audio-coil block).
+      //
+      // Some titles assert bit1 permanently while delivering their entire
+      // vibration as HD-haptic PCM on the audio endpoint's ch2/3 and never
+      // writing a motor value at all (AC4 Resynced measured: 55/55 outputs
+      // motors=00/00, bit1 in 21 of them, coil RMS up to 0.72). Taken at face
+      // value the flag tells the pad to ignore exactly the data the game is
+      // sending, and the pad falls silent: the 0x13 speaker block still plays,
+      // the 0x12 coil block does not. The precedent is in our own notes —
+      // Cyberpunk's "classic rumble" is likewise 0 and its vibration IS the HD
+      // haptic; haptic routing is per-title and must never be generalised.
+      //
+      // So override the flag only where it contradicts the game's own data:
+      // this title has fed real coil energy AND this report carries no motor
+      // value. A report that does carry one passes through untouched with the
+      // flag intact, so a title that genuinely wants motor rumble is unaffected
+      // — and because the gate is per-report, the override corrects itself the
+      // moment the game starts driving the motors.
+      const uint8_t raw_f0 = common[0];  // pre-override, for the diagnostic
+      const bool motors_idle = (common[2] | common[3]) == 0;
+      const bool coil_title = hap_ && haptics_on_.load(std::memory_order_relaxed) &&
+                              hap_->coil_ever_active();
+      const bool rumble_flag_override = coil_title && motors_idle && (common[0] & 0x03) != 0;
+      if (rumble_flag_override) {
+        // Clear both bits: with zero motors, RUMBLE_EMULATION only re-asserts a
+        // zero rumble, and leaving it set keeps the emulation owning the coils.
+        common[0] &= (uint8_t) ~0x03;
+      }
       // The HELLO-time lightbar-setup release can arrive before the pad has
       // switched to extended BT mode (the 0x05/0x09/0x20 feature reads do the
       // unlock, asynchronously). Fold the release into the game's own reports
@@ -456,16 +487,35 @@ namespace platf::ds5_bridge {
       const bool lb_write = (common[1] & 0x04) != 0;
       const bool rgb_changed = lb_write && (common[44] != dbg_rgb_[0] || common[45] != dbg_rgb_[1] || common[46] != dbg_rgb_[2]);
       if (lb_write) { dbg_rgb_[0] = common[44]; dbg_rgb_[1] = common[45]; dbg_rgb_[2] = common[46]; }
+      // Everything except the lightbar colour: flags, motors and the two trigger
+      // effect modes (common[10] / common[21] head the 11-byte FFB blocks).
+      // The RGB rule alone samples this at whatever phase the bar animation
+      // happens to run at, which is how "motors=00/00" looked like a fact when
+      // it was 55 samples of an unrelated trigger — a motor or trigger write
+      // between two colour changes was invisible. Log the non-colour fields on
+      // their OWN change, throttled only enough to survive a title that
+      // animates trigger effects per report.
+      const uint64_t dbg_sig = ((uint64_t) raw_f0) | ((uint64_t) common[1] << 8) |
+                               ((uint64_t) common[38] << 16) | ((uint64_t) common[2] << 24) |
+                               ((uint64_t) common[3] << 32) | ((uint64_t) common[10] << 40) |
+                               ((uint64_t) common[21] << 48) | ((uint64_t) common[43] << 56);
+      const bool sig_changed = dbg_sig != dbg_sig_;
+      dbg_sig_ = dbg_sig;
       const int64_t dbg_now = now_ms();
       if (dbg_out_n_.load(std::memory_order_relaxed) < 10 ||
+          (sig_changed && dbg_now - dbg_sig_log_ms_ >= 250) ||
           (rgb_changed && dbg_now - dbg_rgb_log_ms_ >= 1000)) {
         dbg_out_n_.fetch_add(1, std::memory_order_relaxed);
-        dbg_rgb_log_ms_ = dbg_now;
-        char msg[128];
+        if (sig_changed) dbg_sig_log_ms_ = dbg_now;
+        if (rgb_changed) dbg_rgb_log_ms_ = dbg_now;
+        char msg[192];
         std::snprintf(msg, sizeof(msg),
-                      "ds5-out: f0=%02x f1=%02x f2=%02x motors=%02x/%02x setup=%02x pled=%02x rgb=%02x%02x%02x",
-                      common[0], common[1], common[38], common[2], common[3],
-                      common[41], common[43], common[44], common[45], common[46]);
+                      "ds5-out: f0=%02x f1=%02x f2=%02x motors=%02x/%02x rt=%02x lt=%02x "
+                      "setup=%02x pled=%02x rgb=%02x%02x%02x%s",
+                      raw_f0, common[1], common[38], common[2], common[3],
+                      common[10], common[21],
+                      common[41], common[43], common[44], common[45], common[46],
+                      rumble_flag_override ? " [haptics-override]" : "");
         BOOST_LOG(info) << msg;
       }
       uint8_t bt[BT_OUTPUT_LEN];
@@ -909,6 +959,11 @@ namespace platf::ds5_bridge {
     std::atomic<uint32_t> dbg_out_n_ {0};
     uint8_t dbg_rgb_[3] {};
     int64_t dbg_rgb_log_ms_ {0};
+    // Non-colour output fields (flags/motors/triggers/player LEDs), packed, so a
+    // change in any of them logs on its own instead of only when the lightbar
+    // animation happens to tick. Touched on the usbip output thread only.
+    uint64_t dbg_sig_ {~0ull};
+    int64_t dbg_sig_log_ms_ {0};
     // Set on the first post-HELLO inbound frame; gates the unreliable 0x36
     // stream so it cannot outrun a lost HOST_CONFIG (see on_message).
     std::atomic<bool> client_ready_ {false};

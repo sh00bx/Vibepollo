@@ -170,6 +170,17 @@ namespace platf::ds5_bridge {
     /// separately and rarely. Always fills @p out and signs it.
     void build_setstate_0x32(uint8_t out[DS5_0X32_LEN]);
 
+    /// Whether this title has ever fed above-squelch voice-coil energy, i.e.
+    /// whether it renders HD haptics at all. Latches for the session: a title
+    /// that drives the coils keeps doing so, and the burst structure of real
+    /// haptics (seconds of silence between effects) would make a sliding window
+    /// flap. Used by the 0x31 path to decide whether the game's
+    /// USE_RUMBLE_NOT_HAPTICS flag contradicts its own audio (see
+    /// bridge_host.cpp::on_game_output). Safe from any thread.
+    bool coil_ever_active() const {
+      return coil_ever_.load(std::memory_order_relaxed);
+    }
+
     /// Rate-servo hook (pacer thread): the live pacer period. The speaker
     /// resample ratio follows it so production == consumption at any servo
     /// setting (audio-clock recovery; no systematic PLC or ring growth).
@@ -217,7 +228,7 @@ namespace platf::ds5_bridge {
     // (A FIFO ring was tried while the feed still flooded at ~150x real-time;
     // it only reshuffled the incoherent flood.)
     static constexpr int HAPTIC_BYTES = 64;
-    std::mutex hap_mtx_;
+    mutable std::mutex hap_mtx_;
     std::array<int8_t, HAPTIC_BYTES> latest_frame_ {};  // newest coil snapshot
     // Previous snapshot, kept only for the batched form: a 0x39 needs TWO
     // consecutive coil blocks (21.33 ms of signal). Sending the latest one twice
@@ -230,6 +241,10 @@ namespace platf::ds5_bridge {
     std::chrono::steady_clock::time_point latest_ts_ {};       // when it was produced
     std::chrono::steady_clock::time_point last_signal_ts_ {};  // last above-squelch block
     bool have_haptic_ = false;
+    // Latched once any block clears ACTIVE_RMS — "this title renders HD
+    // haptics". Read from the usbip output thread, so it is an atomic rather
+    // than hap_mtx_-guarded state (the 0x31 path must not block on the feed).
+    std::atomic<bool> coil_ever_ {false};
 
     // A snapshot older than this = the feed stalled (endpoint closed / paused);
     // zero the coil so it stops buzzing the last frame. Generous vs the ~10.67 ms
