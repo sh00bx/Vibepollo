@@ -431,8 +431,21 @@ namespace platf::ds5_bridge {
         srms += (double) pcm_f[i] * pcm_f[i];
       }
       srms = std::sqrt(srms / (OPUS_FRAME * 2));
+      // last_pcm_f_ keeps the CLEAN frame on purpose: concealment continues the
+      // signal, not the resume ramp that sits on top of it below.
       std::memcpy(last_pcm_f_.data(), pcm_f, sizeof(pcm_f));
+      // Arm the ramp on the seam OUT of concealment.
+      if (plc_run_ > 0) spk_resume_left_ = SPK_RESUME_RAMP;
       plc_run_ = 0;
+      const float from = spk_env_;
+      for (int i = 0; i < OPUS_FRAME && spk_resume_left_ > 0; ++i) {
+        const float t = 1.0f - (float) spk_resume_left_ / (float) SPK_RESUME_RAMP;
+        spk_env_ = from + (1.0f - from) * t;
+        pcm_f[i * 2] *= spk_env_;
+        pcm_f[i * 2 + 1] *= spk_env_;
+        spk_resume_left_--;
+      }
+      spk_env_ = 1.0f;  // the rest of the frame, and every clean frame, is unity
       // Activity keys on AMPLITUDE, not on buffer state: usbaudio streams
       // digital silence continuously whenever any session holds the endpoint
       // open, so "a frame was popped" is true forever. Un-gated, that kept
@@ -448,8 +461,23 @@ namespace platf::ds5_bridge {
       float g = 1.0f;
       for (int k = 0; k <= plc_run_; ++k) g *= 0.6f;
       if (g < 0.02f) g = 0.0f;
-      for (int i = 0; i < OPUS_FRAME * 2; ++i) pcm_f[i] = last_pcm_f_[i] * g;
+      // Slide from wherever the envelope stands to this frame's decay target
+      // instead of stepping onto it. The old code applied g flat across all 480
+      // samples, so entering concealment from a clean frame was a 1.0 -> 0.6
+      // jump — the same class of click as the resume seam, just quieter.
+      const float from = spk_env_;
+      for (int i = 0; i < OPUS_FRAME; ++i) {
+        const float t = (float) (i + 1) / (float) OPUS_FRAME;
+        const float e = from + (g - from) * t;
+        pcm_f[i * 2] = last_pcm_f_[i * 2] * e;
+        pcm_f[i * 2 + 1] = last_pcm_f_[i * 2 + 1] * e;
+      }
+      spk_env_ = g;
       plc_run_++;
+      // Abandon any resume ramp in flight: an underrun inside the 5 ms window
+      // means concealment owns the envelope again, and it now picks it up from
+      // exactly where the ramp had got to.
+      spk_resume_left_ = 0;
       dbg_spk_plc_.fetch_add(1, std::memory_order_relaxed);
     }
     if (enc_) {

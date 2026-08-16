@@ -306,6 +306,20 @@ namespace platf::ds5_bridge {
     ::OpusEncoder *enc_ = nullptr;                          // persistent, 48k/2ch/CELT
     std::array<float, OPUS_FRAME * 2> last_pcm_f_ {};       // PLC source (last good frame)
     int plc_run_ = 0;                                       // consecutive underruns
+    // Speaker gain envelope. Both seams around a dropout used to be steps:
+    // concealment jumped straight to 0.6 on entry, and the first real frame
+    // after it came back at FULL gain. Measured on the modelled envelope, the
+    // resume seam was a 1.0 discontinuity and the entry a 0.4 one — on a link
+    // that produces dropouts in storms (529 dropped frames in one 19-min
+    // session), i.e. an audible click at both ends of every one of them.
+    //
+    // spk_env_ is the gain the LAST emitted sample carried. Concealment now
+    // interpolates from it to its decay target across the frame, and recovery
+    // ramps from it back to 1.0 over SPK_RESUME_RAMP samples. Neither branch
+    // can produce a jump because both start where the other stopped.
+    static constexpr int SPK_RESUME_RAMP = 240;             // samples/ch (~5 ms @ 48k)
+    float spk_env_ = 1.0f;                                  // gain at the end of the last frame
+    int spk_resume_left_ = 0;                               // samples/ch of resume ramp remaining
     std::chrono::steady_clock::time_point last_spk_ts_ {};  // last frame popped (idle gate)
 
     void spk_push(const int16_t *pcm4, size_t nframe);  // extract ch0/1, resample, ring-push (feed thread)
