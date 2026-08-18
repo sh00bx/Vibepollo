@@ -132,7 +132,9 @@ namespace tpmouse {
     // remainders are carried so slow, precise movement is not truncated away.
     void move_pointer_locked(int dx, int dy) {
       float mag = std::hypot((float) dx, (float) dy);
-      float accel = 0.55f + std::min(mag * 0.075f, 2.1f);
+      // Tuned down after on-device use: lower floor for precise small motion,
+      // gentler slope and cap so fast swipes don't overshoot.
+      float accel = 0.32f + std::min(mag * 0.04f, 1.15f);
       float gain = accel * (float) speed_percent() / 100.0f;
       st.acc_x += (float) dx * gain;
       st.acc_y += (float) dy * gain;
