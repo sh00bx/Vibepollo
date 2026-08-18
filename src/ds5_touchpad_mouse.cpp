@@ -59,6 +59,10 @@ namespace tpmouse {
       bool gesture_clicked {false};  // physical click happened during this contact
       float acc_x {0.f}, acc_y {0.f};
       int scroll_acc {0};
+      // Pointer velocity tracking (libinput-style, see move_pointer_locked)
+      std::chrono::steady_clock::time_point last_move_time {};
+      bool have_move_time {false};
+      double velocity_ema {0.0};  // device units per µs, smoothed
       // SDL path: map moonlight pointerId -> slot
       uint32_t ptr_id[2] {0, 0};
       bool ptr_used[2] {false, false};
@@ -125,19 +129,78 @@ namespace tpmouse {
       st.gesture_clicked = false;
       st.acc_x = st.acc_y = 0.f;
       st.scroll_acc = 0;
+      st.velocity_ema = 0.0;
+      st.have_move_time = false;
       st.ptr_used[0] = st.ptr_used[1] = false;
     }
 
-    // Pointer motion with a light, speed-dependent acceleration. Fractional
-    // remainders are carried so slow, precise movement is not truncated away.
+    /* Pointer motion: a faithful port of libinput's touchpad acceleration
+     * (filter-touchpad.c touchpad_accel_profile_linear), which is what makes
+     * this same pad feel precise under Linux with default settings:
+     *  - deceleration below a nominal 7 mm/s down to factor 0.3 (subpixel
+     *    precision for small corrections),
+     *  - a flat 0.9 plateau up to 130 mm/s (predictable 1:1-feel — the part
+     *    an "accelerate everything" curve gets wrong),
+     *  - a soft curve above, capped at 4x the threshold,
+     *  - everything times TP_MAGIC_SLOWDOWN (0.2968).
+     * Parameters as libinput resolves them for THIS pad: hid-playstation sets
+     * no resolution and no hwdb/quirk entry exists, so libinput assumes a
+     * 69x50 mm pad => res_x = 1920/69 = 27, res_y = 1080/50 = 21 units/mm
+     * (integer division, as libinput does it); y is rescaled to the x axis
+     * (27/21). The accel filter runs at DEFAULT_MOUSE_DPI = 1000, where
+     * normalize_for_dpi() is the identity, and "mm/s" in the profile is the
+     * nominal units-as-1000dpi-counts speed, not physical mm. Bluetooth pads
+     * get libinput's delta smoothener: an event interval below 50 ms is
+     * REPLACED by 10 ms for the velocity estimate — at a 250 Hz report rate
+     * that substitution dominates the feel, so it is kept verbatim.
+     * Velocity is EMA-smoothed as a stand-in for libinput's tracker set plus
+     * Simpson's-rule factor integration. Fractional remainders are carried so
+     * slow movement is not truncated away. */
     void move_pointer_locked(int dx, int dy) {
-      float mag = std::hypot((float) dx, (float) dy);
-      // Tuned down after on-device use: lower floor for precise small motion,
-      // gentler slope and cap so fast swipes don't overshoot.
-      float accel = 0.32f + std::min(mag * 0.04f, 1.15f);
-      float gain = accel * (float) speed_percent() / 100.0f;
-      st.acc_x += (float) dx * gain;
-      st.acc_y += (float) dy * gain;
+      constexpr double TP_MAGIC_SLOWDOWN = 0.2968;
+      constexpr double BASELINE = 0.9;
+      constexpr double THRESHOLD_MM_S = 130.0;   // nominal, see above
+      constexpr double DECEL_LIMIT_MM_S = 7.0;
+      constexpr double SMOOTH_THRESHOLD_US = 50000.0;
+      constexpr double SMOOTH_VALUE_US = 10000.0;
+      constexpr double XY_SCALE = 27.0 / 21.0;
+      constexpr double EMA_ALPHA = 0.3;
+
+      auto now = std::chrono::steady_clock::now();
+      double dys = (double) dy * XY_SCALE;
+
+      double dt_us = SMOOTH_VALUE_US;
+      if (st.have_move_time) {
+        dt_us = (double) std::chrono::duration_cast<std::chrono::microseconds>(
+                  now - st.last_move_time)
+                  .count() +
+                1.0;
+        if (dt_us < SMOOTH_THRESHOLD_US) {
+          dt_us = SMOOTH_VALUE_US;
+        }
+      }
+      st.last_move_time = now;
+      st.have_move_time = true;
+
+      double v = std::hypot((double) dx, dys) / dt_us;  // units/µs
+      st.velocity_ema += EMA_ALPHA * (v - st.velocity_ema);
+
+      // units/µs -> nominal mm/s at 1000 dpi: *1e6 (per s) * 25.4/1000
+      double speed_in = st.velocity_ema * 25400.0;
+      double factor;
+      if (speed_in < DECEL_LIMIT_MM_S) {
+        factor = std::min(BASELINE, 0.1 * speed_in + 0.3);
+      } else if (speed_in < THRESHOLD_MM_S) {
+        factor = BASELINE;
+      } else {
+        double capped = std::min(speed_in, THRESHOLD_MM_S * 4.0);
+        factor = 0.0025 * (capped / THRESHOLD_MM_S) * (capped - THRESHOLD_MM_S) + BASELINE;
+      }
+      factor *= (double) speed_percent() / 100.0;
+      factor *= TP_MAGIC_SLOWDOWN;
+
+      st.acc_x += (float) ((double) dx * factor);
+      st.acc_y += (float) (dys * factor);
       int out_x = (int) st.acc_x;
       int out_y = (int) st.acc_y;
       if (out_x != 0 || out_y != 0) {
@@ -229,6 +292,11 @@ namespace tpmouse {
     void set_contact_locked(int slot, bool down, uint8_t id, int x, int y) {
       contact_t &c = st.c[slot];
       bool fresh = down && (!c.down || c.id != id);
+      if (fresh) {
+        // libinput resets its velocity trackers when a touch begins.
+        st.velocity_ema = 0.0;
+        st.have_move_time = false;
+      }
       c.down = down;
       c.id = id;
       if (fresh) {
