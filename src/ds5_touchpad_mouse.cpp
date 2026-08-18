@@ -19,6 +19,9 @@
 #include "logging.h"
 #include "platform/common.h"
 #include "process.h"
+#ifdef _WIN32
+  #include "platform/windows/playnite_integration.h"
+#endif
 
 using namespace std::chrono_literals;
 
@@ -93,9 +96,19 @@ namespace tpmouse {
       if (mode == "always") {
         return true;
       }
-      // "auto": only while the streamed app launches nothing itself — a bare
-      // desktop session. The moment a game app runs, the touchpad belongs to
-      // the game.
+      // "auto": only while no game is actually running. Two signals, because
+      // the launched moonlight app alone is not enough — a Desktop session
+      // with a game started from inside it (the normal Playnite flow here)
+      // still says "Desktop":
+      // 1. Playnite's live gameStarted/gameStopped status. Authoritative for
+      //    every Playnite-managed launch, no matter how the stream began.
+#ifdef _WIN32
+      if (platf::playnite::get_active_game_status().active) {
+        return false;
+      }
+#endif
+      // 2. The streamed app's own metadata: anything that launches something
+      //    (cmd, Playnite target, detached) owns the touchpad.
       if (proc::proc.running() == 0) {
         // No app at all: no active stream is feeding us anyway; allow, so the
         // brief window during session start behaves like the desktop it shows.
