@@ -2998,6 +2998,12 @@ namespace proc {
     return _app.uuid;
   }
 
+  bool proc_t::running_app_launches_nothing() {
+    // Same cross-thread _app reader situation as get_running_app_uuid().
+    std::scoped_lock lk(_apps_mutex);
+    return _app.cmd.empty() && _app.playnite_id.empty() && _app.detached.empty();
+  }
+
   bp::environment proc_t::get_env() {
     return _env;
   }

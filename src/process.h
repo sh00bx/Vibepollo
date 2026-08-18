@@ -222,6 +222,13 @@ namespace proc {
     std::optional<ctx_t> resolve_app(int app_id) const;
     std::string get_last_run_app_name();
     std::string get_running_app_uuid();
+
+    /**
+     * @brief True when the currently assigned app launches nothing itself —
+     * no cmd, no Playnite target, no detached commands. That is a bare
+     * desktop-stream session (used to gate DS5 touchpad-mouse synthesis).
+     */
+    bool running_app_launches_nothing();
     bp::environment get_env();
     void resume();
     void pause(bool stream_lifecycle_lock_held = false);

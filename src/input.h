@@ -20,6 +20,13 @@ namespace input {
   struct touch_port_t;
 
   void print(void *input);
+
+  /**
+   * @brief The process-wide platform input context (SendInput on Windows).
+   * For synthesized host input from outside the stream input pipeline
+   * (DS5 touchpad-mouse). Valid after input::init().
+   */
+  platf::input_t &raw_platf_input();
   void reset(std::shared_ptr<input_t> &input);
   void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data, const crypto::PERM &permission);
 

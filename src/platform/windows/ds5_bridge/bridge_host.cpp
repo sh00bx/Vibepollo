@@ -24,6 +24,7 @@
 #include <boost/asio/ip/address.hpp>
 #include <enet/enet.h>
 
+#include "src/ds5_touchpad_mouse.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/platform/windows/ds5_bridge/bridge_host.h"
@@ -177,6 +178,10 @@ namespace platf::ds5_bridge {
             uint8_t usb[INPUT_REPORT_LEN];
             if (bt_input_to_usb(payload, h->payload_len, usb)) {
               usbip_->set_input(slot_, usb);
+              // Desktop touchpad-mouse tap. Cheap no-op while a game is
+              // streamed; the raw report above reaches the virtual pad
+              // unchanged either way.
+              tpmouse::feed_usb_report(usb, sizeof(usb));
             }
           }
           break;

@@ -433,6 +433,17 @@ namespace config {
     // this the bar stays dark. The bridge paints this color until a game
     // writes a non-black color of its own (which then owns the lightbar).
     std::string lightbar_color {"0000ff"};
+
+    // DS5 touchpad as a desktop mouse. "auto" synthesizes host mouse input from
+    // the touchpad only while the streamed app launches nothing itself (a bare
+    // desktop session) — a launched game keeps the raw touchpad to itself.
+    // "always" / "off" override. Applies to bridge-forwarded pads and to
+    // moonlight controller-touch events (SDL-mode pads).
+    std::string touchpad_mouse {"auto"};
+    // Pointer speed in percent (10..400).
+    int touchpad_mouse_speed {100};
+    // Two-finger scroll direction: content follows the fingers when true.
+    bool touchpad_mouse_natural_scroll {false};
   };
 
   namespace flag {

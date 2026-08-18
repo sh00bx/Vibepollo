@@ -2015,6 +2015,9 @@ namespace config {
       bool_f(vars, "ds5_native_audio_batched", ds5b.native_audio_batched);
       int_f(vars, "ds5_native_audio_cushion_frames", ds5b.native_audio_cushion_frames);
       string_f(vars, "ds5_lightbar_color", ds5b.lightbar_color);
+      string_f(vars, "ds5_touchpad_mouse", ds5b.touchpad_mouse);
+      int_between_f(vars, "ds5_touchpad_mouse_speed", ds5b.touchpad_mouse_speed, {10, 400});
+      bool_f(vars, "ds5_touchpad_mouse_natural_scroll", ds5b.touchpad_mouse_natural_scroll);
     }
 
     path_f(vars, "pkey", nvhttp.pkey);

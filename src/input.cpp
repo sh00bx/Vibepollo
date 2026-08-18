@@ -25,6 +25,7 @@ extern "C" {
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
+#include "ds5_touchpad_mouse.h"
 #include "mouse_input.h"
 #include "platform/common.h"
 #include "thread_pool.h"
@@ -115,6 +116,10 @@ namespace input {
   static std::array<std::uint8_t, 5> mouse_press {};
 
   static platf::input_t platf_input;
+
+  platf::input_t &raw_platf_input() {
+    return platf_input;
+  }
   class platform_mouse_backend_t: public mouse_input::backend_t {
   public:
     explicit platform_mouse_backend_t(platf::input_t &input):
@@ -1185,6 +1190,17 @@ namespace input {
     auto &gamepad = input->gamepads[packet->controllerNumber];
     if (gamepad.id < 0) {
       BOOST_LOG(warning) << "ControllerNumber ["sv << packet->controllerNumber << "] not allocated"sv;
+      return;
+    }
+
+    // Desktop touchpad-mouse: while no game is streamed, SDL-mode pads get
+    // their touch events turned into host mouse input here (the emulated pad
+    // either has no touchpad at all, x360, or the desktop ignores it). Games
+    // get the normal passthrough below.
+    if (tpmouse::feed_touch_event(packet->eventType,
+                                  util::endian::little(packet->pointerId),
+                                  from_clamped_netfloat(packet->x, 0.0f, 1.0f),
+                                  from_clamped_netfloat(packet->y, 0.0f, 1.0f))) {
       return;
     }
 
