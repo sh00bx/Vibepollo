@@ -42,6 +42,9 @@ namespace platf::ds5_bridge {
     // The client sends it ONLY when HOST_CONFIG advertised
     // CTMB_HOSTCFG_PACE_FEEDBACK, so a legacy/CTM host never sees the type.
     CTMB_MSG_PACE_FEEDBACK = 11,
+    // TV -> host: user preference for the DS5 touchpad-mouse synthesis
+    // (ds5_touchpad_mouse). Sent once after the HOST_CONFIG handshake.
+    CTMB_MSG_TPMOUSE = 12,
   };
 
   // ctmb_host_config_t.reserved[0] capability bits (0 on a CTM host).
@@ -95,6 +98,16 @@ namespace platf::ds5_bridge {
     uint8_t paced_report_ids[16];
     uint8_t reserved[31];
   };
+
+  // CTMB_MSG_TPMOUSE payload. mode: 0=off, 1=auto, 2=always.
+#pragma pack(push, 1)
+
+  struct ctmb_tpmouse_t {
+    uint8_t mode;
+    uint8_t reserved[7];
+  };
+
+#pragma pack(pop)
 
   // CTMB_MSG_PACE_FEEDBACK payload: a snapshot of the TV daemon's raw-ACL
   // inject queue for this pad's link (published by ds5_txd, forwarded by the

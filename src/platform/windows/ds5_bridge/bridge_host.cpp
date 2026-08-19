@@ -199,6 +199,13 @@ namespace platf::ds5_bridge {
         case CTMB_MSG_PACE_FEEDBACK:
           on_pace_feedback(h, payload);
           break;
+        case CTMB_MSG_TPMOUSE:
+          if (h->payload_len >= sizeof(ctmb_tpmouse_t)) {
+            ctmb_tpmouse_t tp;
+            std::memcpy(&tp, payload, sizeof(tp));
+            tpmouse::set_client_mode(tp.mode <= 2 ? (int) tp.mode : 1);
+          }
+          break;
         default:
           break;  // LOG/ERROR/ENUM/etc. — not used by the DS5 path
       }

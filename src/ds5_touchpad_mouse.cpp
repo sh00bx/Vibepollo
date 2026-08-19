@@ -78,6 +78,9 @@ namespace tpmouse {
     std::atomic<int> gate_cache {-1};
     std::atomic<int64_t> gate_stamp_ms {0};
 
+    // Client preference (CTMB_MSG_TPMOUSE); -1 = none, fall back to config.
+    std::atomic<int> client_mode {-1};
+
     int64_t now_ms() {
       return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -85,16 +88,27 @@ namespace tpmouse {
     }
 
     bool evaluate_gate() {
-      std::string mode;
-      {
-        std::lock_guard lk(config::ds5b_mutex);
-        mode = config::ds5b.touchpad_mouse;
-      }
-      if (mode == "off") {
+      // The TV client's setting wins over the host config: the TV UI is where
+      // the user actually flips this, and it re-asserts every session.
+      int cm = client_mode.load(std::memory_order_relaxed);
+      if (cm == 0) {
         return false;
       }
-      if (mode == "always") {
+      if (cm == 2) {
         return true;
+      }
+      if (cm < 0) {
+        std::string mode;
+        {
+          std::lock_guard lk(config::ds5b_mutex);
+          mode = config::ds5b.touchpad_mouse;
+        }
+        if (mode == "off") {
+          return false;
+        }
+        if (mode == "always") {
+          return true;
+        }
       }
       // "auto": only while no game is actually running. Two signals, because
       // the launched moonlight app alone is not enough — a Desktop session
@@ -342,6 +356,16 @@ namespace tpmouse {
       }
     }
     return gate_cache.load(std::memory_order_relaxed) == 1;
+  }
+
+  void set_client_mode(int mode) {
+    int prev = client_mode.exchange(mode, std::memory_order_relaxed);
+    if (prev != mode) {
+      BOOST_LOG(info) << "tpmouse: client preference "
+                      << (mode == 0 ? "off" : mode == 2 ? "always" : mode == 1 ? "auto" : "cleared");
+      // Re-evaluate on the next feed instead of waiting out the cache.
+      gate_cache.store(-1, std::memory_order_relaxed);
+    }
   }
 
   void feed_usb_report(const uint8_t *usb, size_t len) {

@@ -39,4 +39,11 @@ namespace tpmouse {
    */
   bool active();
 
+  /**
+   * @brief The streaming client's preference (CTMB_MSG_TPMOUSE): 0=off,
+   * 1=auto, 2=always, -1 clears back to the ds5_touchpad_mouse config value.
+   * The client re-asserts it every session, so it is never persisted here.
+   */
+  void set_client_mode(int mode);
+
 }  // namespace tpmouse
