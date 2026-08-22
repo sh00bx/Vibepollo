@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <sstream>
 #include <system_error>
 #include <thread>
@@ -2407,6 +2408,14 @@ namespace video {
   std::atomic<std::int64_t> last_negative_hdr_advertisement_probe_ns {0};
   std::mutex encoder_probe_mutex;
 
+  // Serializes encoder probing against active video capture. A probe rewrites
+  // chosen_encoder, the active HEVC/AV1 modes and the per-encoder capability
+  // records as one unit, while a running capture keeps reading all of them for as
+  // long as the stream lives. Capture holds this shared, the probe takes it
+  // exclusively. encoder_probe_mutex above only keeps probes from overlapping each
+  // other and says nothing about capture.
+  static std::shared_timed_mutex encoder_state_mutex;
+
   namespace {
     struct encoder_probe_status_t {
       bool attempted = false;
@@ -2494,11 +2503,21 @@ namespace video {
     const bool probe_before_negative,
     bool *probe_complete
   ) {
+    // Take the published capability snapshot under the shared side of the encoder
+    // state lock, so nothing is advertised while a probe is still half applied.
+    // Every read locks and unlocks on its own: the lock must not span the
+    // probe_encoders() calls below, because the probe takes the same mutex
+    // exclusively and a thread that already held it shared would deadlock on itself.
+    const auto read_probe_status = [](const auto &key) {
+      std::shared_lock<std::shared_timed_mutex> encoder_state_lock {encoder_state_mutex};
+      return encoder_probe_status_for_key(key);
+    };
+
     auto current_key = build_probe_cache_key();
-    auto probe_status = encoder_probe_status_for_key(current_key);
+    auto probe_status = read_probe_status(current_key);
     const auto refresh_probe_status = [&]() {
       current_key = build_probe_cache_key();
-      probe_status = encoder_probe_status_for_key(current_key);
+      probe_status = read_probe_status(current_key);
     };
 
     if (probe_before_negative && !probe_status.successful && !probe_status.attempted) {
@@ -5845,7 +5864,15 @@ namespace video {
     config_t config,
     void *channel_data
   ) {
-    // Snapshot the encoder pointer to avoid races with concurrent probe_encoders() calls
+    // Hold the encoder state shared for the entire life of this capture. Both
+    // branches below block until the stream ends, and the capture threads they
+    // drive keep reading chosen_encoder, the active HEVC/AV1 modes and the encoder
+    // capability records the whole time. probe_encoders() takes the same lock
+    // exclusively, so it now waits for capture to finish instead of rewriting that
+    // state underneath it -- a pointer snapshot only ever protected the
+    // dereference, never the records sitting next to it.
+    std::shared_lock<std::shared_timed_mutex> encoder_state_lock {encoder_state_mutex};
+
     auto *encoder = chosen_encoder;
     if (!encoder) {
       BOOST_LOG(error) << "No encoder available for capture"sv;
@@ -6271,6 +6298,16 @@ namespace video {
 
   int probe_encoders() {
     std::lock_guard<std::mutex> lock(encoder_probe_mutex);
+    // Wait a bounded moment for every active capture to release the encoder state,
+    // then refuse rather than rewrite it underneath a running stream. Refusing here
+    // changes nothing at all -- no attempt is recorded and no cache entry is
+    // touched -- so the next request probes again immediately, and callers need no
+    // new handling because this reuses the existing probe-failure return.
+    std::unique_lock<std::shared_timed_mutex> encoder_state_lock {encoder_state_mutex, std::defer_lock};
+    if (!encoder_state_lock.try_lock_for(2s)) {
+      BOOST_LOG(error) << "Encoder probe refused because active video capture did not quiesce within 2 seconds.";
+      return -1;
+    }
     const auto probe_target = resolve_probe_target();
     const auto &required_adapter = probe_target.required_adapter;
     const auto cache_key = build_probe_cache_key(&probe_target);
