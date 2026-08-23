@@ -62,6 +62,10 @@ namespace tpmouse {
       bool gesture_clicked {false};  // physical click happened during this contact
       float acc_x {0.f}, acc_y {0.f};
       int scroll_acc {0};
+      // Settling: contacts were disturbed by something that is not a movement,
+      // so motion and scroll are held until a finger travels deliberately again.
+      bool settling {false};
+      int settle_x[2] {0, 0}, settle_y[2] {0, 0};
       // Pointer velocity tracking (libinput-style, see move_pointer_locked)
       std::chrono::steady_clock::time_point last_move_time {};
       bool have_move_time {false};
@@ -148,6 +152,30 @@ namespace tpmouse {
       }
     }
 
+    /* A finger never lands, lifts or presses cleanly -- it rolls, and at any
+     * usable pointer speed that roll is tens of pixels. So every disturbance
+     * that is not itself a movement parks motion here instead of emitting it:
+     * a contact appearing or disappearing, and both edges of the physical
+     * click (the contacts rock as the pad goes down, and rock back on
+     * release). Settling ends when some finger travels past the same slop that
+     * already tells a tap from a drag, and whatever gesture suits the fingers
+     * still down then resumes on its own. Movement made while settling is
+     * dropped, never replayed -- the pointer must not jump to catch up on
+     * motion the user could not see. Buttons are deliberately not gated by
+     * this; a click still fires the moment the pad reports it. */
+    void begin_settle_locked() {
+      st.settling = true;
+      for (int i = 0; i < 2; i++) {
+        st.settle_x[i] = st.c[i].x;
+        st.settle_y[i] = st.c[i].y;
+      }
+      // Nothing accumulated so far may survive into the resumed gesture.
+      st.scroll_acc = 0;
+      st.acc_x = st.acc_y = 0.f;
+      st.velocity_ema = 0.0;
+      st.have_move_time = false;
+    }
+
     void reset_locked() {
       release_click_locked();
       st.c[0] = contact_t {};
@@ -158,6 +186,7 @@ namespace tpmouse {
       st.scroll_acc = 0;
       st.velocity_ema = 0.0;
       st.have_move_time = false;
+      st.settling = false;
       st.ptr_used[0] = st.ptr_used[1] = false;
     }
 
@@ -254,15 +283,41 @@ namespace tpmouse {
     // click = physical touchpad button (HID path only; false on the SDL path).
     void process_locked(const contact_t prev[2], bool click) {
       int fingers = (st.c[0].down ? 1 : 0) + (st.c[1].down ? 1 : 0);
+      int prev_fingers = (prev[0].down ? 1 : 0) + (prev[1].down ? 1 : 0);
       st.fingers_seen = std::max(st.fingers_seen, fingers);
+
+      // st.click_down still holds the previous report's state here -- the edge
+      // itself is acted on further down.
+      bool contacts_changed = fingers != prev_fingers;
+      for (int i = 0; i < 2 && !contacts_changed; i++) {
+        // A lift and a fresh landing inside one report keeps the count but is
+        // still a new finger.
+        contacts_changed = st.c[i].down && prev[i].down && st.c[i].id != prev[i].id;
+      }
+      if (contacts_changed || click != st.click_down) {
+        begin_settle_locked();
+      } else if (st.settling) {
+        for (int i = 0; i < 2; i++) {
+          if (!st.c[i].down) {
+            continue;
+          }
+          int tx = st.c[i].x - st.settle_x[i];
+          int ty = st.c[i].y - st.settle_y[i];
+          if (tx * tx + ty * ty > TAP_MAX_TRAVEL * TAP_MAX_TRAVEL) {
+            st.settling = false;
+            break;
+          }
+        }
+      }
 
       // Primary contact: slot 0 when down, else slot 1.
       int pi = st.c[0].down ? 0 : 1;
       const contact_t &p = st.c[pi];
       const contact_t &pp = prev[pi];
 
-      // Movement, only for an ongoing contact of the same instance.
-      if (p.down && pp.down && p.id == pp.id) {
+      // Movement, only for an ongoing contact of the same instance, and only
+      // once the contacts have settled.
+      if (!st.settling && p.down && pp.down && p.id == pp.id) {
         int dx = p.x - pp.x;
         int dy = p.y - pp.y;
         if (dx != 0 || dy != 0) {
