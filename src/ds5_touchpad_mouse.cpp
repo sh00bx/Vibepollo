@@ -66,10 +66,16 @@ namespace tpmouse {
       // so motion and scroll are held until a finger travels deliberately again.
       bool settling {false};
       int settle_x[2] {0, 0}, settle_y[2] {0, 0};
-      // Pointer velocity tracking (libinput-style, see move_pointer_locked)
+      // Pointer velocity tracking (see move_pointer_locked)
       std::chrono::steady_clock::time_point last_move_time {};
       bool have_move_time {false};
       double velocity_ema {0.0};  // device units per µs, smoothed
+      // The pad's own free-running clock, when the report carries one. Raw
+      // ticks; the kernel divides by 3 for microseconds.
+      bool dev_clock_valid {false};
+      uint32_t dev_now_raw {0};
+      uint32_t dev_prev_raw {0};
+      bool have_dev_prev {false};
       // SDL path: map moonlight pointerId -> slot
       uint32_t ptr_id[2] {0, 0};
       bool ptr_used[2] {false, false};
@@ -186,13 +192,14 @@ namespace tpmouse {
       st.scroll_acc = 0;
       st.velocity_ema = 0.0;
       st.have_move_time = false;
+      st.have_dev_prev = false;
       st.settling = false;
       st.ptr_used[0] = st.ptr_used[1] = false;
     }
 
-    /* Pointer motion: a faithful port of libinput's touchpad acceleration
-     * (filter-touchpad.c touchpad_accel_profile_linear), which is what makes
-     * this same pad feel precise under Linux with default settings:
+    /* Pointer motion: libinput's touchpad acceleration (filter-touchpad.c
+     * touchpad_accel_profile_linear), with two deviations that a measurement on
+     * the real pad forced -- both documented at the constants below:
      *  - deceleration below a nominal 7 mm/s down to factor 0.3 (subpixel
      *    precision for small corrections),
      *  - a flat 0.9 plateau up to 130 mm/s (predictable 1:1-feel — the part
@@ -211,14 +218,49 @@ namespace tpmouse {
      * that substitution dominates the feel, so it is kept verbatim.
      * Velocity is EMA-smoothed as a stand-in for libinput's tracker set plus
      * Simpson's-rule factor integration. Fractional remainders are carried so
-     * slow movement is not truncated away. */
+     * slow movement is not truncated away.
+     *
+     * DEVIATION 1 -- the interval comes from the pad, not from arrival.
+     * libinput replaces any interval below 50 ms with a flat 10 ms because a
+     * Bluetooth pad's delivery is bursty and the arrival gaps say nothing about
+     * the device. Measured here (25 s of real use, 6261 reports read straight
+     * off the TV's hidraw node): nothing was lost on the way, and the arrival
+     * spacing tracks the pad's own emission clock almost exactly -- so there is
+     * no burst artifact to compensate, and the substitution only destroys
+     * information. The pad emits irregularly on its own, in multiples of about
+     * 502 us: real intervals ran median 4015 us, p95 20575, max 42155. Pinning
+     * that 40x spread to a constant turns "speed" into "distance per report",
+     * and the curve then sat in its flat middle band for 89% of all moving
+     * reports -- an acceleration profile that never accelerated and a
+     * deceleration that almost never decelerated. The DS5 report carries a
+     * free-running clock (sensor_timestamp), so use it; it is immune to
+     * whatever the network does downstream. Reports without one (the SDL touch
+     * path) keep libinput's substitution.
+     *
+     * DEVIATION 2 -- the deceleration threshold is this pad's, not libinput's.
+     * libinput's 7 mm/s assumes a pad that reports its resolution; this one
+     * does not (hid-playstation never calls input_abs_set_res for the touch
+     * device), so our "mm/s" is a stack of assumptions rather than a physical
+     * speed. On the measured distribution 7 sits below the 5th percentile --
+     * unreachable, which is why careful aiming got no help. The threshold is
+     * placed at the 20th percentile of real use instead. The upper bound is
+     * left at libinput's 130, because the same measurement puts it at the 75th
+     * percentile, which is where it belongs. */
     void move_pointer_locked(int dx, int dy) {
       constexpr double TP_MAGIC_SLOWDOWN = 0.2968;
       constexpr double BASELINE = 0.9;
-      constexpr double THRESHOLD_MM_S = 130.0;   // nominal, see above
-      constexpr double DECEL_LIMIT_MM_S = 7.0;
-      constexpr double SMOOTH_THRESHOLD_US = 50000.0;
-      constexpr double SMOOTH_VALUE_US = 10000.0;
+      constexpr double THRESHOLD_MM_S = 130.0;   // nominal, ~p75 of measured use
+      constexpr double DECEL_LIMIT_MM_S = 30.0;  // ~p20 of measured use (libinput: 7)
+      constexpr double DECEL_FLOOR = 0.3;        // gain at a standstill
+      // Ramp from DECEL_FLOOR at rest to BASELINE exactly at the limit, so the
+      // deceleration meets the plateau without a step wherever the limit sits.
+      constexpr double DECEL_SLOPE = (BASELINE - DECEL_FLOOR) / DECEL_LIMIT_MM_S;
+      constexpr double SMOOTH_THRESHOLD_US = 50000.0;  // SDL path only
+      constexpr double SMOOTH_VALUE_US = 10000.0;      // SDL path only
+      // Sanity band for the pad clock: a report is never this fast or this slow,
+      // so anything outside is a corrupt timestamp rather than a real interval.
+      constexpr double DEV_DT_MIN_US = 400.0;    // faster than the pad can report
+      constexpr double DEV_DT_MAX_US = 60000.0;  // slower than it ever is
       constexpr double XY_SCALE = 27.0 / 21.0;
       constexpr double EMA_ALPHA = 0.3;
 
@@ -226,7 +268,21 @@ namespace tpmouse {
       double dys = (double) dy * XY_SCALE;
 
       double dt_us = SMOOTH_VALUE_US;
-      if (st.have_move_time) {
+      bool dev_dt_ok = false;
+      if (st.dev_clock_valid && st.have_dev_prev) {
+        // Unsigned arithmetic carries the 32-bit wrap (~24 min) on its own.
+        uint32_t ticks = st.dev_now_raw - st.dev_prev_raw;
+        double us = (double) ticks / 3.0;  // kernel: microseconds = raw / 3
+        // Out of band means the clock is not telling us anything -- a pad that
+        // never advances it would otherwise pin dt to the floor and make the
+        // pointer race. Fall back to arrival time instead of clamping into
+        // range: a wrong-but-plausible interval is worse than the old estimate.
+        if (us >= DEV_DT_MIN_US && us <= DEV_DT_MAX_US) {
+          dt_us = us;
+          dev_dt_ok = true;
+        }
+      }
+      if (!dev_dt_ok && st.have_move_time) {
         dt_us = (double) std::chrono::duration_cast<std::chrono::microseconds>(
                   now - st.last_move_time)
                   .count() +
@@ -245,7 +301,7 @@ namespace tpmouse {
       double speed_in = st.velocity_ema * 25400.0;
       double factor;
       if (speed_in < DECEL_LIMIT_MM_S) {
-        factor = std::min(BASELINE, 0.1 * speed_in + 0.3);
+        factor = std::min(BASELINE, DECEL_SLOPE * speed_in + DECEL_FLOOR);
       } else if (speed_in < THRESHOLD_MM_S) {
         factor = BASELINE;
       } else {
@@ -435,7 +491,13 @@ namespace tpmouse {
       return;
     }
     const uint8_t *p = usb + 1;
+    // Free-running pad clock at common[27..30] (hid-playstation.c,
+    // struct dualsense_input_report::sensor_timestamp). Little endian.
+    const uint32_t dev_raw = (uint32_t) p[27] | ((uint32_t) p[28] << 8) |
+                             ((uint32_t) p[29] << 16) | ((uint32_t) p[30] << 24);
     std::lock_guard lk(st.mtx);
+    st.dev_clock_valid = true;
+    st.dev_now_raw = dev_raw;
     contact_t prev[2] = {st.c[0], st.c[1]};
     for (int i = 0; i < 2; i++) {
       const uint8_t *t = p + 32 + i * 4;
@@ -449,6 +511,10 @@ namespace tpmouse {
     }
     bool click = (p[9] & 0x02) != 0;
     process_locked(prev, click);
+    // Every report advances the reference, not just the ones that moved: the
+    // deltas above are per-report, so the interval must be too.
+    st.dev_prev_raw = dev_raw;
+    st.have_dev_prev = true;
   }
 
   bool feed_touch_event(uint8_t event_type, uint32_t pointer_id, float x, float y) {
@@ -456,6 +522,10 @@ namespace tpmouse {
       return false;
     }
     std::lock_guard lk(st.mtx);
+    // Moonlight touch events carry no pad clock; this path keeps libinput's
+    // arrival-time estimate.
+    st.dev_clock_valid = false;
+    st.have_dev_prev = false;
     contact_t prev[2] = {st.c[0], st.c[1]};
 
     if (event_type == LI_TOUCH_EVENT_CANCEL_ALL) {
