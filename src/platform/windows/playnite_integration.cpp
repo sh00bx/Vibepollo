@@ -498,6 +498,13 @@ namespace platf::playnite {
           send_cmd_json_line(hello.dump());
         } catch (...) {}
       });
+      client_->set_disconnected_handler([]() {
+        // The live-game status is only trustworthy while the pipe lives:
+        // once it is gone, gameStopped can never arrive, and a status left
+        // latched "active" would hold the DS5 touchpad-mouse gate closed for
+        // the rest of the host's uptime.
+        remember_active_game_stopped(std::string());
+      });
       client_->start();
       {
         std::scoped_lock lk(mutex_);
