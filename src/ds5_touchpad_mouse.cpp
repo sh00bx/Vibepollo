@@ -189,6 +189,7 @@ namespace tpmouse {
       st.acc_x = st.acc_y = 0.f;
       st.velocity_ema = 0.0;
       st.have_move_time = false;
+      st.have_dev_prev = false;
     }
 
     void reset_locked() {
@@ -228,8 +229,8 @@ namespace tpmouse {
     /* Pointer motion: libinput's touchpad acceleration (filter-touchpad.c
      * touchpad_accel_profile_linear), with two deviations that a measurement on
      * the real pad forced -- both documented at the constants below:
-     *  - deceleration below a nominal 7 mm/s down to factor 0.3 (subpixel
-     *    precision for small corrections),
+     *  - deceleration below DECEL_LIMIT_MM_S down to factor 0.3 (subpixel
+     *    precision for small corrections; see DEVIATION 2 for the limit),
      *  - a flat 0.9 plateau up to 130 mm/s (predictable 1:1-feel — the part
      *    an "accelerate everything" curve gets wrong),
      *  - a soft curve above, capped at 4x the threshold,
@@ -239,14 +240,24 @@ namespace tpmouse {
      * 69x50 mm pad => res_x = 1920/69 = 27, res_y = 1080/50 = 21 units/mm
      * (integer division, as libinput does it); y is rescaled to the x axis
      * (27/21). The accel filter runs at DEFAULT_MOUSE_DPI = 1000, where
-     * normalize_for_dpi() is the identity, and "mm/s" in the profile is the
-     * nominal units-as-1000dpi-counts speed, not physical mm. Bluetooth pads
+     * normalize_for_dpi() is the identity — but libinput ALSO scales touchpad
+     * deltas by (1000/25.4)/res_x ≈ 1.458 (tp_normalize_delta) before the
+     * filter and on its output, which this port omits: velocities here are
+     * libinput's divided by 1.458, and "mm/s" below is that raw-pad-unit
+     * scale, not physical mm. Divide libinput constants by 1.458 before
+     * comparing; the thresholds below are tuned in THIS unit on measured
+     * data, so they need no conversion. Bluetooth pads
      * get libinput's delta smoothener: an event interval below 50 ms is
      * REPLACED by 10 ms for the velocity estimate — at a 250 Hz report rate
-     * that substitution dominates the feel, so it is kept verbatim.
+     * that substitution dominates the feel, so it is kept verbatim (SDL path
+     * only; see DEVIATION 1).
      * Velocity is EMA-smoothed as a stand-in for libinput's tracker set plus
-     * Simpson's-rule factor integration. Fractional remainders are carried so
-     * slow movement is not truncated away.
+     * Simpson's-rule factor integration; the blend is time-weighted so its
+     * time constant does not ride the pad's 40x cadence spread, and so a
+     * pause (a large honest dt with a near-zero instantaneous speed) drains
+     * the estimate almost completely — the first careful correction after a
+     * flick must decelerate, not inherit the flick's speed. Fractional
+     * remainders are carried so slow movement is not truncated away.
      *
      * DEVIATION 1 -- the interval comes from the pad, not from arrival.
      * libinput replaces any interval below 50 ms with a flat 10 ms because a
@@ -264,6 +275,14 @@ namespace tpmouse {
      * free-running clock (sensor_timestamp), so use it; it is immune to
      * whatever the network does downstream. Reports without one (the SDL touch
      * path) keep libinput's substitution.
+     * The clock reference advances only on reports that actually moved: the
+     * coordinates are absolute, so a moving report's delta already integrates
+     * everything since the last step, and pairing it with the full inter-step
+     * interval is what makes the speed true. A per-report reference made
+     * quantized slow motion (a 1-unit step every ~15-20 ms, reported every
+     * ~4 ms) read 5-40x too fast -- the deceleration floor was unreachable a
+     * second time -- and made pauses invisible to the estimator. This is also
+     * the kernel's semantic: input events only fire on change.
      *
      * DEVIATION 2 -- the deceleration threshold is this pad's, not libinput's.
      * libinput's 7 mm/s assumes a pad that reports its resolution; this one
@@ -285,12 +304,16 @@ namespace tpmouse {
       constexpr double DECEL_SLOPE = (BASELINE - DECEL_FLOOR) / DECEL_LIMIT_MM_S;
       constexpr double SMOOTH_THRESHOLD_US = 50000.0;  // SDL path only
       constexpr double SMOOTH_VALUE_US = 10000.0;      // SDL path only
-      // Sanity band for the pad clock: a report is never this fast or this slow,
-      // so anything outside is a corrupt timestamp rather than a real interval.
-      constexpr double DEV_DT_MIN_US = 400.0;    // faster than the pad can report
-      constexpr double DEV_DT_MAX_US = 60000.0;  // slower than it ever is
+      // Sanity band for the pad clock, now spanning steps rather than
+      // reports: faster than the pad can emit is a corrupt timestamp, and
+      // beyond a second the "interval" is a wrap-ambiguous pause whose speed
+      // the arrival clock estimates just as well.
+      constexpr double DEV_DT_MIN_US = 400.0;      // faster than the pad can report
+      constexpr double DEV_DT_MAX_US = 1000000.0;  // longer is a pause, not a step
       constexpr double XY_SCALE = 27.0 / 21.0;
-      constexpr double EMA_ALPHA = 0.3;
+      // Time constant of the velocity EMA; 1-exp(-4015/11000) = 0.30, the
+      // per-event alpha the curve was tuned with at the pad's median cadence.
+      constexpr double EMA_TAU_US = 11000.0;
 
       auto now = std::chrono::steady_clock::now();
       double dys = (double) dy * XY_SCALE;
@@ -321,9 +344,16 @@ namespace tpmouse {
       }
       st.last_move_time = now;
       st.have_move_time = true;
+      if (st.dev_clock_valid) {
+        // Only motion advances the reference (see the header comment): the
+        // next step's dt then spans the stationary reports in between.
+        st.dev_prev_raw = st.dev_now_raw;
+        st.have_dev_prev = true;
+      }
 
       double v = std::hypot((double) dx, dys) / dt_us;  // units/µs
-      st.velocity_ema += EMA_ALPHA * (v - st.velocity_ema);
+      double alpha = 1.0 - std::exp(-dt_us / EMA_TAU_US);
+      st.velocity_ema += alpha * (v - st.velocity_ema);
 
       // units/µs -> nominal mm/s at 1000 dpi: *1e6 (per s) * 25.4/1000
       double speed_in = st.velocity_ema * 25400.0;
@@ -551,10 +581,9 @@ namespace tpmouse {
     }
     bool click = (p[9] & 0x02) != 0;
     process_locked(prev, click);
-    // Every report advances the reference, not just the ones that moved: the
-    // deltas above are per-report, so the interval must be too.
-    st.dev_prev_raw = dev_raw;
-    st.have_dev_prev = true;
+    // The clock reference is advanced inside move_pointer_locked, by motion
+    // only -- a stationary report must lengthen the next step's interval,
+    // not reset it.
   }
 
   bool feed_touch_event(uintptr_t source, uint8_t event_type, uint32_t pointer_id, float x, float y) {
