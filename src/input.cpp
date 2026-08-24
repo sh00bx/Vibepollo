@@ -25,7 +25,9 @@ extern "C" {
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
-#include "ds5_touchpad_mouse.h"
+#ifdef _WIN32
+  #include "ds5_touchpad_mouse.h"
+#endif
 #include "mouse_input.h"
 #include "platform/common.h"
 #include "thread_pool.h"
@@ -1199,11 +1201,13 @@ namespace input {
       return;
     }
 
+#ifdef _WIN32
     // Desktop touchpad-mouse: while no game is streamed, SDL-mode pads get
     // their touch events turned into host mouse input here (the emulated pad
     // either has no touchpad at all, x360, or the desktop ignores it). Games
-    // get the normal passthrough below. Synthesizing mouse input needs the
-    // mouse permission — controller permission alone must not reach the host
+    // get the normal passthrough below; other platforms keep the emulated
+    // pad's own touchpad. Synthesizing mouse input needs the mouse
+    // permission — controller permission alone must not reach the host
     // pointer.
     if (!!(input->permission & crypto::PERM::input_mouse) &&
         // Source id: controller number, offset past 0 (= "no owner"). The
@@ -1215,6 +1219,7 @@ namespace input {
                                   from_clamped_netfloat(packet->y, 0.0f, 1.0f))) {
       return;
     }
+#endif
 
     platf::gamepad_touch_t touch {
       {gamepad.id, packet->controllerNumber},
@@ -1897,9 +1902,11 @@ namespace input {
 
     // Ensure input is synchronous, by using the task_pool
     task_pool.push([]() {
+#ifdef _WIN32
       // Touchpad-mouse buttons bypass mouse_press[] (they go straight to
       // platf::button_mouse), so release them separately.
       tpmouse::reset();
+#endif
 
       for (int x = 0; x < mouse_press.size(); ++x) {
         if (mouse_press[x]) {

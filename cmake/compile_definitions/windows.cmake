@@ -164,6 +164,8 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ipc/misc_utils.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ipc/process_handler.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ipc/process_handler.cpp"
+        "${CMAKE_SOURCE_DIR}/src/ds5_touchpad_mouse.cpp"
+        "${CMAKE_SOURCE_DIR}/src/ds5_touchpad_mouse.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ctmb_protocol.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ds5_reports.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ds5_haptics.h"
