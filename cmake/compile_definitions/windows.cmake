@@ -40,6 +40,7 @@ file(GLOB NVPREFS_FILES CONFIGURE_DEPENDS
 # vigem
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include")
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party")
+include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party/bluez-sbc")
 set(SUNSHINE_WINDOWS_VDISPLAY_SOURCES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display_identity.cpp"
@@ -178,6 +179,13 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/bridge_host.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ds5_bridge.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ds5_bridge.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ds4_reports.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ds4_audio.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/ds5_bridge/ds4_audio.cpp"
+        "${CMAKE_SOURCE_DIR}/third-party/bluez-sbc/sbc/sbc.c"
+        "${CMAKE_SOURCE_DIR}/third-party/bluez-sbc/sbc/sbc_primitives.c"
+        "${CMAKE_SOURCE_DIR}/third-party/bluez-sbc/sbc/sbc_primitives_mmx.c"
+        "${CMAKE_SOURCE_DIR}/third-party/bluez-sbc/sbc/sbc_primitives_sse.c"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ipc/display_settings_client.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ipc/display_settings_client.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_helper_coordinator.h"

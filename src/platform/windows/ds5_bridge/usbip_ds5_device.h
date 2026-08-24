@@ -34,6 +34,32 @@ namespace platf::ds5_bridge {
   constexpr int OUTPUT_PAYLOAD_LEN = 47;
 
   /**
+   * @brief Everything that distinguishes one virtual pad model from another at
+   *        the USB level. The session state machine is model-agnostic; a slot
+   *        carries a pointer to its model (DS5 by default, DS4 for kind "ds4").
+   */
+  struct usb_model_t {
+    const char *name;                 // for logs
+    uint16_t vid, pid;
+    const uint8_t *device_desc;       // 18 bytes
+    const uint8_t *config_desc;
+    int config_len;
+    int hid_desc_off;                 // offset of the 9-byte HID class descriptor in config
+    const uint8_t *hid_report_desc;
+    int hid_report_len;
+    uint8_t usb_output_report_id;     // 0x02 (DS5) / 0x05 (DS4)
+    int usb_output_payload_len;       // 47 / 31
+    int iso_bytes_per_frame;          // 8 (4ch s16) / 4 (2ch s16)
+    int iso_sample_rate;              // 48000 / 32000
+    // Static fallback for EP0 GET_REPORT(feature) when the slot has no live
+    // provider hit; returns bytes written into out (up to 64), 0 for none.
+    int (*feature_fallback)(uint8_t report_id, uint8_t *out);
+  };
+
+  const usb_model_t *ds5_usb_model();
+  const usb_model_t *ds4_usb_model();
+
+  /**
    * @brief One virtual DualSense, addressed by a USB/IP busid (e.g. "1-1").
    *
    * A slot carries the live input report (delivered on the next interrupt-IN),
@@ -44,9 +70,12 @@ namespace platf::ds5_bridge {
   struct slot_t {
     std::string busid;
     std::string serial;  // stable iSerialNumber (typically the pad's BT MAC)
+    // USB personality of this slot. Fixed at add_slot; never changes while the
+    // vhci session lives.
+    const usb_model_t *model = nullptr;
 
-    // Called on a server thread with the 47-byte effects payload (after the
-    // 0x02 report-id) whenever the game writes an output report.
+    // Called on a server thread with the model's effects payload (bytes after
+    // the output report id) whenever the game writes an output report.
     using output_cb = std::function<void(const uint8_t *payload)>;
     output_cb on_output;
 
@@ -103,11 +132,12 @@ namespace platf::ds5_bridge {
 
     /// Register a controller slot. Returns a shared handle used for set_input /
     /// remove_slot. The next free busid ("1-1", "1-2", ...) is assigned if
-    /// @p busid is empty.
+    /// @p busid is empty. @p model defaults to the DualSense.
     std::shared_ptr<slot_t> add_slot(const std::string &serial,
                                      slot_t::output_cb on_output,
                                      slot_t::feature_cb on_feature,
-                                     std::string busid = {});
+                                     std::string busid = {},
+                                     const usb_model_t *model = nullptr);
 
     /// Remove a slot (closes its live vhci session, if any).
     void remove_slot(const std::shared_ptr<slot_t> &slot);

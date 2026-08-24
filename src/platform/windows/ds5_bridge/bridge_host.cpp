@@ -29,6 +29,8 @@
 #include "src/platform/common.h"
 #include "src/platform/windows/ds5_bridge/bridge_host.h"
 #include "src/platform/windows/ds5_bridge/ctmb_protocol.h"
+#include "src/platform/windows/ds5_bridge/ds4_audio.h"
+#include "src/platform/windows/ds5_bridge/ds4_reports.h"
 #include "src/platform/windows/ds5_bridge/ds5_haptics.h"
 #include "src/platform/windows/ds5_bridge/ds5_reports.h"
 #include "src/platform/windows/ds5_bridge/vhci_attach.h"
@@ -64,12 +66,16 @@ namespace platf::ds5_bridge {
   // ===========================================================================
   class bridge_session {
   public:
-    bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, bool haptics,
-                   bool audio_batched, int audio_cushion,
+    enum class pad_kind_e { ds5, ds4 };
+
+    bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, pad_kind_e kind,
+                   bool haptics, bool audio_batched, int audio_cushion,
                    const std::atomic<uint32_t> *lightbar_rgb):
-        usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport),
+        usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport), kind_(kind),
         audio_batched_(audio_batched), audio_cushion_(audio_cushion),
         lightbar_rgb_(lightbar_rgb) { haptics_want_.store(haptics); }
+
+    pad_kind_e kind() const { return kind_; }
 
     /// Control thread, on every BRIDGE_START for this session (incl. adopts).
     /// Takes effect at the next HELLO (see on_hello).
@@ -180,6 +186,19 @@ namespace platf::ds5_bridge {
           on_hello(h, payload);
           break;
         case CTMB_MSG_INPUT_REPORT:
+          if (slot_ && kind_ == pad_kind_e::ds4) {
+            uint8_t usb[INPUT_REPORT_LEN];
+            if (ds4_bt_input_to_usb(payload, h->payload_len, usb)) {
+              // Follow the pad's own jack state for the audio route (Layout B
+              // auto-route); the TV-side patch forces 0xFF/0xDF over this for
+              // the user's explicit Headphones/Split modes.
+              ds4_route_.store((usb[1 + DS4_STATUS_COMMON_OFFSET] & DS4_STATUS_HEADPHONES)
+                                 ? DS4_ROUTE_HEADPHONES : DS4_ROUTE_SPLIT,
+                               std::memory_order_relaxed);
+              usbip_->set_input(slot_, usb);
+            }
+            break;
+          }
           if (slot_) {
             uint8_t usb[INPUT_REPORT_LEN];
             if (bt_input_to_usb(payload, h->payload_len, usb)) {
@@ -243,7 +262,28 @@ namespace platf::ds5_bridge {
       // feature callbacks run on a usbip server thread) and attach the vhci once.
       // A HELLO on a reconnect keeps the same slot + device (the game never sees a
       // hot-unplug); only the handshake below is replayed.
-      if (!slot_) {
+      if (!slot_ && kind_ == pad_kind_e::ds4) {
+        slot_ = usbip_->add_slot(
+          serial,
+          [this](const uint8_t *eff) { on_game_output_ds4(eff); },
+          [this](uint8_t rid, uint8_t *out) -> int { return ds4_feature(rid, out); },
+          {}, ds4_usb_model());
+        // DS4 audio: the game's 32 kHz stereo iso-OUT PCM becomes a paced SBC
+        // 0x17 stream. Unconditional (no config gate): the builder emits only
+        // while the endpoint carries audible PCM.
+        ds4a_ = std::make_unique<ds4_audio_builder>();
+        slot_->on_iso_out = [this](const uint8_t *pcm, size_t len) {
+          if (ds4a_) ds4a_->feed_pcm(pcm, len);
+        };
+        BOOST_LOG(info) << "ds4-bridge: audio downlink = SBC 0x17 ("sv << DS4_0X17_LEN
+                        << " B, four SBC frames per report)"sv;
+        pacer_stop_.store(false);
+        pacer_thread_ = std::thread(&bridge_session::pacer_run, this);
+        std::string busid = slot_->busid;
+        attach_thread_ = std::thread([this, busid] { vhci_port_.store(vhci_attach(busid)); });
+        BOOST_LOG(info) << "ds4-bridge: session "sv << label() << " up (serial="sv
+                        << serial << ", usbip busid="sv << busid << ")"sv;
+      } else if (!slot_) {
         slot_ = usbip_->add_slot(
           serial,
           [this](const uint8_t *eff) { on_game_output(eff); },
@@ -339,31 +379,50 @@ namespace platf::ds5_bridge {
       // without a lockstep deploy. hap_ exists by the time any HELLO is
       // answered (created above on session setup); the fallback only covers a
       // re-HELLO racing teardown.
-      cfg.bt_pace_us = hap_ ? (uint32_t) hap_->pace_base_us() : 10667;
+      cfg.bt_pace_us = kind_ == pad_kind_e::ds4
+                         ? (uint32_t) (ds4a_ ? ds4a_->pace_base_us() : DS4_PACE_BASE_US)
+                         : (hap_ ? (uint32_t) hap_->pace_base_us() : 10667);
       // Advertise the rate-servo capability: a client that sees this forwards
       // the daemon's inject-queue telemetry as CTMB_MSG_PACE_FEEDBACK. Old
       // clients ignore reserved bytes and simply never send it.
       cfg.reserved[0] = CTMB_HOSTCFG_PACE_FEEDBACK;
       cfg.input_report_len = caps.input_report_len;
-      cfg.output_report_len = BT_OUTPUT_LEN;
+      cfg.output_report_len = kind_ == pad_kind_e::ds4 ? DS4_BT_OUTPUT_LEN : BT_OUTPUT_LEN;
       cfg.feature_report_len = caps.feature_report_len;
       // Advertise BOTH audio report forms as paced. Which one this session emits
       // is fixed at session creation (audio_batched_, caps-gated above), but advertising both is
       // free (the list holds 16) and keeps the advertisement correct no matter
       // when the HELLO arrives relative to the builder's construction.
-      cfg.paced_report_count = 2;
-      cfg.paced_report_ids[0] = 0x36;
-      cfg.paced_report_ids[1] = 0x39;
+      if (kind_ == pad_kind_e::ds4) {
+        // 0x17 is what this build emits; 0x14 is advertised too so a future
+        // 8 ms form needs no lockstep deploy.
+        cfg.paced_report_count = 2;
+        cfg.paced_report_ids[0] = DS4_BT_AUDIO_REPORT_ID;
+        cfg.paced_report_ids[1] = 0x14;
+      } else {
+        cfg.paced_report_count = 2;
+        cfg.paced_report_ids[0] = 0x36;
+        cfg.paced_report_ids[1] = 0x39;
+      }
       send_msg(CTMB_MSG_HOST_CONFIG, CTMB_FLAG_OK, 0,
                reinterpret_cast<const uint8_t *>(&cfg), sizeof(cfg));
 
       // Prefetch calibration / MAC / firmware so the game's EP0 GET_REPORT is
       // answered from the real controller. This read also unlocks the pad's
-      // extended (0x31) BT input mode, so refresh it on every (re)connect.
-      for (uint8_t rid : {0x05, 0x09, 0x20}) {
-        uint8_t req[64] = {0};
-        req[0] = rid;
-        send_msg(CTMB_MSG_FEATURE_GET, CTMB_FLAG_OK, rid, req, sizeof(req));
+      // extended BT input mode (0x31 on the DS5, 0x11 on the DS4 — both via
+      // feature 0x05), so refresh it on every (re)connect. The DS4 has no BT
+      // 0x09/0x20; its USB 0x02 calibration answer is served from BT 0x05
+      // restamped (see ds4_feature).
+      {
+        static const uint8_t ds5_rids[] = {0x05, 0x09, 0x20};
+        static const uint8_t ds4_rids[] = {0x05};
+        const uint8_t *rids = kind_ == pad_kind_e::ds4 ? ds4_rids : ds5_rids;
+        const size_t nrids = kind_ == pad_kind_e::ds4 ? sizeof(ds4_rids) : sizeof(ds5_rids);
+        for (size_t i = 0; i < nrids; ++i) {
+          uint8_t req[64] = {0};
+          req[0] = rids[i];
+          send_msg(CTMB_MSG_FEATURE_GET, CTMB_FLAG_OK, rids[i], req, sizeof(req));
+        }
       }
 
       // Only now may output reports flow: the TV's handshake() hard-fails the
@@ -374,6 +433,25 @@ namespace platf::ds5_bridge {
       hello_seen_.store(true);
       if (!link_live_.exchange(true)) {
         g_hello_links.fetch_add(1);
+      }
+
+      if (kind_ == pad_kind_e::ds4) {
+        // No BT setup gate on the DS4 — just light the synthetic color on
+        // connect so the bar is not dark until a game writes LED output.
+        const uint32_t synth = lightbar_rgb_ ? lightbar_rgb_->load(std::memory_order_relaxed) : LIGHTBAR_OFF;
+        if (synth != LIGHTBAR_OFF) {
+          uint8_t common[DS4_USB_OUTPUT_COMMON_LEN] = {0};
+          common[0] = 0x02;  // valid_flag0: LED
+          common[5] = (uint8_t) (synth >> 16);
+          common[6] = (uint8_t) (synth >> 8);
+          common[7] = (uint8_t) synth;
+          lb_last_paint_ms_.store(now_ms(), std::memory_order_relaxed);
+          uint8_t bt[DS4_BT_OUTPUT_LEN];
+          ds4_usb_output_to_bt(common, bt);
+          std::lock_guard<std::mutex> lk(out_mtx_);
+          outbox_.emplace_back(bt, bt + DS4_BT_OUTPUT_LEN);
+        }
+        return;
       }
 
       // BT firmware gate: over Bluetooth the DualSense ignores lightbar color
@@ -451,6 +529,88 @@ namespace platf::ds5_bridge {
         dbg_fb_drops_ = 0;
         dbg_fb_fifo_max_ = 0;
       }
+    }
+
+    // usbip server thread (DS4 slot): the game wrote a 31-byte USB 0x05 output
+    // common block. No DS5-isms apply: no lightbar-setup gate, no
+    // rumble-vs-haptics flag, no trigger FFB. The TV-side patch stamps the
+    // volume bytes + valid flags per the user's sliders; here only the
+    // synthetic lightbar rides along while no game owns the LED.
+    void on_game_output_ds4(const uint8_t *eff) {
+      if (!hello_seen_.load(std::memory_order_relaxed)) return;
+      uint8_t common[DS4_USB_OUTPUT_COMMON_LEN];
+      std::memcpy(common, eff, DS4_USB_OUTPUT_COMMON_LEN);
+      // LED ownership follows the last LED write: a real color hands the bar to
+      // the game, black hands it back to the synth (same rule as the DS5 path).
+      bool owned = lb_game_owned_.load(std::memory_order_relaxed);
+      if (common[0] & 0x02) {
+        owned = (common[5] | common[6] | common[7]) != 0;
+      }
+      const uint32_t synth = lightbar_rgb_ ? lightbar_rgb_->load(std::memory_order_relaxed) : LIGHTBAR_OFF;
+      if (!owned && synth != LIGHTBAR_OFF) {
+        common[0] |= 0x02;
+        common[5] = (uint8_t) (synth >> 16);
+        common[6] = (uint8_t) (synth >> 8);
+        common[7] = (uint8_t) synth;
+        lb_last_paint_ms_.store(now_ms(), std::memory_order_relaxed);
+      }
+      // Per-connect diagnostics: first outputs, then on signature change.
+      const uint64_t dbg_sig = ((uint64_t) common[0]) | ((uint64_t) common[3] << 8) |
+                               ((uint64_t) common[4] << 16) | ((uint64_t) common[5] << 24) |
+                               ((uint64_t) common[6] << 32) | ((uint64_t) common[7] << 40);
+      const bool sig_changed = dbg_sig != dbg_sig_;
+      dbg_sig_ = dbg_sig;
+      const int64_t dbg_now = now_ms();
+      if (dbg_out_n_.load(std::memory_order_relaxed) < 10 ||
+          (sig_changed && dbg_now - dbg_sig_log_ms_ >= 250)) {
+        dbg_out_n_.fetch_add(1, std::memory_order_relaxed);
+        if (sig_changed) dbg_sig_log_ms_ = dbg_now;
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+                      "ds4-out: f0=%02x motors=%02x/%02x rgb=%02x%02x%02x flash=%02x/%02x",
+                      common[0], common[3], common[4], common[5], common[6], common[7],
+                      common[8], common[9]);
+        BOOST_LOG(info) << msg;
+      }
+      uint8_t bt[DS4_BT_OUTPUT_LEN];
+      ds4_usb_output_to_bt(common, bt);
+      std::lock_guard<std::mutex> lk(out_mtx_);
+      lb_game_owned_.store(owned, std::memory_order_relaxed);
+      outbox_.emplace_back(bt, bt + DS4_BT_OUTPUT_LEN);
+    }
+
+    // usbip server thread (DS4 slot): EP0 GET_REPORT(feature). The DS4's USB
+    // and BT feature id spaces differ: USB 0x02 (calibration) lives in BT 0x05
+    // (41 B; first 37 carry the payload, byte 0 restamped), and USB 0x12
+    // (pairing info) has no BT sibling — it is built from the pad's BT MAC.
+    int ds4_feature(uint8_t rid, uint8_t *out) {
+      if (rid == 0x02) {
+        std::lock_guard<std::mutex> lk(feat_mtx_);
+        if (!feat_have_[0x05]) return 0;   // model fallback answers meanwhile
+        std::memcpy(out, feat_cache_[0x05].data(), 64);
+        out[0] = 0x02;
+        return 37;
+      }
+      if (rid == 0x12) {
+        std::memset(out, 0, 16);
+        out[0] = 0x12;
+        out[7] = 0x08;
+        out[8] = 0x25;
+        // serial "aa:bb:cc:dd:ee:ff" -> bytes [1..6] LSB-first.
+        const std::string serial = slot_ ? slot_->serial : std::string {};
+        unsigned b[6];
+        if (std::sscanf(serial.c_str(), "%2x:%2x:%2x:%2x:%2x:%2x",
+                        &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+          for (int i = 0; i < 6; ++i) out[1 + i] = (uint8_t) b[5 - i];
+        }
+        return 16;
+      }
+      std::lock_guard<std::mutex> lk(feat_mtx_);
+      if (feat_have_[rid]) {
+        std::memcpy(out, feat_cache_[rid].data(), 64);
+        return 64;
+      }
+      return 0;
     }
 
     // usbip server thread: the game wrote a 47-byte USB output effects block.
@@ -603,6 +763,19 @@ namespace platf::ds5_bridge {
       const int64_t now = now_ms();
       if (now - lb_last_paint_ms_.load(std::memory_order_relaxed) < 5000) return;
       lb_last_paint_ms_.store(now, std::memory_order_relaxed);
+      if (kind_ == pad_kind_e::ds4) {
+        uint8_t c4[DS4_USB_OUTPUT_COMMON_LEN] = {0};
+        c4[0] = 0x02;  // valid_flag0: LED
+        c4[5] = (uint8_t) (synth >> 16);
+        c4[6] = (uint8_t) (synth >> 8);
+        c4[7] = (uint8_t) synth;
+        uint8_t bt4[DS4_BT_OUTPUT_LEN];
+        ds4_usb_output_to_bt(c4, bt4);
+        std::lock_guard<std::mutex> lk(out_mtx_);
+        if (lb_game_owned_.load(std::memory_order_relaxed)) return;
+        outbox_.emplace_back(bt4, bt4 + DS4_BT_OUTPUT_LEN);
+        return;
+      }
       uint8_t common[USB_OUTPUT_COMMON_LEN] = {0};
       // Keep folding the BT lightbar-setup release for the whole re-assert
       // window: a re-paired BT link re-latches the firmware gate, and without
@@ -640,8 +813,42 @@ namespace platf::ds5_bridge {
         // down the TV's unpaced path (the rate servo would have no queue to act
         // on). The rare standalone 0x32 SetState stays unpaced on purpose.
         uint32_t flags = CTMB_FLAG_OK;
-        if (!bt.empty() && (bt[0] == 0x36 || bt[0] == 0x39)) flags |= CTMB_FLAG_PACED;
+        if (!bt.empty() && (bt[0] == 0x36 || bt[0] == 0x39 ||
+                            bt[0] == DS4_BT_AUDIO_REPORT_ID || bt[0] == 0x14)) {
+          flags |= CTMB_FLAG_PACED;
+        }
         send_msg(CTMB_MSG_OUTPUT_REPORT, flags, 0, bt.data(), (uint32_t) bt.size());
+      }
+    }
+
+    // 16 ms grid producing paced DS4 0x17 SBC audio reports. Same skeleton as
+    // the DS5 pacer below; the rate servo's adjustment is defined in
+    // microseconds of the DS5's 10.667 ms period, so it is rescaled by 3/2 to
+    // keep the same relative-rate meaning on the 16 ms grid.
+    void ds4_pacer_run() {
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+      using namespace std::chrono;
+      auto next = steady_clock::now();
+      auto hpt = platf::create_high_precision_timer();
+      uint8_t rep[DS4_0X17_LEN];
+      while (!pacer_stop_.load() && !stop_.load()) {
+        int64_t now_ms_v = duration_cast<milliseconds>(
+          steady_clock::now().time_since_epoch()).count();
+        bool fb_live = (now_ms_v - fb_last_ms_.load(std::memory_order_relaxed)) < 2000;
+        int adj = fb_live ? pace_adj_us_.load(std::memory_order_relaxed)
+                          : DS5_PACE_FALLBACK_ADJ_US;
+        const int adj_scaled = adj * 3 / 2;
+        const auto period = microseconds(DS4_PACE_BASE_US + adj_scaled);
+        next += period;
+        auto now = steady_clock::now();
+        if (now - next > milliseconds(100)) next = now;  // genuine stall: no catch-up burst
+        else if (next > now && hpt && *hpt) hpt->sleep_for(next - now);
+        if (!ds4a_) continue;
+        if (ds4a_->build_0x17(rep, ds4_route_.load(std::memory_order_relaxed)) &&
+            client_ready_.load(std::memory_order_relaxed)) {
+          std::lock_guard<std::mutex> lk(out_mtx_);
+          if (outbox_.size() < 256) outbox_.emplace_back(rep, rep + DS4_0X17_LEN);
+        }
       }
     }
 
@@ -649,6 +856,10 @@ namespace platf::ds5_bridge {
     // PCM. Enqueues to the outbox (drained on the run/session thread) so the
     // ENet host is only ever serviced from one thread.
     void pacer_run() {
+      if (kind_ == pad_kind_e::ds4) {
+        ds4_pacer_run();
+        return;
+      }
       // Time-critical so the 10 ms grid is not descheduled by the capture/encoder
       // threads under heavy game load — an irregular grid makes the coil actuation
       // choppy (ds5_av_play.c boosts the same loop for the same reason).
@@ -953,6 +1164,10 @@ namespace platf::ds5_bridge {
     std::mutex label_mtx_;
     std::string ctmb_busid_;  // guarded by label_mtx_ (relabel from control thread)
     int dport_;
+    const pad_kind_e kind_ {pad_kind_e::ds5};
+    // DS4 audio builder + the live auto-route byte (from the pad's jack bit).
+    std::unique_ptr<ds4_audio_builder> ds4a_;
+    std::atomic<uint8_t> ds4_route_ {DS4_ROUTE_SPLIT};
     // Desired HD-haptics state (config), pushed by the control thread on every
     // BRIDGE_START (incl. adopts); latched into haptics_on_ at the next HELLO so
     // the documented "takes effect on the next connect" A/B semantics hold even
@@ -1131,12 +1346,15 @@ namespace platf::ds5_bridge {
       std::string kind, busid;
       int dport = 0;
       iss >> kind >> dport >> busid;
-      if (kind != "ds5") {
-        return "ERR unsupported kind (native provider is DS5-only in this build)";
+      if (kind != "ds5" && kind != "ds4") {
+        return "ERR unsupported kind (native provider handles ds5 and ds4)";
       }
+      const auto pad_kind = kind == "ds4" ? bridge_session::pad_kind_e::ds4
+                                          : bridge_session::pad_kind_e::ds5;
       if (dport <= 0 || busid.empty()) {
         return "ERR bad args";
       }
+      std::unique_ptr<bridge_session> evicted;
       std::lock_guard<std::mutex> lk(sessions_mtx_);
       // The data port is a controller's stable identity across reconnects: the TV
       // reuses it but issues a fresh busid each time (ctm-ds5-1 -> ctm-ds5-2 ...,
@@ -1149,19 +1367,30 @@ namespace platf::ds5_bridge {
       // only race for the same port: enet_host_create fails and the loser lingers
       // as a zombie TCP-fallback session the reconnecting peer never reaches.
       auto it = sessions_.find(dport);
-      if (it != sessions_.end()) {
+      if (it != sessions_.end() && it->second->kind() == pad_kind) {
         it->second->relabel(busid);
         it->second->set_haptics(haptics_.load());
-        BOOST_LOG(info) << "ds5-bridge: BRIDGE_START ds5 port="sv << dport << " busid="sv
-                        << busid << " (reconnect; adopted live session on this port)"sv;
+        BOOST_LOG(info) << "ds5-bridge: BRIDGE_START "sv << kind << " port="sv << dport
+                        << " busid="sv << busid << " (reconnect; adopted live session on this port)"sv;
         return "OK";
       }
-      auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, haptics_.load(),
+      if (it != sessions_.end()) {
+        // Same dport, different pad kind: a stale session (pad vanished without
+        // BRIDGE_STOP) must not adopt a different controller model — the game
+        // would keep a virtual pad the reports no longer match. Replace it.
+        BOOST_LOG(warning) << "ds5-bridge: BRIDGE_START "sv << kind << " port="sv << dport
+                           << " replaces a live session of a different kind"sv;
+        evicted = std::move(it->second);
+        sessions_.erase(it);
+        evicted->stop();
+      }
+      auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, pad_kind,
+                                                  haptics_.load(),
                                                   audio_batched_.load(), audio_cushion_.load(),
                                                   &lightbar_rgb_);
       sess->start();
       sessions_[dport] = std::move(sess);
-      BOOST_LOG(info) << "ds5-bridge: BRIDGE_START ds5 port="sv << dport << " busid="sv << busid;
+      BOOST_LOG(info) << "ds5-bridge: BRIDGE_START "sv << kind << " port="sv << dport << " busid="sv << busid;
       return "OK";
     }
     if (cmd == "BRIDGE_STOP") {
