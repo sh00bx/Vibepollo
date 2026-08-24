@@ -209,7 +209,15 @@ namespace platf::ds5_bridge {
           if (h->payload_len >= sizeof(ctmb_tpmouse_t)) {
             ctmb_tpmouse_t tp;
             std::memcpy(&tp, payload, sizeof(tp));
-            tpmouse::set_client_mode(tp.mode <= 2 ? (int) tp.mode : 1);
+            if (tp.mode <= 2) {
+              tpmouse::set_client_mode((int) tp.mode);
+            } else {
+              // The client's word overrides the host config, so a value we
+              // do not understand must change nothing -- coercing it to a
+              // real mode would enable the feature against an explicit
+              // host-side "off".
+              BOOST_LOG(warning) << "ds5-bridge: ignoring unknown tpmouse mode "sv << (int) tp.mode;
+            }
           }
           break;
         default:
