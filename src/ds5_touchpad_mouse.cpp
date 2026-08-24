@@ -554,16 +554,16 @@ namespace tpmouse {
     reset_locked();
   }
 
-  void feed_usb_report(uintptr_t source, const uint8_t *usb, size_t len) {
+  bool feed_usb_report(uintptr_t source, const uint8_t *usb, size_t len) {
     // USB 0x01 layout: payload p = usb + 1; touch points at p[32..35] / p[36..39]
     // (bit7 of the first byte = finger up, low 7 bits = contact counter);
     // touchpad click = p[9] & 0x02. Offsets per Linux hid-playstation, the
     // same map the client's neutralizer uses.
     if (!usb || len < 41 || usb[0] != 0x01) {
-      return;
+      return false;
     }
     if (!active()) {
-      return;
+      return false;
     }
     const uint8_t *p = usb + 1;
     const bool engaged = (p[32] & 0x80) == 0 || (p[36] & 0x80) == 0 || (p[9] & 0x02) != 0;
@@ -573,7 +573,7 @@ namespace tpmouse {
                              ((uint32_t) p[29] << 16) | ((uint32_t) p[30] << 24);
     std::lock_guard lk(st.mtx);
     if (!acquire_source_locked(source, engaged)) {
-      return;
+      return false;
     }
     st.dev_clock_valid = true;
     st.dev_now_raw = dev_raw;
@@ -593,6 +593,7 @@ namespace tpmouse {
     // The clock reference is advanced inside move_pointer_locked, by motion
     // only -- a stationary report must lengthen the next step's interval,
     // not reset it.
+    return true;
   }
 
   bool feed_touch_event(uintptr_t source, uint8_t event_type, uint32_t pointer_id, float x, float y) {

@@ -28,8 +28,12 @@ namespace tpmouse {
    * feeder, e.g. the session object) drives the mouse at a time. A touching
    * source takes over once the current owner is fully idle; everything else
    * is ignored so an idle second pad cannot corrupt the owner's gesture.
+   *
+   * @return true when the mouse consumed this pad's touch (the caller should
+   *         then lift the touch contacts and the touchpad click off the copy
+   *         it hands the virtual pad, so nothing reads the finger twice).
    */
-  void feed_usb_report(uintptr_t source, const uint8_t *usb, size_t len);
+  bool feed_usb_report(uintptr_t source, const uint8_t *usb, size_t len);
 
   /**
    * @brief Feed a normalized moonlight controller-touch event.

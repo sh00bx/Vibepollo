@@ -177,11 +177,17 @@ namespace platf::ds5_bridge {
           if (slot_) {
             uint8_t usb[INPUT_REPORT_LEN];
             if (bt_input_to_usb(payload, h->payload_len, usb)) {
-              usbip_->set_input(slot_, usb);
               // Desktop touchpad-mouse tap. Cheap no-op while a game is
-              // streamed; the raw report above reaches the virtual pad
-              // unchanged either way.
-              tpmouse::feed_usb_report((uintptr_t) this, usb, sizeof(usb));
+              // streamed. While the mouse consumes this pad's touch, lift the
+              // contacts and the touchpad click off the copy the virtual pad
+              // sees -- a host-side pad reader (Steam Input and friends) must
+              // not receive the same finger the desktop pointer acts on.
+              if (tpmouse::feed_usb_report((uintptr_t) this, usb, sizeof(usb))) {
+                usb[1 + 32] |= 0x80;  // touch point 0: finger up
+                usb[1 + 36] |= 0x80;  // touch point 1: finger up
+                usb[1 + 9] &= ~0x02;  // touchpad click
+              }
+              usbip_->set_input(slot_, usb);
             }
           }
           break;
