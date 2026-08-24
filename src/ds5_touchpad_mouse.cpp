@@ -79,6 +79,10 @@ namespace tpmouse {
       // SDL path: map moonlight pointerId -> slot
       uint32_t ptr_id[2] {0, 0};
       bool ptr_used[2] {false, false};
+      // The feeder currently driving the gesture state (0 = none). Everything
+      // here is per-gesture, so interleaved reports from a second pad would
+      // corrupt it -- the non-owner is ignored instead.
+      uintptr_t owner {0};
     };
 
     state_t st;
@@ -200,6 +204,25 @@ namespace tpmouse {
       st.have_dev_prev = false;
       st.settling = false;
       st.ptr_used[0] = st.ptr_used[1] = false;
+      st.owner = 0;
+    }
+
+    // One source owns the gesture state at a time. A different source takes
+    // over only when it actually touches (engaged) and the current owner is
+    // fully idle -- its resting reports must not tear down an ongoing gesture.
+    bool acquire_source_locked(uintptr_t source, bool engaged) {
+      if (st.owner == source) {
+        return true;
+      }
+      if (st.owner != 0 && (st.c[0].down || st.c[1].down || st.click_down)) {
+        return false;
+      }
+      if (!engaged) {
+        return false;
+      }
+      reset_locked();
+      st.owner = source;
+      return true;
     }
 
     /* Pointer motion: libinput's touchpad acceleration (filter-touchpad.c
@@ -492,7 +515,7 @@ namespace tpmouse {
     reset_locked();
   }
 
-  void feed_usb_report(const uint8_t *usb, size_t len) {
+  void feed_usb_report(uintptr_t source, const uint8_t *usb, size_t len) {
     // USB 0x01 layout: payload p = usb + 1; touch points at p[32..35] / p[36..39]
     // (bit7 of the first byte = finger up, low 7 bits = contact counter);
     // touchpad click = p[9] & 0x02. Offsets per Linux hid-playstation, the
@@ -504,11 +527,15 @@ namespace tpmouse {
       return;
     }
     const uint8_t *p = usb + 1;
+    const bool engaged = (p[32] & 0x80) == 0 || (p[36] & 0x80) == 0 || (p[9] & 0x02) != 0;
     // Free-running pad clock at common[27..30] (hid-playstation.c,
     // struct dualsense_input_report::sensor_timestamp). Little endian.
     const uint32_t dev_raw = (uint32_t) p[27] | ((uint32_t) p[28] << 8) |
                              ((uint32_t) p[29] << 16) | ((uint32_t) p[30] << 24);
     std::lock_guard lk(st.mtx);
+    if (!acquire_source_locked(source, engaged)) {
+      return;
+    }
     st.dev_clock_valid = true;
     st.dev_now_raw = dev_raw;
     contact_t prev[2] = {st.c[0], st.c[1]};
@@ -530,11 +557,15 @@ namespace tpmouse {
     st.have_dev_prev = true;
   }
 
-  bool feed_touch_event(uint8_t event_type, uint32_t pointer_id, float x, float y) {
+  bool feed_touch_event(uintptr_t source, uint8_t event_type, uint32_t pointer_id, float x, float y) {
     if (!active()) {
       return false;
     }
     std::lock_guard lk(st.mtx);
+    if (!acquire_source_locked(source, event_type == LI_TOUCH_EVENT_DOWN)) {
+      // Another pad owns the gesture state; this one stays a pad touchpad.
+      return false;
+    }
     // Moonlight touch events carry no pad clock; this path keeps libinput's
     // arrival-time estimate.
     st.dev_clock_valid = false;

@@ -1206,7 +1206,10 @@ namespace input {
     // mouse permission — controller permission alone must not reach the host
     // pointer.
     if (!!(input->permission & crypto::PERM::input_mouse) &&
-        tpmouse::feed_touch_event(packet->eventType,
+        // Source id: controller number, offset past 0 (= "no owner"). The
+        // bridge path uses session object addresses, far from this range.
+        tpmouse::feed_touch_event((uintptr_t) (1 + packet->controllerNumber),
+                                  packet->eventType,
                                   util::endian::little(packet->pointerId),
                                   from_clamped_netfloat(packet->x, 0.0f, 1.0f),
                                   from_clamped_netfloat(packet->y, 0.0f, 1.0f))) {

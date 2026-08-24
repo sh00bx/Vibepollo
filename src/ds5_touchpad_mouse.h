@@ -23,15 +23,21 @@ namespace tpmouse {
    * @brief Feed one full USB 0x01 DualSense input report (64 bytes).
    * Cheap no-op while the gate is inactive. Called from the bridge session
    * thread at report rate.
+   *
+   * The gesture state is single: one source (a distinct non-zero id per
+   * feeder, e.g. the session object) drives the mouse at a time. A touching
+   * source takes over once the current owner is fully idle; everything else
+   * is ignored so an idle second pad cannot corrupt the owner's gesture.
    */
-  void feed_usb_report(const uint8_t *usb, size_t len);
+  void feed_usb_report(uintptr_t source, const uint8_t *usb, size_t len);
 
   /**
    * @brief Feed a normalized moonlight controller-touch event.
+   * Source semantics as in feed_usb_report().
    * @return true when the event was consumed for mouse synthesis (the caller
    *         should then skip the emulated-pad touch passthrough).
    */
-  bool feed_touch_event(uint8_t event_type, uint32_t pointer_id, float x, float y);
+  bool feed_touch_event(uintptr_t source, uint8_t event_type, uint32_t pointer_id, float x, float y);
 
   /**
    * @brief Whether touchpad-mouse synthesis is currently in effect

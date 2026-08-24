@@ -181,7 +181,7 @@ namespace platf::ds5_bridge {
               // Desktop touchpad-mouse tap. Cheap no-op while a game is
               // streamed; the raw report above reaches the virtual pad
               // unchanged either way.
-              tpmouse::feed_usb_report(usb, sizeof(usb));
+              tpmouse::feed_usb_report((uintptr_t) this, usb, sizeof(usb));
             }
           }
           break;
