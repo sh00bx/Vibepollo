@@ -218,9 +218,11 @@ namespace input {
 
     // This session's permission mask, latched by passthrough() so the typed
     // handlers can gate side effects that cross input classes (controller
-    // touch becoming host mouse input). Until the first packet arrives,
-    // nothing is granted.
-    crypto::PERM permission {crypto::PERM::_no};
+    // touch becoming host mouse input). Atomic: the latch is written on the
+    // receive thread while the queued handlers read it, and permissions can
+    // be updated mid-session. Until the first packet arrives, nothing is
+    // granted.
+    std::atomic<crypto::PERM> permission {crypto::PERM::_no};
 
     std::vector<gamepad_t> gamepads;
     std::unique_ptr<platf::client_input_t> client_context;
@@ -1209,7 +1211,7 @@ namespace input {
     // pad's own touchpad. Synthesizing mouse input needs the mouse
     // permission — controller permission alone must not reach the host
     // pointer.
-    if (!!(input->permission & crypto::PERM::input_mouse) &&
+    if (!!(input->permission.load(std::memory_order_relaxed) & crypto::PERM::input_mouse) &&
         // Source id: controller number, offset past 0 (= "no owner"). The
         // bridge path uses session object addresses, far from this range.
         tpmouse::feed_touch_event((uintptr_t) (1 + packet->controllerNumber),
@@ -1818,7 +1820,7 @@ namespace input {
     }
 
     // The queue drops the permission; latch it for the typed handlers.
-    input->permission = permission;
+    input->permission.store(permission, std::memory_order_relaxed);
 
     const auto packet = validate_packet(input_data);
     if (!packet) {
