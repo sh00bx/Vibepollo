@@ -818,6 +818,11 @@ namespace platf::ds5_bridge {
       // flows again. The learned adj is kept; it decays on clean samples.
       fb_seen_ = false;
       fb_last_ms_.store(0, std::memory_order_relaxed);
+      // The touchpad-mouse only advances on reports; with the link gone a held
+      // synthesized button would stay down forever. The client preference dies
+      // with the link too -- the client re-asserts it after every handshake.
+      tpmouse::reset();
+      tpmouse::set_client_mode(-1);
       BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " link dropped; awaiting reconnect"sv;
     }
 
@@ -894,6 +899,10 @@ namespace platf::ds5_bridge {
     }
 
     void teardown(SOCKET ls) {
+      // Same as reset_transport(): no more reports will arrive to release a
+      // held button or carry the next session's preference.
+      tpmouse::reset();
+      tpmouse::set_client_mode(-1);
       pacer_stop_.store(true);
       if (pacer_thread_.joinable()) pacer_thread_.join();
       if (attach_thread_.joinable()) attach_thread_.join();

@@ -474,9 +474,17 @@ namespace tpmouse {
     if (prev != mode) {
       BOOST_LOG(info) << "tpmouse: client preference "
                       << (mode == 0 ? "off" : mode == 2 ? "always" : mode == 1 ? "auto" : "cleared");
-      // Re-evaluate on the next feed instead of waiting out the cache.
-      gate_cache.store(-1, std::memory_order_relaxed);
+      // Re-evaluate on the next feed instead of waiting out the cache. Expire
+      // the stamp rather than the cached verdict: active()'s off-transition
+      // reset needs the previous verdict (prev >= 0) to see the edge, and
+      // wiping it would leave a held click stuck across a mode change.
+      gate_stamp_ms.store(0, std::memory_order_relaxed);
     }
+  }
+
+  void reset() {
+    std::lock_guard lk(st.mtx);
+    reset_locked();
   }
 
   void feed_usb_report(const uint8_t *usb, size_t len) {

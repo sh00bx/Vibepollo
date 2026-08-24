@@ -46,4 +46,12 @@ namespace tpmouse {
    */
   void set_client_mode(int mode);
 
+  /**
+   * @brief Drop all gesture state and release any held synthesized button.
+   * Must be called when a feed path dies (bridge link drop or teardown,
+   * stream session end): the state machine otherwise only advances on the
+   * next report, which may never come.
+   */
+  void reset();
+
 }  // namespace tpmouse

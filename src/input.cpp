@@ -1894,6 +1894,10 @@ namespace input {
 
     // Ensure input is synchronous, by using the task_pool
     task_pool.push([]() {
+      // Touchpad-mouse buttons bypass mouse_press[] (they go straight to
+      // platf::button_mouse), so release them separately.
+      tpmouse::reset();
+
       for (int x = 0; x < mouse_press.size(); ++x) {
         if (mouse_press[x]) {
           platf::button_mouse(platf_input, x, true);
