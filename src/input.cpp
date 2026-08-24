@@ -214,6 +214,12 @@ namespace input {
     // Keep track of alt+ctrl+shift key combo
     int shortcutFlags;
 
+    // This session's permission mask, latched by passthrough() so the typed
+    // handlers can gate side effects that cross input classes (controller
+    // touch becoming host mouse input). Until the first packet arrives,
+    // nothing is granted.
+    crypto::PERM permission {crypto::PERM::_no};
+
     std::vector<gamepad_t> gamepads;
     std::unique_ptr<platf::client_input_t> client_context;
 
@@ -1196,8 +1202,11 @@ namespace input {
     // Desktop touchpad-mouse: while no game is streamed, SDL-mode pads get
     // their touch events turned into host mouse input here (the emulated pad
     // either has no touchpad at all, x360, or the desktop ignores it). Games
-    // get the normal passthrough below.
-    if (tpmouse::feed_touch_event(packet->eventType,
+    // get the normal passthrough below. Synthesizing mouse input needs the
+    // mouse permission — controller permission alone must not reach the host
+    // pointer.
+    if (!!(input->permission & crypto::PERM::input_mouse) &&
+        tpmouse::feed_touch_event(packet->eventType,
                                   util::endian::little(packet->pointerId),
                                   from_clamped_netfloat(packet->x, 0.0f, 1.0f),
                                   from_clamped_netfloat(packet->y, 0.0f, 1.0f))) {
@@ -1799,6 +1808,9 @@ namespace input {
     if (!(permission & crypto::PERM::_all_inputs)) {
       return;
     }
+
+    // The queue drops the permission; latch it for the typed handlers.
+    input->permission = permission;
 
     const auto packet = validate_packet(input_data);
     if (!packet) {
