@@ -576,7 +576,9 @@ namespace tpmouse {
       set_contact_locked(0, false, st.c[0].id, st.c[0].x, st.c[0].y);
       set_contact_locked(1, false, st.c[1].id, st.c[1].x, st.c[1].y);
       process_locked(prev, false);
-      return true;
+      // Pass it on as well: the emulated pad may hold contacts from before a
+      // gate flip, and cancel-everything means as much there as here.
+      return false;
     }
 
     // Resolve the pointer to a slot; allocate on DOWN.
@@ -589,7 +591,11 @@ namespace tpmouse {
     }
     if (slot < 0) {
       if (event_type != LI_TOUCH_EVENT_DOWN) {
-        return true;  // stale MOVE/UP for a pointer we never tracked
+        // A pointer we never tracked: its DOWN went to the emulated pad
+        // before the gate flipped on. Pass the rest of that gesture through
+        // too -- the pad must see the terminating edge, or it holds the
+        // contact (and its ViGEm pointer slot) forever.
+        return false;
       }
       for (int i = 0; i < 2; i++) {
         if (!st.ptr_used[i]) {
@@ -600,7 +606,10 @@ namespace tpmouse {
         }
       }
       if (slot < 0) {
-        return true;  // third finger; the DS5 pad tracks two
+        // Third finger; the DS5 pad tracks two. Let the whole extra gesture
+        // stay a pad touch rather than consuming its DOWN and orphaning the
+        // UP.
+        return false;
       }
     }
 
