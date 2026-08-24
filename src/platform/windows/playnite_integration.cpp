@@ -67,6 +67,20 @@ namespace platf::playnite {
     active_game_status_t g_active_game;
     std::vector<active_game_status_t> g_active_games;
 
+    // Steady-clock ms at which the IPC pipe last went down; 0 while it is up.
+    // The live-game status is only ever refreshed over the pipe, so a latched
+    // "active" becomes untrustworthy once the pipe has been gone long enough
+    // that a gameStopped could plausibly have been missed. Deliberate stops
+    // and reconnect blips stay inside the grace window and keep the latch.
+    std::atomic<int64_t> g_pipe_down_since_ms {0};
+    constexpr int64_t kActiveGameStaleGraceMs = 60000;
+
+    int64_t steady_now_ms() {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+    }
+
     std::string lower_copy(std::string s) {
       std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -128,6 +142,19 @@ namespace platf::playnite {
   }
 
   active_game_status_t get_active_game_status() {
+    // A latched "active" outlives the pipe that alone could clear it. Trust
+    // it across brief outages, but not once gameStopped can plausibly have
+    // been missed (Playnite crashed or was closed mid-game).
+    const int64_t down_since = g_pipe_down_since_ms.load(std::memory_order_relaxed);
+    if (down_since != 0 && steady_now_ms() - down_since > kActiveGameStaleGraceMs) {
+      std::scoped_lock lk(g_active_game_mutex);
+      if (g_active_game.active) {
+        BOOST_LOG(info) << "Playnite: active-game status expired; IPC pipe has been down past the grace period";
+        g_active_games.clear();
+        g_active_game = active_game_status_t {};
+      }
+      return g_active_game;
+    }
     std::scoped_lock lk(g_active_game_mutex);
     return g_active_game;
   }
@@ -490,6 +517,7 @@ namespace platf::playnite {
         handle_message(bytes);
       });
       client_->set_connected_handler([this]() {
+        g_pipe_down_since_ms.store(0, std::memory_order_relaxed);
         try {
           nlohmann::json hello;
           hello["type"] = "hello";
@@ -499,11 +527,14 @@ namespace platf::playnite {
         } catch (...) {}
       });
       client_->set_disconnected_handler([]() {
-        // The live-game status is only trustworthy while the pipe lives:
-        // once it is gone, gameStopped can never arrive, and a status left
-        // latched "active" would hold the DS5 touchpad-mouse gate closed for
-        // the rest of the host's uptime.
-        remember_active_game_stopped(std::string());
+        // Do NOT clear the live-game status here: deliberate stops (API
+        // inactivity, session end) and reconnect blips land in this callback
+        // too, and wiping the latch mid-game would hand a running game's
+        // touchpad to the desktop pointer. Start the staleness clock instead;
+        // the status expires only if no connection returns within the grace
+        // period (see get_active_game_status).
+        int64_t expected = 0;
+        g_pipe_down_since_ms.compare_exchange_strong(expected, steady_now_ms(), std::memory_order_relaxed);
       });
       client_->start();
       {
@@ -620,6 +651,13 @@ namespace platf::playnite {
           auto elapsed = now - last_activity;
 
           if (elapsed >= kApiInactivityTimeout) {
+            // While a Playnite game runs, the pipe is load-bearing: it is the
+            // only carrier of gameStopped, and expiring it would eventually
+            // stale-out the status under the running game. Idle-stop once
+            // nothing is active.
+            if (get_active_game_status().active) {
+              continue;
+            }
             BOOST_LOG(debug) << "Playnite: IPC client stopping due to "
                              << std::chrono::duration_cast<std::chrono::seconds>(elapsed).count()
                              << "s of API inactivity";
