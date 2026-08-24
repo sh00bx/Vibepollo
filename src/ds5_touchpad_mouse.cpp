@@ -92,6 +92,12 @@ namespace tpmouse {
     std::atomic<int> gate_cache {-1};
     std::atomic<int64_t> gate_stamp_ms {0};
 
+    // Tuning values, mirrored out of the config at the same cadence: the
+    // report path reads them per moving report while holding st.mtx, and must
+    // not take the config mutex there either.
+    std::atomic<int> speed_cache {100};
+    std::atomic<bool> natural_scroll_cache {false};
+
     // Client preference (CTMB_MSG_TPMOUSE); -1 = none, fall back to config.
     std::atomic<int> client_mode {-1};
 
@@ -151,13 +157,11 @@ namespace tpmouse {
     }
 
     int speed_percent() {
-      std::lock_guard lk(config::ds5b_mutex);
-      return config::ds5b.touchpad_mouse_speed;
+      return speed_cache.load(std::memory_order_relaxed);
     }
 
     bool natural_scroll() {
-      std::lock_guard lk(config::ds5b_mutex);
-      return config::ds5b.touchpad_mouse_natural_scroll;
+      return natural_scroll_cache.load(std::memory_order_relaxed);
     }
 
     void release_click_locked() {
@@ -514,6 +518,11 @@ namespace tpmouse {
     if (gate_cache.load(std::memory_order_relaxed) < 0 ||
         now - gate_stamp_ms.load(std::memory_order_relaxed) > 500) {
       bool on = evaluate_gate();
+      {
+        std::lock_guard lk(config::ds5b_mutex);
+        speed_cache.store(config::ds5b.touchpad_mouse_speed, std::memory_order_relaxed);
+        natural_scroll_cache.store(config::ds5b.touchpad_mouse_natural_scroll, std::memory_order_relaxed);
+      }
       int prev = gate_cache.exchange(on ? 1 : 0, std::memory_order_relaxed);
       gate_stamp_ms.store(now, std::memory_order_relaxed);
       if (prev >= 0 && prev != (on ? 1 : 0)) {
