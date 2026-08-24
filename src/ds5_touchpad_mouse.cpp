@@ -132,8 +132,13 @@ namespace tpmouse {
       }
 #endif
       // 2. The streamed app's own metadata: anything that launches something
-      //    (cmd, Playnite target, detached) owns the touchpad.
-      if (proc::proc.running() == 0) {
+      //    (cmd, Playnite target, detached) owns the touchpad. Read the app
+      //    id passively: proc.running() drives the session state machine
+      //    (it consumes deferred-launch flags and may run terminate(), with
+      //    its blocking undo commands, in the caller's thread) and belongs
+      //    to the control thread's poll, not to a gate evaluated on the
+      //    bridge and stream-input threads.
+      if (proc::proc.current_app_id() <= 0) {
         // No app at all: no active stream is feeding us anyway; allow, so the
         // brief window during session start behaves like the desktop it shows.
         return true;
