@@ -8,6 +8,8 @@
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 
+#include <stdint.h>  /* MinGW: sys/types.h does not provide int32_t */
+
 #define fabs(x) ((x) < 0 ? -(x) : (x))
 /* C does not provide an explicit arithmetic shift right but this will
    always be correct and every compiler *should* generate optimal code */
