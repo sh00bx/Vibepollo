@@ -57,11 +57,13 @@ namespace tpmouse {
   void set_client_mode(int mode);
 
   /**
-   * @brief Drop all gesture state and release any held synthesized button.
+   * @brief Drop the gesture state and release any held synthesized button,
+   * if @p source currently owns the gesture (cheap no-op otherwise).
    * Must be called when a feed path dies (bridge link drop or teardown,
-   * stream session end): the state machine otherwise only advances on the
-   * next report, which may never come.
+   * stream session end, pad removal, mouse permission revoked): the state
+   * machine otherwise only advances on the next report, which may never
+   * come. Only the id is compared -- the call is safe with a dying source.
    */
-  void reset();
+  void reset(uintptr_t source);
 
 }  // namespace tpmouse

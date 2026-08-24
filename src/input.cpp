@@ -168,6 +168,11 @@ namespace input {
     }
 
     ~gamepad_t() {
+#ifdef _WIN32
+      // Last-resort release of a touchpad-mouse gesture this slot still owns
+      // (only the address is compared; nothing is dereferenced).
+      tpmouse::reset((uintptr_t) this);
+#endif
       if (id >= 0) {
         task_pool.push([id = this->id]() {
           free_gamepad(platf_input, id);
@@ -1211,15 +1216,24 @@ namespace input {
     // pad's own touchpad. Synthesizing mouse input needs the mouse
     // permission — controller permission alone must not reach the host
     // pointer.
-    if (!!(input->permission.load(std::memory_order_relaxed) & crypto::PERM::input_mouse) &&
-        // Source id: controller number, offset past 0 (= "no owner"). The
-        // bridge path uses session object addresses, far from this range.
-        tpmouse::feed_touch_event((uintptr_t) (1 + packet->controllerNumber),
-                                  packet->eventType,
-                                  util::endian::little(packet->pointerId),
-                                  from_clamped_netfloat(packet->x, 0.0f, 1.0f),
-                                  from_clamped_netfloat(packet->y, 0.0f, 1.0f))) {
-      return;
+    // Source id: this session's gamepad slot. The address is unique across
+    // concurrent sessions (a bare controller number is not) and disjoint
+    // from the bridge path's session-object ids.
+    const uintptr_t tp_source = (uintptr_t) &gamepad;
+    if (!!(input->permission.load(std::memory_order_relaxed) & crypto::PERM::input_mouse)) {
+      if (tpmouse::feed_touch_event(tp_source,
+                                    packet->eventType,
+                                    util::endian::little(packet->pointerId),
+                                    from_clamped_netfloat(packet->x, 0.0f, 1.0f),
+                                    from_clamped_netfloat(packet->y, 0.0f, 1.0f))) {
+        return;
+      }
+    } else {
+      // No (or no longer any) mouse permission -- possibly revoked
+      // mid-gesture. Drop whatever this source still owns so a held click
+      // and the owner latch cannot outlive the grant; the event itself
+      // continues to the emulated pad below.
+      tpmouse::reset(tp_source);
     }
 #endif
 
@@ -1326,6 +1340,10 @@ namespace input {
       gamepad.id = id;
     } else if (!(packet->activeGamepadMask & (1 << packet->controllerNumber)) && gamepad.id >= 0) {
       // If this is the final event for a gamepad being removed, free the gamepad and return.
+#ifdef _WIN32
+      // A pad dying mid-touch never sends its UP; drop any gesture it owns.
+      tpmouse::reset((uintptr_t) &gamepad);
+#endif
       free_gamepad(platf_input, gamepad.id);
       gamepad.id = -1;
       return;
@@ -1903,11 +1921,15 @@ namespace input {
     task_pool.cancel(input->mouse_left_button_timeout);
 
     // Ensure input is synchronous, by using the task_pool
-    task_pool.push([]() {
+    task_pool.push([input]() {
 #ifdef _WIN32
       // Touchpad-mouse buttons bypass mouse_press[] (they go straight to
-      // platf::button_mouse), so release them separately.
-      tpmouse::reset();
+      // platf::button_mouse), so release them separately -- but only this
+      // session's sources: a gesture owned by another session or by a
+      // bridge-fed pad must survive.
+      for (auto &gamepad : input->gamepads) {
+        tpmouse::reset((uintptr_t) &gamepad);
+      }
 #endif
 
       for (int x = 0; x < mouse_press.size(); ++x) {

@@ -43,6 +43,12 @@ namespace platf::ds5_bridge {
       return (uint64_t) duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
     }
 
+    // Bridge links that completed a HELLO handshake, across all sessions. The
+    // touchpad-mouse client preference is client-scoped, not per-pad: it may
+    // only fall back to the host config once the LAST live link is gone (each
+    // link re-asserts it right after its handshake).
+    std::atomic<int> g_hello_links {0};
+
     void ensure_enet() {
       static std::once_flag once;
       std::call_once(once, [] {
@@ -366,6 +372,9 @@ namespace platf::ds5_bridge {
       // right back into a drop loop (the Phase 2b ~6 s drop/reconnect cycle, and
       // the "2 drops then stable" connects before it).
       hello_seen_.store(true);
+      if (!link_live_.exchange(true)) {
+        g_hello_links.fetch_add(1);
+      }
 
       // BT firmware gate: over Bluetooth the DualSense ignores lightbar color
       // writes until a one-shot lightbar-setup release (valid_flag2 bit1 +
@@ -832,11 +841,15 @@ namespace platf::ds5_bridge {
       // flows again. The learned adj is kept; it decays on clean samples.
       fb_seen_ = false;
       fb_last_ms_.store(0, std::memory_order_relaxed);
-      // The touchpad-mouse only advances on reports; with the link gone a held
-      // synthesized button would stay down forever. The client preference dies
-      // with the link too -- the client re-asserts it after every handshake.
-      tpmouse::reset();
-      tpmouse::set_client_mode(-1);
+      // The touchpad-mouse only advances on reports; with the link gone a
+      // held synthesized button would stay down forever. Scoped to this pad:
+      // a second pad's live gesture must survive. The client preference falls
+      // only with the LAST live link -- it belongs to the client, not to one
+      // pad's transport, and every link re-asserts it after its handshake.
+      tpmouse::reset((uintptr_t) this);
+      if (link_live_.exchange(false) && g_hello_links.fetch_sub(1) == 1) {
+        tpmouse::set_client_mode(-1);
+      }
       BOOST_LOG(info) << "ds5-bridge: session "sv << label() << " link dropped; awaiting reconnect"sv;
     }
 
@@ -914,9 +927,11 @@ namespace platf::ds5_bridge {
 
     void teardown(SOCKET ls) {
       // Same as reset_transport(): no more reports will arrive to release a
-      // held button or carry the next session's preference.
-      tpmouse::reset();
-      tpmouse::set_client_mode(-1);
+      // held button, and this link's share of the client preference ends.
+      tpmouse::reset((uintptr_t) this);
+      if (link_live_.exchange(false) && g_hello_links.fetch_sub(1) == 1) {
+        tpmouse::set_client_mode(-1);
+      }
       pacer_stop_.store(true);
       if (pacer_thread_.joinable()) pacer_thread_.join();
       if (attach_thread_.joinable()) attach_thread_.join();
@@ -959,6 +974,7 @@ namespace platf::ds5_bridge {
     // hard-fails on any frame that precedes HOST_CONFIG. Atomic — set/cleared on
     // the session thread, read by the pacer and usbip threads.
     std::atomic<bool> hello_seen_ {false};
+    std::atomic<bool> link_live_ {false};  // this session holds one g_hello_links count
 
     // Rate servo (on_pace_feedback writes on the run thread, pacer reads).
     std::atomic<int> pace_adj_us_ {0};       // period stretch over the base cadence

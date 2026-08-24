@@ -317,13 +317,18 @@ namespace tpmouse {
       constexpr double XY_SCALE = 27.0 / 21.0;
       // Time constant of the velocity EMA; 1-exp(-4015/11000) = 0.30, the
       // per-event alpha the curve was tuned with at the pad's median cadence.
+      // Substituted intervals carry no time information, so they keep the
+      // tuned per-event blend instead -- the SDL path (always substituted
+      // below 50 ms) would otherwise smooth 2.5x less than it was tuned to.
       constexpr double EMA_TAU_US = 11000.0;
+      constexpr double EMA_ALPHA_EVENT = 0.3;
 
       auto now = std::chrono::steady_clock::now();
       double dys = (double) dy * XY_SCALE;
 
       double dt_us = SMOOTH_VALUE_US;
       bool dev_dt_ok = false;
+      bool dt_substituted = true;  // until a real interval replaces the default
       if (st.dev_clock_valid && st.have_dev_prev) {
         // Unsigned arithmetic carries the 32-bit wrap (~24 min) on its own.
         uint32_t ticks = st.dev_now_raw - st.dev_prev_raw;
@@ -335,6 +340,7 @@ namespace tpmouse {
         if (us >= DEV_DT_MIN_US && us <= DEV_DT_MAX_US) {
           dt_us = us;
           dev_dt_ok = true;
+          dt_substituted = false;
         }
       }
       if (!dev_dt_ok && st.have_move_time) {
@@ -342,8 +348,10 @@ namespace tpmouse {
                   now - st.last_move_time)
                   .count() +
                 1.0;
+        dt_substituted = false;
         if (dt_us < SMOOTH_THRESHOLD_US) {
           dt_us = SMOOTH_VALUE_US;
+          dt_substituted = true;
         }
       }
       st.last_move_time = now;
@@ -356,7 +364,7 @@ namespace tpmouse {
       }
 
       double v = std::hypot((double) dx, dys) / dt_us;  // units/µs
-      double alpha = 1.0 - std::exp(-dt_us / EMA_TAU_US);
+      double alpha = dt_substituted ? EMA_ALPHA_EVENT : 1.0 - std::exp(-dt_us / EMA_TAU_US);
       st.velocity_ema += alpha * (v - st.velocity_ema);
 
       // units/µs -> nominal mm/s at 1000 dpi: *1e6 (per s) * 25.4/1000
@@ -549,9 +557,11 @@ namespace tpmouse {
     }
   }
 
-  void reset() {
+  void reset(uintptr_t source) {
     std::lock_guard lk(st.mtx);
-    reset_locked();
+    if (st.owner == source) {
+      reset_locked();
+    }
   }
 
   bool feed_usb_report(uintptr_t source, const uint8_t *usb, size_t len) {
