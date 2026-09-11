@@ -70,11 +70,10 @@ namespace platf::ds5_bridge {
 
     bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, pad_kind_e kind,
                    bool haptics, bool audio_batched, int audio_cushion, bool audio_cancel_bits,
-                   bool pace_refill, int pace_refill_cap_ms, bool haptics_handback,
+                   bool haptics_handback,
                    const std::atomic<uint32_t> *lightbar_rgb):
         usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport), kind_(kind),
         audio_batched_(audio_batched), audio_cushion_(audio_cushion), audio_cancel_bits_(audio_cancel_bits),
-        pace_refill_(pace_refill), pace_refill_cap_us_((int64_t) pace_refill_cap_ms * 1000),
         haptics_handback_(haptics_handback),
         lightbar_rgb_(lightbar_rgb) { haptics_want_.store(haptics); }
 
@@ -343,11 +342,6 @@ namespace platf::ds5_bridge {
         if (haptics_handback_) {
           BOOST_LOG(info) << "ds5-bridge: haptics override hands back as f0 0x01 without 0x02, f2 &= ~0x0C"sv;
         }
-        if (pace_refill_) {
-          BOOST_LOG(info) << "ds5-bridge: pace refill on (dropped audio is made up at up to +"sv
-                          << DS5_PACE_REFILL_MAX_US << " us per 0x36 period, owed audio capped at "sv
-                          << pace_refill_cap_us_ / 1000 << " ms)"sv;
-        }
         if (batched) {
           BOOST_LOG(info) << "ds5-bridge: audio downlink = batched 0x39 ("sv
                           << DS5_0X39_LEN << " B, two frames + two coil blocks per report)"sv;
@@ -550,9 +544,6 @@ namespace platf::ds5_bridge {
         adj = std::max(adj - 3, 0);
       }
       pace_adj_us_.store(adj, std::memory_order_relaxed);
-      if (pace_refill_ && kind_ == pad_kind_e::ds5) {
-        update_refill(fb, drops, q_excess, adj);
-      }
       fb_last_ms_.store(
         std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count(),
@@ -575,51 +566,10 @@ namespace platf::ds5_bridge {
                         << dbg_fb_fifo_max_ << " q=" << (int) fb.outstanding
                         << "/" << fb.maxq << " drops+=" << dbg_fb_drops_
                         << " inj=" << fb.inj_total;
-        if (pace_refill_ && !ds4) {
-          BOOST_LOG(info) << "ds5-pace: refill=" << refill_us_.load(std::memory_order_relaxed)
-                          << "us debt=" << refill_debt_us_.load(std::memory_order_relaxed) / 1000
-                          << "ms owed+=" << dbg_refill_owed_us_ / 1000 << "ms";
-          dbg_refill_owed_us_ = 0;
-        }
         dbg_fb_n_ = 0;
         dbg_fb_drops_ = 0;
         dbg_fb_fifo_max_ = 0;
       }
-    }
-
-    // Run thread, per feedback sample: book dropped reports as audio owed to the
-    // pad and decide the refill speed-up. Only drops are booked: they are the one
-    // loss that is certain (the pad re-primes on delivered audio, so a dropped
-    // report is depth it never gets back). The refill runs only once the
-    // positive branch has fully relaxed and the TV shows neither backlog nor
-    // fresh drops, ramps in, and needs the daemon's inject counter to move — if
-    // the extra reports are not leaving the TV they are not reaching the pad.
-    // Backlog showing up while it runs means the overfeed is parking at the TV
-    // instead of banking in the pad: the pad is full, the debt is void.
-    void update_refill(const ctmb_pace_feedback_t &fb, uint32_t drops, int q_excess, int adj) {
-      const uint32_t inj_delta = fb.inj_total - fb_last_inj_;
-      const bool inj_known = fb_last_inj_ != 0;
-      fb_last_inj_ = fb.inj_total;
-      int r = refill_us_.load(std::memory_order_relaxed);
-      if (drops > 0) {
-        const int report_us = hap_ ? hap_->pace_base_us() : DS5_PACE_BASE_US;
-        const int64_t owed = (int64_t) std::min<uint32_t>(drops, 64u) * report_us;
-        const int64_t debt = refill_debt_us_.fetch_add(owed, std::memory_order_relaxed) + owed;
-        if (debt > pace_refill_cap_us_) {
-          refill_debt_us_.fetch_sub(debt - pace_refill_cap_us_, std::memory_order_relaxed);
-        }
-        dbg_refill_owed_us_ += (uint32_t) owed;
-        r = 0;  // the positive branch owns the rate while losses are fresh
-      } else if (fb.fifo_count > 0 || q_excess > 0) {
-        if (r > 0) refill_debt_us_.store(0, std::memory_order_relaxed);
-        r = 0;
-      } else if (adj == 0 && inj_known && inj_delta > 0 &&
-                 refill_debt_us_.load(std::memory_order_relaxed) > 0) {
-        r = std::min(r + DS5_PACE_REFILL_STEP_US, DS5_PACE_REFILL_MAX_US);
-      } else {
-        r = 0;
-      }
-      refill_us_.store(r, std::memory_order_relaxed);
     }
 
     // usbip server thread (DS4 slot): the game wrote a 31-byte USB 0x05 output
@@ -1063,13 +1013,7 @@ namespace platf::ds5_bridge {
         // The servo's adj is a RELATIVE rate offset expressed in microseconds of
         // the 0x36 period; a batched report covers two of those, so scale it or
         // the same feedback would only stretch the wire rate half as much.
-        int adj_scaled = adj * pace_scale;
-        // Refill: shorten the period; each faster tick that queues a report
-        // produces refill_scaled us of audio beyond the drain, which pays the
-        // debt down (below). The run thread only sets refill_us_ while adj is 0,
-        // so the two branches never add up.
-        const int refill_scaled = fb_live ? refill_us_.load(std::memory_order_relaxed) * pace_scale : 0;
-        adj_scaled -= refill_scaled;
+        const int adj_scaled = adj * pace_scale;
         const auto period = microseconds(pace_base_us + adj_scaled);
         if (hap_) hap_->set_pace_us(pace_base_us + adj_scaled);
         next += period;
@@ -1083,14 +1027,7 @@ namespace platf::ds5_bridge {
         // dropped frames are disposable.
         if (hap_->build_audio(rep) && client_ready_.load(std::memory_order_relaxed)) {
           std::lock_guard<std::mutex> lk(out_mtx_);
-          if (outbox_.size() < 256) {
-            outbox_.emplace_back(rep, rep + rep_len);
-            if (refill_scaled > 0 &&
-                refill_debt_us_.fetch_sub(refill_scaled, std::memory_order_relaxed) <= refill_scaled) {
-              refill_debt_us_.store(0, std::memory_order_relaxed);
-              refill_us_.store(0, std::memory_order_relaxed);
-            }
-          }
+          if (outbox_.size() < 256) outbox_.emplace_back(rep, rep + rep_len);
           if (hap_->batched() && ++setstate_ticks >= setstate_every) {
             setstate_ticks = 0;
             hap_->build_setstate_0x32(setstate);
@@ -1219,11 +1156,6 @@ namespace platf::ds5_bridge {
       // flows again. The learned adj is kept; it decays on clean samples.
       fb_seen_ = false;
       fb_last_ms_.store(0, std::memory_order_relaxed);
-      // A new link may be a fresh pad or a fresh daemon: the debt described
-      // the old pad's buffer, and the old inj counter is gone.
-      refill_us_.store(0, std::memory_order_relaxed);
-      refill_debt_us_.store(0, std::memory_order_relaxed);
-      fb_last_inj_ = 0;
       // The touchpad-mouse only advances on reports; with the link gone a
       // held synthesized button would stay down forever. Scoped to this pad:
       // a second pad's live gesture must survive. The client preference falls
@@ -1367,8 +1299,6 @@ namespace platf::ds5_bridge {
     const bool audio_batched_ {false};
     const int audio_cushion_ {4};
     const bool audio_cancel_bits_ {false};
-    const bool pace_refill_ {false};          // negative servo branch (DS5 only)
-    const int64_t pace_refill_cap_us_ {0};
     const bool haptics_handback_ {false};     // override form, see on_game_output
     std::atomic<bool> haptics_on_ {false};
 
@@ -1391,13 +1321,6 @@ namespace platf::ds5_bridge {
     uint32_t fb_last_drop_ = 0;              // run thread only
     bool fb_seen_ = false;                   // run thread only
     uint32_t dbg_fb_n_ = 0, dbg_fb_drops_ = 0, dbg_fb_fifo_max_ = 0;
-    // Refill (negative branch): the run thread books the audio the TV dropped
-    // as debt and sets the speed-up; the pacer applies it and pays the debt
-    // down by the extra audio each faster tick produces.
-    std::atomic<int> refill_us_ {0};           // period shortening per 0x36 period
-    std::atomic<int64_t> refill_debt_us_ {0};  // audio still owed to the pad
-    uint32_t fb_last_inj_ = 0;                 // run thread only
-    uint32_t dbg_refill_owed_us_ = 0;          // run thread only, per telemetry window
     std::thread thread_;
 
     transport_e transport_ {NONE};
@@ -1591,7 +1514,6 @@ namespace platf::ds5_bridge {
                                                   haptics_.load(),
                                                   audio_batched_.load(), audio_cushion_.load(),
                                                   audio_cancel_bits_.load(),
-                                                  pace_refill_.load(), pace_refill_cap_ms_.load(),
                                                   haptics_handback_.load(),
                                                   &lightbar_rgb_);
       sess->start();

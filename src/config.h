@@ -432,15 +432,6 @@ namespace config {
     // speaker. OFF until the SPL A/B on our own pad (port plan W1-05) says
     // otherwise. Read at session creation (next controller connect).
     bool native_audio_cancel_bits {false};
-    // Refill dropped speaker audio (port plan W2-01): after the TV reports
-    // dropped audio reports, the pacer runs up to 0.66% fast until the dropped
-    // audio has been made up, so the pad's buffer returns to its slider depth
-    // instead of staying short. OFF until the click-latency mic rig shows the
-    // latency returning to the slider after a provoked drop without creeping
-    // above it. The cap bounds how much audio one burst of drops can owe (and
-    // so how much latency a wrong refill could add). Read at session creation.
-    bool native_pace_refill {false};
-    int native_pace_refill_cap_ms {64};
     // How the rumble-vs-haptics override hands the coils back (port plan W2-03).
     // Off: clear both valid_flag0 rumble bits (the behavior since a6d6d6a2).
     // On: the SundayMoments form -- keep COMPATIBLE_VIBRATION (0x01) with zero

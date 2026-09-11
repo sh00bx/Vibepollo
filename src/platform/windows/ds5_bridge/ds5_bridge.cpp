@@ -52,8 +52,8 @@ namespace ds5_bridge_provider {
       using namespace std::chrono_literals;
       bool started = false;
       while (!st.stop_requested()) {
-        bool enable, haptics, audio_batched, audio_cancel_bits, pace_refill, haptics_handback;
-        int audio_cushion, pace_refill_cap_ms;
+        bool enable, haptics, audio_batched, audio_cancel_bits, haptics_handback;
+        int audio_cushion;
         int port;
         std::string lightbar;
         {
@@ -64,8 +64,6 @@ namespace ds5_bridge_provider {
           audio_batched = config::ds5b.native_audio_batched;
           audio_cushion = config::ds5b.native_audio_cushion_frames;
           audio_cancel_bits = config::ds5b.native_audio_cancel_bits;
-          pace_refill = config::ds5b.native_pace_refill;
-          pace_refill_cap_ms = config::ds5b.native_pace_refill_cap_ms;
           haptics_handback = config::ds5b.native_haptics_handback;
           lightbar = config::ds5b.lightbar_color;
         }
@@ -79,7 +77,6 @@ namespace ds5_bridge_provider {
         host().set_audio_batched(audio_batched);
         host().set_audio_cushion(audio_cushion);
         host().set_audio_cancel_bits(audio_cancel_bits);
-        host().set_pace_refill(pace_refill, pace_refill_cap_ms);
         host().set_haptics_handback(haptics_handback);
         host().set_lightbar(parse_lightbar(lightbar));
         if (want && !started) {
