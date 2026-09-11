@@ -152,7 +152,10 @@ namespace nvenc {
     }
 
     if (encoder) {
-      destroy_encoder();
+      if (!destroy_encoder()) {
+        BOOST_LOG(error) << "NvEnc: couldn't destroy the previous encoder before reinitialization";
+        return false;
+      }
     }
     if (initial_hdr_metadata) {
       set_hdr_metadata(*initial_hdr_metadata);
@@ -178,15 +181,19 @@ namespace nvenc {
 
     auto destroy_api_attempt = [&]() {
       if (encoder) {
-        nvenc->nvEncDestroyEncoder(encoder);
+        if (nvenc_failed(nvenc->nvEncDestroyEncoder(encoder))) {
+          BOOST_LOG(error) << "NvEnc: couldn't destroy the rejected API session: " << last_nvenc_error_string;
+          return false;
+        }
         encoder = nullptr;
       }
       selected_api_version = 0;
+      return true;
     };
 
     auto retry_with_next_api = [&](std::string_view operation, uint32_t api_version) {
       BOOST_LOG(debug) << "NvEnc: "sv << operation << " rejected API "sv << api::version_string(api_version);
-      destroy_api_attempt();
+      return destroy_api_attempt();
     };
 
     auto buffer_is_10bit = [&]() {
@@ -218,14 +225,18 @@ namespace nvenc {
           return false;
         }
 
-        retry_with_next_api("NvEncOpenEncodeSessionEx()"sv, api_version);
+        if (!retry_with_next_api("NvEncOpenEncodeSessionEx()"sv, api_version)) {
+          return false;
+        }
         continue;
       }
 
       uint32_t encode_guid_count = 0;
       if (nvenc_failed(nvenc->nvEncGetEncodeGUIDCount(encoder, &encode_guid_count))) {
         if (last_nvenc_status == NV_ENC_ERR_INVALID_VERSION) {
-          retry_with_next_api("NvEncGetEncodeGUIDCount()"sv, api_version);
+          if (!retry_with_next_api("NvEncGetEncodeGUIDCount()"sv, api_version)) {
+            return false;
+          }
           continue;
         }
 
@@ -236,7 +247,9 @@ namespace nvenc {
       std::vector<GUID> encode_guids(encode_guid_count);
       if (nvenc_failed(nvenc->nvEncGetEncodeGUIDs(encoder, encode_guids.data(), (uint32_t) encode_guids.size(), &encode_guid_count))) {
         if (last_nvenc_status == NV_ENC_ERR_INVALID_VERSION) {
-          retry_with_next_api("NvEncGetEncodeGUIDs()"sv, api_version);
+          if (!retry_with_next_api("NvEncGetEncodeGUIDs()"sv, api_version)) {
+            return false;
+          }
           continue;
         }
 
@@ -451,6 +464,7 @@ namespace nvenc {
       }
       return value;
     };
+    const auto encoder_engine_count = get_encoder_cap(NV_ENC_CAPS_NUM_ENCODER_ENGINES);
 
     NV_ENC_CONFIG enc_config {};
     if (have_preset_config) {
@@ -762,7 +776,11 @@ namespace nvenc {
                          << "); retrying NvEncInitializeEncoder() with driver defaults";
 
         // Must destroy and re-open the session since NvEncInitializeEncoder can only be called once
-        nvenc->nvEncDestroyEncoder(encoder);
+        if (nvenc_failed(nvenc->nvEncDestroyEncoder(encoder))) {
+          BOOST_LOG(error) << "NvEnc: couldn't destroy the rejected explicit-config session: "
+                           << last_nvenc_error_string;
+          return false;
+        }
         encoder = nullptr;
 
         NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS session_params = {api::open_encode_session_ex_params_version(selected_api_version)};
@@ -863,6 +881,9 @@ namespace nvenc {
       if (config.insert_filler_data) {
         extra += " filler-data";
       }
+      if (encoder_engine_count > 0) {
+        extra += std::format(" engines={}", encoder_engine_count);
+      }
       extra += " " + split_frame_status;
 
       BOOST_LOG(info) << "NvEnc: created encoder " << codec_name_from_video_format(client_config.videoFormat) << " "
@@ -874,7 +895,8 @@ namespace nvenc {
     return true;
   }
 
-  void nvenc_base::destroy_encoder() {
+  bool nvenc_base::destroy_encoder() {
+    bool destroyed = true;
     if (output_bitstream) {
       if (nvenc_failed(nvenc->nvEncDestroyBitstreamBuffer(encoder, output_bitstream))) {
         BOOST_LOG(error) << "NvEnc: NvEncDestroyBitstreamBuffer() failed: " << last_nvenc_error_string;
@@ -897,6 +919,7 @@ namespace nvenc {
     if (encoder) {
       if (nvenc_failed(nvenc->nvEncDestroyEncoder(encoder))) {
         BOOST_LOG(error) << "NvEnc: NvEncDestroyEncoder() failed: " << last_nvenc_error_string;
+        destroyed = false;
       }
       encoder = nullptr;
     }
@@ -906,6 +929,7 @@ namespace nvenc {
     hdr_metadata_valid = false;
     hdr_metadata = {};
     selected_api_version = 0;
+    return destroyed;
   }
 
   void nvenc_base::set_hdr_metadata(const SS_HDR_METADATA &metadata) {
@@ -917,6 +941,12 @@ namespace nvenc {
   }
 
   nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr) {
+    // Both clock reads are skipped unless the debug log level is active.
+    encoder_state.encode_latency_logger.first_point_now();
+    auto latency_guard = util::fail_guard([&] {
+      encoder_state.encode_latency_logger.second_point_now_and_log();
+    });
+
     if (!encoder) {
       return {};
     }

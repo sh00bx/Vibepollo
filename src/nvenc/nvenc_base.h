@@ -59,7 +59,7 @@ namespace nvenc {
      * @brief Destroy the encoder.
      *        Derived classes classes call it in the destructor.
      */
-    void destroy_encoder();
+    bool destroy_encoder();
 
     /**
      * @brief Encode the next frame using platform-specific input surface.
@@ -165,6 +165,7 @@ namespace nvenc {
       bool rfi_needs_confirmation = false;
       std::pair<uint64_t, uint64_t> last_rfi_range;
       logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "NvEnc: encoded frame sizes in kB", ""};
+      logging::time_delta_periodic_logger encode_latency_logger = {debug, "NvEnc: native encode call latency"};
     } encoder_state;
 
     // Saved during create_encoder() so set_bitrate() can drive nvEncReconfigureEncoder().
