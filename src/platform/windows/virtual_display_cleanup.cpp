@@ -6,6 +6,7 @@
   #include "src/logging.h"
   #include "src/platform/windows/impersonating_display_device.h"
   #include "src/platform/windows/virtual_display.h"
+  #include "src/process.h"
 
   #include <algorithm>
   #include <array>
@@ -16,12 +17,14 @@
   #include <display_device/windows/win_display_device.h>
   #include <exception>
   #include <memory>
+  #include <mutex>
   #include <string>
   #include <thread>
 
 namespace platf::virtual_display_cleanup {
   namespace {
     std::atomic_uint g_cleanup_reservations {0};
+    std::mutex g_terminal_cleanup_mutex;
 
     class cleanup_reservation_t {
     public:
@@ -194,6 +197,42 @@ namespace platf::virtual_display_cleanup {
                     << ", helper_revert_dispatched=" << (result.helper_revert_dispatched ? "true" : "false")
                     << ", database_restore_applied=" << (result.database_restore_applied ? "true" : "false")
                     << ")";
+    return result;
+  }
+
+  cleanup_result_t terminate_all(const std::string_view reason) {
+    std::lock_guard terminal_lock {g_terminal_cleanup_mutex};
+    const std::string reason_text = reason.empty() ? "unspecified" : std::string(reason);
+
+    // A previous app-triggered revert may still be queued for the end of the
+    // final stream. This action consumes that intent now, so it must not fire
+    // again later.
+    proc::clear_deferred_display_revert();
+
+    // Terminal intent is authoritative: stop session recovery workers before
+    // any display is removed, so an intentionally removed display is never
+    // classified as a crash and recreated by the recovery worker. Cancellation
+    // is non-latching; a later session arms fresh monitors.
+    VDISPLAY::cancel_all_virtual_display_recovery_monitors();
+    BOOST_LOG(info) << "Virtual display cleanup: recovery monitors disengaged before terminal cleanup (reason="
+                    << reason_text << ").";
+
+    const auto result = run(
+      reason,
+      true,
+      revert_order_t::restore_before_remove,
+      true,
+      std::nullopt
+    );
+
+    // A terminal user action must also end the helper restart loop. Forced
+    // stop is safe here because run() has already completed the synchronous
+    // REVERT attempt and display teardown. Closing the driver transport stops
+    // its lease/watchdog worker; a later session opens it again on demand.
+    VDISPLAY::closeVDisplayDevice();
+    display_helper_integration::stop_watchdog(true);
+    BOOST_LOG(info) << "Virtual display cleanup: terminal driver and helper watchdog shutdown completed (reason="
+                    << reason_text << ").";
     return result;
   }
 

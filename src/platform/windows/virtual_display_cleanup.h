@@ -54,6 +54,11 @@ namespace platf::virtual_display_cleanup {
     std::optional<std::array<std::uint8_t, 16>> virtual_display_guid_bytes = std::nullopt
   );
 
+  // Execute the complete user-requested kill-switch contract: disengage
+  // session recovery, restore the physical layout, remove every managed
+  // virtual display, close the driver transport and stop the helper watchdog.
+  cleanup_result_t terminate_all(std::string_view reason);
+
   // Nonblocking observation for callers that must not begin display probing
   // while any cleanup path is removing a virtual display or restoring topology.
   bool in_progress();
