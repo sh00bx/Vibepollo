@@ -30,10 +30,24 @@
 
 extern "C" {
   // clang-format off
+  // moonlight-common-c (pinned 2600beaf) still carries its own nanors glue: RtpAudioQueue.h
+  // defines the legacy struct _reed_solomon (ds/ps/ts/p[]) and includes its rswrapper.h,
+  // which maps reed_solomon_new/_release/_encode/_decode to function-pointer macros.
+  // Rename that struct and drop the macros so this file sees only nanors' rs.h below,
+  // whose struct layout (the rs->p offset) differs.
+#define _reed_solomon mcc_legacy_reed_solomon
+#define reed_solomon mcc_legacy_reed_solomon_t
 #include <moonlight-common-c/src/Limelight-internal.h>
-#include "rswrapper.h"
+#undef reed_solomon
+#undef _reed_solomon
+#undef reed_solomon_new
+#undef reed_solomon_release
+#undef reed_solomon_encode
+#undef reed_solomon_decode
   // clang-format on
 }
+
+#include <rs.h>
 
 // local includes
 #include "config.h"

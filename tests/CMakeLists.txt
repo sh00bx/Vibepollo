@@ -292,22 +292,23 @@ sunshine_add_test_target(
     DEPENDENCIES
 )
 
-# rswrapper.c includes the vendored nanors Reed-Solomon implementation directly,
-# so no separate library or server source is required by this target.
-set_source_files_properties(
-    "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/rswrapper.c"
-    PROPERTIES COMPILE_OPTIONS "-ftree-vectorize;-funroll-loops"
-)
+# The host compiles the vendored nanors sources directly (runtime SIMD dispatch
+# inside nanors); the support fixture re-includes its selector with synthetic
+# CPUID sets. OpenSSL only hashes the parity fixtures.
 sunshine_add_test_target(
-    NAME test_fast_rswrapper
+    NAME test_fast_reed_solomon
     CATEGORY fast
     TEST_SOURCES
         "${CMAKE_CURRENT_LIST_DIR}/tests_main.cpp"
-        "${CMAKE_CURRENT_LIST_DIR}/unit/test_rswrapper.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/unit/test_reed_solomon.cpp"
+    SUPPORT_SOURCES
+        "${CMAKE_CURRENT_LIST_DIR}/support/nanors_cpu_dispatch.c"
     PRODUCT_SOURCES
-        "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/rswrapper.c"
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/third-party/nanors/rs.c"
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/third-party/nanors/deps/obl/oblas_common.c"
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/third-party/nanors/deps/obl/oblas_lite.c"
     DEFINITIONS
-    LINK_LIBRARIES GTest::gtest sunshine_test_nanors_headers
+    LINK_LIBRARIES GTest::gtest sunshine_test_nanors_headers OpenSSL::Crypto
     DEPENDENCIES
 )
 

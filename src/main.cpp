@@ -57,9 +57,7 @@
 
 #define PROBE_DISPLAY_UUID "38F72B96-B00C-4F21-8B6C-E1BFF1602B0E"
 
-extern "C" {
-#include "rswrapper.h"
-}
+#include <rs.h>
 
 using namespace std::literals;
 
@@ -592,7 +590,13 @@ int main(int argc, char *argv[]) {
     return lifetime::desired_exit_code;
   }
 
-  reed_solomon_init();
+  // nanors picks its SIMD kernels per codec and fills its GF(2^8) table on first use without
+  // synchronization, so create one codec here before any audio/video thread can.
+  if (auto fec_warmup = reed_solomon_new(1, 1)) {
+    reed_solomon_release(fec_warmup);
+  } else {
+    BOOST_LOG(error) << "FEC encoder failed to initialize"sv;
+  }
   auto input_deinit_guard = input::init();
 
   if (input::probe_gamepads()) {
