@@ -24,6 +24,9 @@ constexpr auto SERVICE_NAME = "ApolloService";
 constexpr DWORD FAST_EXIT_WINDOW_MS = 60 * 1000;
 constexpr DWORD CRASH_LOOP_RESTART_DELAY_MS = 30 * 1000;
 constexpr DWORD CRASH_LOOP_FAST_EXIT_THRESHOLD = 3;
+// Graceful stop waits 20 s; this bound on the forced kill keeps the whole stop
+// inside the 30 s wait hint HandlerEx reports to SCM.
+constexpr DWORD FORCED_EXIT_WAIT_MS = 10 * 1000;
 
 DWORD WINAPI HandlerEx(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext) {
   switch (dwControl) {
@@ -171,6 +174,27 @@ bool RunTerminationHelper(HANDLE console_token, DWORD pid) {
   return exit_code == 0;
 }
 
+void ReportServiceStopped(DWORD error, HANDLE log_file_handle = INVALID_HANDLE_VALUE, LPPROC_THREAD_ATTRIBUTE_LIST attributes = nullptr) {
+  // SERVICE_STOPPED permits SCM to start a replacement immediately. Release our
+  // non-write-shared log handle before publishing that state, including failures
+  // during startup; returning from ServiceMain does not release process handles.
+  if (attributes != nullptr) {
+    DeleteProcThreadAttributeList(attributes);
+    HeapFree(GetProcessHeap(), 0, attributes);
+  }
+  if (log_file_handle != INVALID_HANDLE_VALUE) {
+    CloseHandle(log_file_handle);
+  }
+  // HandlerEx remains registered until process exit. Its event handles must
+  // stay valid for any control callback already in flight during cleanup.
+  service_status.dwControlsAccepted = 0;
+  service_status.dwCheckPoint = 0;
+  service_status.dwWaitHint = 0;
+  service_status.dwWin32ExitCode = error;
+  service_status.dwCurrentState = SERVICE_STOPPED;
+  SetServiceStatus(service_status_handle, &service_status);
+}
+
 VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
   service_status_handle = RegisterServiceCtrlHandlerEx(SERVICE_NAME, HandlerEx, nullptr);
   if (service_status_handle == nullptr) {
@@ -193,9 +217,7 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
   stop_event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
   if (stop_event == nullptr) {
     // Tell SCM we failed to start
-    service_status.dwWin32ExitCode = GetLastError();
-    service_status.dwCurrentState = SERVICE_STOPPED;
-    SetServiceStatus(service_status_handle, &service_status);
+    ReportServiceStopped(GetLastError());
     return;
   }
 
@@ -203,18 +225,14 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
   session_change_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
   if (session_change_event == nullptr) {
     // Tell SCM we failed to start
-    service_status.dwWin32ExitCode = GetLastError();
-    service_status.dwCurrentState = SERVICE_STOPPED;
-    SetServiceStatus(service_status_handle, &service_status);
+    ReportServiceStopped(GetLastError());
     return;
   }
 
   auto log_file_handle = OpenLogFileHandle();
   if (log_file_handle == INVALID_HANDLE_VALUE) {
     // Tell SCM we failed to start
-    service_status.dwWin32ExitCode = GetLastError();
-    service_status.dwCurrentState = SERVICE_STOPPED;
-    SetServiceStatus(service_status_handle, &service_status);
+    ReportServiceStopped(GetLastError());
     return;
   }
 
@@ -231,9 +249,7 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
   startup_info.lpAttributeList = AllocateProcThreadAttributeList(2);
   if (startup_info.lpAttributeList == nullptr) {
     // Tell SCM we failed to start
-    service_status.dwWin32ExitCode = GetLastError();
-    service_status.dwCurrentState = SERVICE_STOPPED;
-    SetServiceStatus(service_status_handle, &service_status);
+    ReportServiceStopped(GetLastError(), log_file_handle);
     return;
   }
 
@@ -249,6 +265,7 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
 
   DWORD fast_exit_count = 0;
   ULONGLONG first_fast_exit_tick = 0;
+  DWORD unreaped_child_error = NO_ERROR;
 
   // Loop every 3 seconds until the stop event is set or Sunshine.exe is running
   while (WaitForSingleObject(stop_event, 3000) != WAIT_OBJECT_0) {
@@ -299,8 +316,27 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
           // If it doesn't terminate in 20 seconds, we will forcefully terminate it.
           if (!RunTerminationHelper(console_token, process_info.dwProcessId) ||
               WaitForSingleObject(process_info.hProcess, 20000) != WAIT_OBJECT_0) {
-            // If it won't terminate gracefully, kill it now
-            TerminateProcess(process_info.hProcess, ERROR_PROCESS_ABORTED);
+            // If it won't terminate gracefully, kill it now. This also fails
+            // (ERROR_ACCESS_DENIED) while the child is already exiting on its
+            // own, so the wait below decides the outcome, not this result.
+            DWORD termination_error = NO_ERROR;
+            if (!TerminateProcess(process_info.hProcess, ERROR_PROCESS_ABORTED)) {
+              termination_error = GetLastError();
+            }
+            // TerminateProcess is asynchronous. The inherited log handle stays
+            // open until termination completes, so wait before allowing restart.
+            // The wait is bounded: a thread stuck in a driver can keep a killed
+            // process alive indefinitely, and neither SCM (STOP_PENDING) nor a
+            // console-session relaunch may hang on it. An unreaped child makes
+            // the final SERVICE_STOPPED carry an error instead of success.
+            const auto wait_result = WaitForSingleObject(process_info.hProcess, FORCED_EXIT_WAIT_MS);
+            if (wait_result != WAIT_OBJECT_0) {
+              if (wait_result == WAIT_FAILED) {
+                unreaped_child_error = GetLastError();
+              } else {
+                unreaped_child_error = termination_error != NO_ERROR ? termination_error : WAIT_TIMEOUT;
+              }
+            }
           }
           still_running = false;
           break;
@@ -353,9 +389,9 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     }
   }
 
-  // Let SCM know we've stopped
-  service_status.dwCurrentState = SERVICE_STOPPED;
-  SetServiceStatus(service_status_handle, &service_status);
+  // The child has exited (or could not be reaped, see above); release our
+  // remaining handles before allowing restart.
+  ReportServiceStopped(unreaped_child_error, log_file_handle, startup_info.lpAttributeList);
 }
 
 // This will run in a child process in the user session
