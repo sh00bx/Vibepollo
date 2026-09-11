@@ -43,6 +43,7 @@
 
 // local includes
 #include "app_catalog_policy.h"
+#include "audio.h"
 #include "config.h"
 #include "crypto.h"
 #include "display_device.h"
@@ -1316,6 +1317,7 @@ namespace proc {
       _app = app;
     }
     _app_id = util::from_view(app.id);
+    audio::app_started();
 #ifdef _WIN32
     // A replacement app owns the streaming display configuration. Any
     // restore deferred by the previous app must not fire at this session's end.
@@ -2716,6 +2718,10 @@ namespace proc {
       stream_lifecycle_lock =
         std::unique_lock<std::mutex> {nvhttp::stream_lifecycle_mutex()};
     }
+
+    // Mark termination before process teardown so a concurrent final audio
+    // owner restores directly instead of retaining state for the ended app.
+    audio::app_termination_requested();
 
     // App termination can remove a display directly and can continue through
     // process, undo-command, helper, watchdog, and deferred-config cleanup.
