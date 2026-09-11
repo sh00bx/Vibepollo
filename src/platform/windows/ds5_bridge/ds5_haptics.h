@@ -138,6 +138,10 @@ namespace platf::ds5_bridge {
       recompute_cushion();
     }
 
+    /// AudioControl byte of the audio SetState (inline in 0x36, standalone 0x32).
+    /// Set before the pacer starts.
+    void set_audio_control(uint8_t v);
+
     /// The clamped cushion actually in force (frames).
     int cushion_frames() const {
       return eff_cushion_;
@@ -368,6 +372,7 @@ namespace platf::ds5_bridge {
     // -- 398-byte 0x36 skeleton (sub-packet headers + audio SetState) --------
     // The 0x12 haptic and 0x13 Opus payloads are written per tick in build_0x36.
     std::array<uint8_t, DS5_0X36_LEN> skeleton_ {};
+    uint8_t audio_control_ = 0x00;   // SetState byte 7, see set_audio_control
     // -- 547-byte 0x39 skeleton (batched; no SetState block — see 0x32) ------
     std::array<uint8_t, DS5_0X39_LEN> skeleton39_ {};
     bool batched_ = false;

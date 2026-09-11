@@ -583,8 +583,9 @@ namespace confighttp {
     if (!request->header.empty()) {
       BOOST_LOG(verbose) << "Headers:"sv;
       for (auto &[name, val] : request->header) {
+        const bool secret = boost::iequals(name, "Authorization") || boost::iequals(name, "Cookie");
         BOOST_LOG(verbose) << name << " -- "
-                           << (name == "Authorization" ? "CREDENTIALS REDACTED" : val);
+                           << (secret ? "CREDENTIALS REDACTED" : val);
       }
     }
 
@@ -4534,9 +4535,13 @@ namespace confighttp {
       nlohmann::json output_tree;
       std::string pin = input_tree.value("pin", "");
       std::string name = input_tree.value("name", "");
-      output_tree["status"] = nvhttp::pin(pin, name);
+      std::string pin_error;
+      output_tree["status"] = nvhttp::pin(pin, name, &pin_error);
       if (!output_tree["status"].get<bool>()) {
         BOOST_LOG(warning) << "SavePin: no pending Moonlight pairing request accepted the submitted PIN";
+        if (!pin_error.empty()) {
+          output_tree["error"] = pin_error;
+        }
       }
       send_response(response, output_tree);
     } catch (std::exception &e) {

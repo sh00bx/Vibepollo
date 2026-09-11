@@ -30,8 +30,10 @@ namespace platf::ds5_bridge {
       return "usbip.exe";  // fall back to PATH
     }
 
-    // Run a command line and capture stdout. Returns exit code (-1 on spawn fail).
-    int run_capture(const std::string &cmd, std::string &out) {
+    // Run a command line and capture stdout. Returns exit code (-1 on spawn fail,
+    // -2 when the child had to be killed). The CLI normally finishes in ~0.1 s; a
+    // wedged usbip.exe (driver stuck after attach, #188) must not hang the bridge.
+    int run_capture(const std::string &cmd, std::string &out, DWORD timeout_ms = 5000) {
       out.clear();
       SECURITY_ATTRIBUTES sa {};
       sa.nLength = sizeof(sa);
@@ -55,26 +57,60 @@ namespace platf::ds5_bridge {
         CloseHandle(wr);
         return -1;
       }
-      CloseHandle(wr);  // close our write end so ReadFile sees EOF at child exit
+      CloseHandle(wr);  // close our write end so the pipe breaks at child exit
+
+      // Poll instead of a blocking ReadFile, which would wait forever on a hung child.
+      const ULONGLONG deadline = GetTickCount64() + timeout_ms;
       char buf[512];
-      DWORD n = 0;
-      while (ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n > 0) {
-        out.append(buf, n);
+      for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) break;  // broken pipe = EOF
+        if (avail > 0) {
+          DWORD n = 0;
+          if (!ReadFile(rd, buf, avail < sizeof(buf) ? avail : (DWORD) sizeof(buf), &n, nullptr) || n == 0) break;
+          out.append(buf, n);
+          continue;
+        }
+        // Exited but a grandchild still holds the write end: take what the child wrote
+        // before exiting (it may have landed after the peek above), then stop.
+        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
+          while (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+            DWORD n = 0;
+            if (!ReadFile(rd, buf, avail < sizeof(buf) ? avail : (DWORD) sizeof(buf), &n, nullptr) || n == 0) break;
+            out.append(buf, n);
+          }
+          break;
+        }
+        if (GetTickCount64() >= deadline) break;
+        Sleep(10);
       }
       CloseHandle(rd);
-      WaitForSingleObject(pi.hProcess, 8000);
-      DWORD code = 0;
-      GetExitCodeProcess(pi.hProcess, &code);
+
+      const ULONGLONG now = GetTickCount64();
+      const DWORD remaining = now < deadline ? (DWORD) (deadline - now) : 0;
+      int rc;
+      if (WaitForSingleObject(pi.hProcess, remaining) == WAIT_OBJECT_0) {
+        DWORD code = 0;
+        GetExitCodeProcess(pi.hProcess, &code);
+        rc = (int) code;
+      } else {
+        BOOST_LOG(warning) << "ds5-bridge: '"sv << cmd << "' still running after "sv << timeout_ms
+                           << " ms; killing it (output so far: "sv << out << ")"sv;
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 1000);
+        rc = -2;
+      }
       CloseHandle(pi.hProcess);
       CloseHandle(pi.hThread);
-      return (int) code;
+      return rc;
     }
 
-    // Parse the "Port NN:" numbers currently listed by `usbip port`.
-    std::set<int> list_ports(const std::string &exe) {
-      std::set<int> ports;
+    // Parse the "Port NN:" numbers currently listed by `usbip port`. False when the
+    // listing itself failed: an empty set would then be a guess, not a snapshot.
+    bool list_ports(const std::string &exe, std::set<int> &ports) {
+      ports.clear();
       std::string out;
-      run_capture("\"" + exe + "\" port", out);
+      if (run_capture("\"" + exe + "\" port", out) != 0) return false;
       size_t pos = 0;
       while ((pos = out.find("Port ", pos)) != std::string::npos) {
         pos += 5;
@@ -87,14 +123,17 @@ namespace platf::ds5_bridge {
         }
         if (any) ports.insert(v);
       }
-      return ports;
+      return true;
     }
 
   }  // namespace
 
   int vhci_attach(const std::string &busid) {
     const std::string exe = find_usbip_exe();
-    auto before = list_ports(exe);
+    std::set<int> before, after;
+    // Without a reliable before/after pair the new port could be another pad's,
+    // and teardown would detach that one.
+    const bool have_before = list_ports(exe, before);
     std::string out;
     std::string cmd = "\"" + exe + "\" attach -r 127.0.0.1 -b " + busid;
     int rc = run_capture(cmd, out);
@@ -103,7 +142,11 @@ namespace platf::ds5_bridge {
                          << " failed (rc="sv << rc << "): "sv << out;
       return -1;
     }
-    auto after = list_ports(exe);
+    if (!have_before || !list_ports(exe, after)) {
+      BOOST_LOG(warning) << "ds5-bridge: vhci attach busid="sv << busid
+                         << " ok but the port listing failed (detach will be manual)"sv;
+      return -1;
+    }
     for (int p : after) {
       if (!before.count(p)) {
         BOOST_LOG(info) << "ds5-bridge: vhci attached busid="sv << busid << " -> port "sv << p;

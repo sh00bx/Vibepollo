@@ -63,6 +63,8 @@ namespace platf::ds5_bridge {
     /// counter steps by frames-per-report, so the form must not change under it).
     void set_audio_batched(bool on) { audio_batched_.store(on); }
     void set_audio_cushion(int n) { audio_cushion_.store(n); }
+    /// AudioControl echo/noise-cancel bits in the audio SetState (next connect).
+    void set_audio_cancel_bits(bool on) { audio_cancel_bits_.store(on); }
 
     /// Synthetic lightbar color (0x00RRGGBB) or LIGHTBAR_OFF. Sessions read it
     /// live on every game output, so config changes apply immediately.
@@ -78,6 +80,7 @@ namespace platf::ds5_bridge {
     std::atomic<bool> haptics_ {false};
     std::atomic<bool> audio_batched_ {false};
     std::atomic<int> audio_cushion_ {4};
+    std::atomic<bool> audio_cancel_bits_ {false};
     std::atomic<uint32_t> lightbar_rgb_ {LIGHTBAR_OFF};
     int port_ {48054};
 

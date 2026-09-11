@@ -112,6 +112,7 @@ namespace nvhttp {
       std::string uniqueID = {};
       std::string cert = {};
       std::string name = {};
+      std::string address = {};  ///< Normalized peer address of the getservercert request.
     } client;
 
     std::unique_ptr<crypto::aes_t> cipher_key = {};
@@ -207,7 +208,7 @@ namespace nvhttp {
    * bool pin_status = nvhttp::pin("1234", "laptop");
    * @examples_end
    */
-  bool pin(std::string pin, std::string name);
+  bool pin(std::string pin, std::string name, std::string *error = nullptr);
 
   /**
    * @brief Pick the client label used for display-facing behavior.

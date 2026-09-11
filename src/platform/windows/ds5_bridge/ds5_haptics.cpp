@@ -38,17 +38,16 @@ namespace platf::ds5_bridge {
     const uint8_t state_audio_data[63] = {
       0xB0, 0x82,                 // ValidFlags: audio-only
       0x00, 0x00,                 // RumbleEmulation R/L (not allowed)
-      // VolumeHeadphones=127 (7-bit field), VolumeSpeaker=255.
-      // The speaker byte is NOT 7-bit: CTM maps its volume slider onto
-      // 0x80..0xFF (`0x80 + scale(0..0x7f)`), so 0x7f — which ds5_av_play.c
-      // used believing it was "max" — sits at the very bottom of the real
-      // range and plays ~6 dB below CTM's full scale (the "quieter than CTM"
-      // field report). 0xFF is exactly what CTM emits at max. Windows still
-      // attenuates digitally (the endpoint exposes no hardware volume unit),
-      // so the host slider keeps working with the physical volume pinned high.
+      // VolumeHeadphones=127 (7-bit field), VolumeSpeaker=255 (= "max").
+      // The speaker firmware's usable range is 0x3d..0x64 (the old 0x80..0xFF
+      // theory from the CTM slider is refuted, sweep 2026-09-11), so anything
+      // >= 0x64 is full scale. These two bytes rarely reach the pad as sent:
+      // the TV client rewrites both volume bytes in every audio mode from its
+      // own sliders. Windows attenuates digitally on top (the endpoint exposes
+      // no hardware volume unit).
       0x7f, 0xff,
       0x00,                       // VolumeMic (not allowed)
-      0x00,                       // AudioControl (Auto mic / default)
+      0x00,                       // AudioControl (Auto mic / default); set_audio_control() overrides
       0x00,                       // MuteLightMode (ignored)
       0x00,                       // MuteControl: all UNMUTED
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // RightTriggerFFB
@@ -390,6 +389,11 @@ namespace platf::ds5_bridge {
     b39[140] = 0x13 | 0xC0; b39[141] = OPUS_BYTES;     // two Opus frames follow
   }
 
+  void ds5_haptic_builder::set_audio_control(uint8_t v) {
+    audio_control_ = v;
+    skeleton_[OFF_SETSTATE + 7] = v;   // state_audio_data[7]
+  }
+
   // DS5 BT output CRC: CRC32 over the 0xA2 seed byte + bytes [0 .. len-4).
   void ds5_haptic_builder::sign_report(uint8_t *out, int len) {
     const uint8_t seed = PS_OUTPUT_CRC_SEED;
@@ -414,6 +418,7 @@ namespace platf::ds5_bridge {
     out_seq_++;
     out[2] = 0x10 | 0x80; out[3] = 63;
     std::memcpy(out + 4, state_audio_data, 63);
+    out[4 + 7] = audio_control_;
     sign_report(out, DS5_0X32_LEN);
   }
 

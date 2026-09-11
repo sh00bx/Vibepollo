@@ -426,6 +426,12 @@ namespace config {
     // spkplc in the ds5-haptics log line -- it reports the cost of going too
     // low directly.
     int native_audio_cushion_frames {4};
+    // AudioControl (SetState byte 7) echo/noise-cancel bits 0x0C. Our SetState
+    // sets AUDIO_CONTROL_ENABLE, so the firmware takes byte 7 whole; 0x00 leaves
+    // both cancel paths off, which awalol #263 and CTM report as a quieter
+    // speaker. OFF until the SPL A/B on our own pad (port plan W1-05) says
+    // otherwise. Read at session creation (next controller connect).
+    bool native_audio_cancel_bits {false};
 
     // Synthetic lightbar color, hex "RRGGBB" (empty/"off" disables). PC games
     // via libScePad set the lightbar to black at pad init and never write a

@@ -41,6 +41,7 @@
 #include <Simple-Web-Server/server_http.hpp>
 
 // local includes
+#include "app_display_policy.h"
 #include "config.h"
 #include "display_device.h"
 #include "display_helper_integration.h"
@@ -516,13 +517,17 @@ namespace nvhttp {
       };
 
       std::optional<std::string> app_output_override;
+      auto app_display_override = proc::display_policy::app_override_e::inherit;
       if (launch_session->output_name_override) {
         app_output_override = boost::algorithm::trim_copy(*launch_session->output_name_override);
       }
 
       if (app_output_override && !app_output_override->empty() && VDISPLAY::is_virtual_display_selection(*app_output_override)) {
         launch_session->virtual_display = true;
+        app_display_override = proc::display_policy::app_override_e::virtual_display;
         app_output_override.reset();
+      } else if (app_output_override) {
+        app_display_override = proc::display_policy::app_override_e::physical;
       }
       launch_session->virtual_display_recreated_on_demand = false;
       launch_session->virtual_display_needs_resume_apply = false;
@@ -540,10 +545,11 @@ namespace nvhttp {
       const bool session_requests_virtual = launch_session->app_metadata && launch_session->app_metadata->virtual_screen;
       const bool launch_requests_physical = launch_session->client_virtual_display_override &&
                                             !*launch_session->client_virtual_display_override;
-      bool request_virtual_display =
-        launch_session->virtual_display ||
+      bool request_virtual_display = proc::display_policy::resolve_virtual_display_request(
         (config_requests_virtual && !launch_requests_physical) ||
-        client_requests_virtual || session_requests_virtual || forced_sudavda_virtual_display;
+          launch_session->virtual_display || session_requests_virtual,
+        app_display_override
+      ) || client_requests_virtual || forced_sudavda_virtual_display;
       const auto requested_virtual_display_mode =
         launch_session->virtual_display_mode_override.value_or(config::video.virtual_display_mode);
       const bool shared_virtual_display_mode =
@@ -1313,6 +1319,11 @@ namespace nvhttp {
 
     // uniqueID, session
     std::unordered_map<std::string, pair_session_t> map_id_sess;
+    // pair() runs on the nvhttp pools and pin() on the confighttp thread; every
+    // map_id_sess access holds this. Recursive because the pairing phases call
+    // remove_session() while the handler already holds it.
+    std::recursive_mutex map_id_sess_mutex;
+    constexpr auto kPairingSessionExpiry = std::chrono::minutes(10);
     client_t client_root;
     std::mutex client_mutex;
     std::atomic<uint32_t> session_id_counter;
@@ -2308,7 +2319,51 @@ namespace nvhttp {
     }
 
     void remove_session(const pair_session_t &sess) {
+      std::scoped_lock sess_lock {map_id_sess_mutex};
       map_id_sess.erase(sess.client.uniqueID);
+    }
+
+    // Answers a client still blocked in getservercert. Caller holds map_id_sess_mutex.
+    bool write_async_pin_response(pair_session_t &sess, const pt::ptree &tree);
+
+    // Drops a pending session, first answering a client still parked in getservercert
+    // (an unanswered parked response closes with 0 bytes and the client hangs).
+    // Caller holds map_id_sess_mutex.
+    decltype(map_id_sess)::iterator drop_pair_session_locked(decltype(map_id_sess)::iterator it, int status_code, const char *status_message) {
+      pt::ptree tree;
+      tree.put("root.paired", 0);
+      tree.put("root.<xmlattr>.status_code", status_code);
+      tree.put("root.<xmlattr>.status_message", status_message);
+      write_async_pin_response(it->second, tree);
+      return map_id_sess.erase(it);
+    }
+
+    // Caller holds map_id_sess_mutex.
+    void expire_pair_sessions_locked(const std::chrono::steady_clock::time_point now) {
+      for (auto it = map_id_sess.begin(); it != map_id_sess.end();) {
+        if (now - it->second.created_at > kPairingSessionExpiry) {
+          it = drop_pair_session_locked(it, 408, "Pairing session expired");
+        } else {
+          ++it;
+        }
+      }
+    }
+
+    bool write_async_pin_response(pair_session_t &sess, const pt::ptree &tree) {
+      std::ostringstream data;
+      pt::write_xml(data, tree);
+
+      auto &async_response = sess.async_insert_pin.response;
+      // Keep Content-Length on this delayed response; Moonlight waits for a complete body.
+      if (async_response.has_left() && async_response.left()) {
+        async_response.left()->write(data.str());
+      } else if (async_response.has_right() && async_response.right()) {
+        async_response.right()->write(data.str());
+      } else {
+        return false;
+      }
+      async_response = std::decay_t<decltype(async_response.left())>();
+      return true;
     }
 
     void fail_pair(pair_session_t &sess, pt::ptree &tree, const std::string status_msg) {
@@ -2603,7 +2658,9 @@ namespace nvhttp {
       if (!query.empty()) {
         BOOST_LOG(verbose) << "Query Params:"sv;
         for (auto &[name, val] : query) {
-          BOOST_LOG(verbose) << name << " -- " << val;
+          // rikey is the stream's AES key; keep it out of verbose logs.
+          const bool secret = boost::iequals(name, "rikey") || boost::iequals(name, "rikeyid");
+          BOOST_LOG(verbose) << name << " -- " << (secret ? "REDACTED"sv : std::string_view {val});
         }
       }
     }
@@ -2641,7 +2698,22 @@ namespace nvhttp {
       auto args = request->parse_query_string();
       auto unique_id = get_arg(args, "uniqueid", "");
 
-      const bool cleaned_pending_pair = !unique_id.empty() && map_id_sess.erase(unique_id) > 0;
+      bool cleaned_pending_pair = false;
+      if (!unique_id.empty()) {
+        // /unpair is unauthenticated on plain HTTP and the uniqueid is shared by many
+        // clients; only the peer that opened a pending session may cancel it.
+        const auto peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
+        std::scoped_lock sess_lock {map_id_sess_mutex};
+        if (auto it = map_id_sess.find(unique_id); it != map_id_sess.end()) {
+          if (it->second.client.address == peer_address) {
+            drop_pair_session_locked(it, 400, "Pairing cancelled by the client");
+            cleaned_pending_pair = true;
+          } else {
+            BOOST_LOG(warning) << "Ignoring unpair from " << peer_address << " for a pending pairing session opened by "
+                               << it->second.client.address;
+          }
+        }
+      }
       bool removed = false;
 
       if constexpr (std::is_same_v<T, SunshineHTTPS>) {
@@ -2688,6 +2760,10 @@ namespace nvhttp {
       }
 
       auto uniqID {get_arg(args, "uniqueid")};
+      const auto peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
+
+      // Declared after fg, so it is released before the response is written.
+      std::unique_lock sess_lock {map_id_sess_mutex};
 
       args_t::const_iterator it;
       if (it = args.find("phrase"); it != std::end(args)) {
@@ -2702,14 +2778,29 @@ namespace nvhttp {
 
           sess.client.uniqueID = std::move(uniqID);
           sess.client.name = std::move(deviceName);
+          sess.client.address = peer_address;
           sess.client.cert = util::from_hex_vec(get_arg(args, "clientcert"), true);
 
           BOOST_LOG(verbose) << sess.client.cert;
+          expire_pair_sessions_locked(std::chrono::steady_clock::now());
           auto session_id = sess.client.uniqueID;
           if (auto existing = map_id_sess.find(session_id); existing != map_id_sess.end()) {
-            BOOST_LOG(info) << "Replacing stale pending pairing session for uniqueid=" << session_id;
-            map_id_sess.erase(existing);
+            // Moonlight-derived clients (aurora included) share one fixed uniqueid, so a
+            // second requester must not be able to take over a pending session (GHSA-36ff).
+            // A retry from the same address is the same client after a cancel; let it replace.
+            if (existing->second.client.address != peer_address) {
+              BOOST_LOG(warning) << "Rejecting pairing request from '" << sess.client.name << "' at " << peer_address
+                                 << ": uniqueid=" << session_id << " already has a pending pairing session from '"
+                                 << existing->second.client.name << "' at " << existing->second.client.address;
+              tree.put("root.paired", 0);
+              tree.put("root.<xmlattr>.status_code", 409);
+              tree.put("root.<xmlattr>.status_message", "Another pairing request is already pending");
+              return;
+            }
+            BOOST_LOG(info) << "Replacing stale pending pairing session for uniqueid=" << session_id << " from " << peer_address;
+            drop_pair_session_locked(existing, 409, "Superseded by a newer pairing request");
           }
+          BOOST_LOG(info) << "Pairing request from '" << sess.client.name << "' at " << peer_address << " is waiting for a PIN";
           auto ptr = map_id_sess.emplace(std::move(session_id), std::move(sess)).first;
 
           ptr->second.async_insert_pin.salt = std::move(get_arg(args, "salt"));
@@ -2746,11 +2837,23 @@ namespace nvhttp {
 
           if (config::sunshine.flags[config::flag::PIN_STDIN]) {
             std::string pin;
+            const auto session_created_at = ptr->second.created_at;
+            const auto session_key = ptr->first;
 
+            // Never block the other handlers on console input.
+            sess_lock.unlock();
             std::cout << "Please insert pin: "sv;
             std::getline(std::cin, pin);
+            sess_lock.lock();
 
-            getservercert(ptr->second, tree, pin);
+            auto sess_it = map_id_sess.find(session_key);
+            if (sess_it == map_id_sess.end() || sess_it->second.created_at != session_created_at) {
+              tree.put("root.paired", 0);
+              tree.put("root.<xmlattr>.status_code", 408);
+              tree.put("root.<xmlattr>.status_message", "Pairing session expired");
+              return;
+            }
+            getservercert(sess_it->second, tree, pin);
           } else {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
             system_tray::update_tray_require_pin();
@@ -2773,6 +2876,13 @@ namespace nvhttp {
         tree.put("root.<xmlattr>.status_message", "Invalid uniqueid");
         return;
       }
+      if (sess_it->second.client.address != peer_address) {
+        BOOST_LOG(warning) << "Rejecting pairing phase from " << peer_address << " for a session opened by "
+                           << sess_it->second.client.address;
+        tree.put("root.<xmlattr>.status_code", 400);
+        tree.put("root.<xmlattr>.status_message", "Invalid uniqueid");
+        return;
+      }
 
 
       if (it = args.find("clientchallenge"); it != std::end(args)) {
@@ -2790,8 +2900,9 @@ namespace nvhttp {
       }
     }
 
-    bool pin(std::string pin, std::string name) {
+    bool pin(std::string pin, std::string name, std::string *error) {
       pt::ptree tree;
+      std::scoped_lock sess_lock {map_id_sess_mutex};
       if (map_id_sess.empty()) {
         BOOST_LOG(warning) << "PIN submitted but no pending pairing session exists";
         return false;
@@ -2816,29 +2927,42 @@ namespace nvhttp {
         return false;
       }
 
-      const auto now = std::chrono::steady_clock::now();
-      constexpr auto pairing_session_expiry = std::chrono::minutes(10);
-      std::erase_if(map_id_sess, [now, pairing_session_expiry](const auto &entry) {
-        const auto &sess = entry.second;
-        return sess.last_phase == PAIR_PHASE::NONE && now - sess.created_at > pairing_session_expiry;
-      });
+      expire_pair_sessions_locked(std::chrono::steady_clock::now());
 
-      auto sess_it = map_id_sess.end();
+      std::vector<decltype(map_id_sess)::iterator> waiting;
       for (auto it = map_id_sess.begin(); it != map_id_sess.end(); ++it) {
-        if (it->second.last_phase != PAIR_PHASE::NONE) {
-          continue;
-        }
-        if (sess_it == map_id_sess.end() || sess_it->second.created_at < it->second.created_at) {
-          sess_it = it;
+        if (it->second.last_phase == PAIR_PHASE::NONE) {
+          waiting.push_back(it);
         }
       }
 
-      if (sess_it == map_id_sess.end()) {
+      if (waiting.empty()) {
         BOOST_LOG(warning) << "PIN submitted but no active pending pairing session is ready";
         return false;
       }
 
-      auto &sess = sess_it->second;
+      // The PIN is not bound to a request id, so with two requests waiting we cannot
+      // know which one the user is approving (GHSA-36ff). Drop them all; the real
+      // client retries and the user sees who asked.
+      if (waiting.size() > 1) {
+        pt::ptree reject;
+        reject.put("root.paired", 0);
+        reject.put("root.<xmlattr>.status_code", 409);
+        reject.put("root.<xmlattr>.status_message", "Several pairing requests were pending; please pair again");
+        for (auto it : waiting) {
+          BOOST_LOG(warning) << "PIN refused: pairing request from '" << it->second.client.name << "' at "
+                             << it->second.client.address << " was one of " << waiting.size() << " waiting requests";
+          write_async_pin_response(it->second, reject);
+          map_id_sess.erase(it);
+        }
+        if (error) {
+          *error = "Several pairing requests were pending; start pairing again on the client";
+        }
+        return false;
+      }
+
+      auto &sess = waiting.front()->second;
+      BOOST_LOG(info) << "PIN submitted for pairing request from '" << sess.client.name << "' at " << sess.client.address;
       if (sess.async_insert_pin.salt.size() < 32) {
         BOOST_LOG(warning) << "PIN submitted but pending pairing session has an invalid salt";
         remove_session(sess);
@@ -2852,24 +2976,11 @@ namespace nvhttp {
       }
 
       // response to the request for pin
-      std::ostringstream data;
-      pt::write_xml(data, tree);
-
-      auto &async_response = sess.async_insert_pin.response;
-      // Keep Content-Length on this delayed response; Moonlight waits for a complete body.
-      if (async_response.has_left() && async_response.left()) {
-        async_response.left()->write(data.str());
-      } else if (async_response.has_right() && async_response.right()) {
-        async_response.right()->write(data.str());
-      } else {
+      if (!write_async_pin_response(sess, tree)) {
         BOOST_LOG(warning) << "PIN submitted but pending pairing session has no response channel";
         remove_session(sess);
         return false;
       }
-
-      // reset async_response
-      async_response = std::decay_t<decltype(async_response.left())>();
-      // response to the current request
       return true;
     }
 
@@ -4795,7 +4906,10 @@ namespace nvhttp {
     // Wait for any event
     shutdown_event->view();
 
-    map_id_sess.clear();
+    {
+      std::scoped_lock sess_lock {map_id_sess_mutex};
+      map_id_sess.clear();
+    }
 
     https_server.stop();
     http_server.stop();
@@ -4813,6 +4927,8 @@ namespace nvhttp {
       return "";
     }
 
+    // pair() reads and clears these under the same lock.
+    std::scoped_lock sess_lock {map_id_sess_mutex};
     one_time_pin = crypto::rand_alphabet(4, "0123456789"sv);
     otp_passphrase = passphrase;
     otp_device_name = deviceName;

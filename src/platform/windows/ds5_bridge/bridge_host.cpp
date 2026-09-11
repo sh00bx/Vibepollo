@@ -69,10 +69,10 @@ namespace platf::ds5_bridge {
     enum class pad_kind_e { ds5, ds4 };
 
     bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, pad_kind_e kind,
-                   bool haptics, bool audio_batched, int audio_cushion,
+                   bool haptics, bool audio_batched, int audio_cushion, bool audio_cancel_bits,
                    const std::atomic<uint32_t> *lightbar_rgb):
         usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport), kind_(kind),
-        audio_batched_(audio_batched), audio_cushion_(audio_cushion),
+        audio_batched_(audio_batched), audio_cushion_(audio_cushion), audio_cancel_bits_(audio_cancel_bits),
         lightbar_rgb_(lightbar_rgb) { haptics_want_.store(haptics); }
 
     pad_kind_e kind() const { return kind_; }
@@ -333,6 +333,10 @@ namespace platf::ds5_bridge {
         const bool batched = audio_batched_ && client_0x39;
         hap_->set_batched(batched);
         hap_->set_cushion_frames(audio_cushion_);   // after set_batched: the floor depends on it
+        hap_->set_audio_control(audio_cancel_bits_ ? 0x0C : 0x00);
+        if (audio_cancel_bits_) {
+          BOOST_LOG(info) << "ds5-bridge: audio SetState AudioControl = 0x0C (echo + noise cancel bits)"sv;
+        }
         if (batched) {
           BOOST_LOG(info) << "ds5-bridge: audio downlink = batched 0x39 ("sv
                           << DS5_0X39_LEN << " B, two frames + two coil blocks per report)"sv;
@@ -1223,7 +1227,16 @@ namespace platf::ds5_bridge {
       }
       pacer_stop_.store(true);
       if (pacer_thread_.joinable()) pacer_thread_.join();
-      if (attach_thread_.joinable()) attach_thread_.join();
+      if (attach_thread_.joinable()) {
+        // run_capture() bounds each usbip call, so this finishes; the log makes a
+        // slow teardown visible instead of a silent stall.
+        const auto t0 = std::chrono::steady_clock::now();
+        attach_thread_.join();
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+        if (waited > std::chrono::seconds(2)) {
+          BOOST_LOG(warning) << "ds5-bridge: teardown waited "sv << waited.count() << " ms for the vhci attach thread"sv;
+        }
+      }
       if (slot_) {
         vhci_detach(vhci_port_.load());
         usbip_->remove_slot(slot_);
@@ -1263,6 +1276,7 @@ namespace platf::ds5_bridge {
     // Report form for this session's whole lifetime (see set_batched).
     const bool audio_batched_ {false};
     const int audio_cushion_ {4};
+    const bool audio_cancel_bits_ {false};
     std::atomic<bool> haptics_on_ {false};
 
     std::unique_ptr<ds5_haptic_builder> hap_;   // Phase 2 0x36 builder (gated by haptics_on_)
@@ -1476,7 +1490,7 @@ namespace platf::ds5_bridge {
       auto sess = std::make_unique<bridge_session>(&usbip_, busid, dport, pad_kind,
                                                   haptics_.load(),
                                                   audio_batched_.load(), audio_cushion_.load(),
-                                                  &lightbar_rgb_);
+                                                  audio_cancel_bits_.load(), &lightbar_rgb_);
       sess->start();
       sessions_[dport] = std::move(sess);
       BOOST_LOG(info) << "ds5-bridge: BRIDGE_START "sv << kind << " port="sv << dport << " busid="sv << busid;
