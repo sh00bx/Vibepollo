@@ -973,29 +973,63 @@ namespace platf::audio {
         prop_var_t current_device_format;
 
         if (SUCCEEDED(current_default_dev->OpenPropertyStore(STGM_READ, &prop)) && SUCCEEDED(prop->GetValue(PKEY_AudioEngine_DeviceFormat, &current_device_format.prop))) {
-          auto *format = (WAVEFORMATEXTENSIBLE *) current_device_format.prop.blob.pBlobData;
-          wanted_bits_per_sample = format->Samples.wValidBitsPerSample;
-          BOOST_LOG(info) << "Virtual audio device will use "sv << wanted_bits_per_sample << "-bit to match default device"sv;
+          // PKEY_AudioEngine_DeviceFormat is a WAVEFORMATEX that is only a
+          // WAVEFORMATEXTENSIBLE when it says so. Casting unconditionally reads
+          // wValidBitsPerSample out of whatever follows a plain header, and a
+          // UAC1 endpoint -- which is exactly what a bridged DualSense or
+          // DualShock 4 exposes -- publishes a plain one. The observed result
+          // was "will use 112-bit to match default device", no candidate format
+          // matching, and set_sink() failing altogether: the pad's endpoint had
+          // just stolen the default, and the recovery that exists to take it
+          // back died on its own format probe (log 2026-08-25 23:58).
+          auto *format = (WAVEFORMATEX *) current_device_format.prop.blob.pBlobData;
+          const ULONG blob_size = current_device_format.prop.blob.cbSize;
+          int bits = 0;
+          if (format && blob_size >= sizeof(WAVEFORMATEX)) {
+            if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && blob_size >= sizeof(WAVEFORMATEXTENSIBLE)) {
+              bits = ((WAVEFORMATEXTENSIBLE *) format)->Samples.wValidBitsPerSample;
+            } else {
+              bits = format->wBitsPerSample;
+            }
+          }
+          if (bits == 8 || bits == 16 || bits == 24 || bits == 32) {
+            wanted_bits_per_sample = bits;
+            BOOST_LOG(info) << "Virtual audio device will use "sv << wanted_bits_per_sample << "-bit to match default device"sv;
+          } else {
+            BOOST_LOG(warning) << "Default device reports an unusable sample depth ("sv << bits
+                               << "); keeping "sv << wanted_bits_per_sample << "-bit"sv;
+          }
         }
       }
 
       auto &device_id = virtual_sink_info->first;
       auto &waveformats = virtual_sink_info->second.get().virtual_sink_waveformats;
-      for (const auto &waveformat : waveformats) {
-        // We're using completely undocumented and unlisted API,
-        // better not pass objects without copying them first.
-        auto device_id_copy = device_id;
-        auto waveformat_copy = waveformat;
-        auto waveformat_copy_pointer = reinterpret_cast<WAVEFORMATEX *>(&waveformat_copy);
+      // Two passes: the depth we would prefer, then any depth the sink offers.
+      // Matching the host's bit depth is a nicety (a 16- to 24-bit switch has
+      // glitched for some users); assigning the sink at all is not. Failing the
+      // whole assignment because no candidate matched used to leave the default
+      // device wherever it had just been dragged.
+      for (int pass = 0; pass < 2; pass++) {
+        for (const auto &waveformat : waveformats) {
+          if (pass == 0 && wanted_bits_per_sample != waveformat.Samples.wValidBitsPerSample) {
+            continue;
+          }
 
-        if (wanted_bits_per_sample != waveformat.Samples.wValidBitsPerSample) {
-          continue;
+          // We're using completely undocumented and unlisted API,
+          // better not pass objects without copying them first.
+          auto device_id_copy = device_id;
+          auto waveformat_copy = waveformat;
+          auto waveformat_copy_pointer = reinterpret_cast<WAVEFORMATEX *>(&waveformat_copy);
+
+          WAVEFORMATEXTENSIBLE p {};
+          if (SUCCEEDED(policy->SetDeviceFormat(device_id_copy.c_str(), waveformat_copy_pointer, (WAVEFORMATEX *) &p))) {
+            BOOST_LOG(info) << "Changed virtual audio sink format to " << logging::bracket(waveformat_to_pretty_string(waveformat));
+            return device_id;
+          }
         }
-
-        WAVEFORMATEXTENSIBLE p {};
-        if (SUCCEEDED(policy->SetDeviceFormat(device_id_copy.c_str(), waveformat_copy_pointer, (WAVEFORMATEX *) &p))) {
-          BOOST_LOG(info) << "Changed virtual audio sink format to " << logging::bracket(waveformat_to_pretty_string(waveformat));
-          return device_id;
+        if (pass == 0) {
+          BOOST_LOG(warning) << "No "sv << wanted_bits_per_sample
+                             << "-bit format applied to the virtual sink; trying the rest"sv;
         }
       }
 

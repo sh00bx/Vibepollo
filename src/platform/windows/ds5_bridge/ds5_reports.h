@@ -5,9 +5,13 @@
  *        injects into the real controller.
  *
  * All layout facts come from public sources (Linux hid-playstation.c, the
- * DualSense wiki / DJm00n ControllersInfo). The DualSense input/output "common
- * block" is identical across the USB and BT transports — only the framing and
- * the trailing BT CRC32 differ — so translation is a reframe, not a re-encode.
+ * DualSense wiki / DJm00n ControllersInfo) and were re-verified against this
+ * hardware on 2026-08-28 (600 live reports off /dev/hidraw3 while streaming).
+ * The DualSense input/output "common block" is identical across the USB and BT
+ * transports, so translation is very nearly a reframe -- with one exception:
+ * the common block carries an 8-byte authentication tag the pad computes over
+ * its own report, and that tag cannot survive being reframed. Everything else
+ * is copied through; see bt_input_to_usb.
  */
 #pragma once
 
@@ -20,6 +24,11 @@ namespace platf::ds5_bridge {
   // 64-byte USB input report the virtual device delivers to the game:
   //   [0x01][63-byte common input block].
   constexpr int USB_INPUT_LEN = 64;
+  // The last 8 bytes of the common block are an authentication tag the pad
+  // computes over its OWN report (VIIPER 0aaae619 names it an AES-CMAC). It is
+  // the only field in the block we must NOT forward -- see bt_input_to_usb.
+  constexpr int USB_INPUT_TAG_OFFSET = 56;
+  constexpr int USB_INPUT_TAG_LEN = 8;
   // 47-byte USB output "effects" payload (the 0x02 report body, id stripped)
   // handed to us by the virtual device when the game writes an output report.
   constexpr int USB_OUTPUT_COMMON_LEN = 47;
@@ -65,6 +74,20 @@ namespace platf::ds5_bridge {
     }
     out[0] = 0x01;
     std::memcpy(&out[1], &bt[BT_INPUT_COMMON_OFFSET], USB_INPUT_LEN - 1);
+    // Drop the pad's authentication tag instead of forwarding it. It is
+    // computed over the PHYSICAL report; we hand the game a different one --
+    // the report id is reframed 0x31 -> 0x01, and while the desktop
+    // touchpad-mouse owns this pad bridge_host.cpp additionally lifts the touch
+    // contacts and the touchpad click out of this very copy. A forwarded tag
+    // therefore cannot match what the game receives, and passing a stale tag
+    // asserts an authenticity we cannot back; zero is the honest "absent".
+    //
+    // Measured on this hardware 2026-08-28, 600 live reports during a stream
+    // plus 400 idle: bytes 56..63 take all 256 byte values, never repeat as a
+    // tail across 1000 reports and are never zero -- a live per-report tag,
+    // not padding. Bytes 54 and 55 sit in the same reserved run but are hard
+    // zero here and are left untouched deliberately.
+    std::memset(&out[USB_INPUT_TAG_OFFSET], 0, USB_INPUT_TAG_LEN);
     return true;
   }
 

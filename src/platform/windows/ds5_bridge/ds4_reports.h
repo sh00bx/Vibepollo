@@ -69,6 +69,10 @@ namespace platf::ds5_bridge {
   // user's Headphones/Split modes and passes AUTO through untouched.
   constexpr uint8_t DS4_ROUTE_HEADPHONES = 0xFF;
   constexpr uint8_t DS4_ROUTE_SPLIT = 0xDF;
+  /* Firmware "no target": the pad decodes nothing and stays quiet. The low
+   * nibble must contain 0x02 or 0x04 for any output to be enabled at all, so
+   * zero is the off value rather than a third destination. */
+  constexpr uint8_t DS4_ROUTE_NONE = 0x00;
 
   /// Sign a DS4 BT output-class report in place: CRC32 over the 0xA2 seed byte
   /// followed by everything but the 4-byte tail, little-endian at the tail.

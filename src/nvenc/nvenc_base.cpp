@@ -672,6 +672,21 @@ namespace nvenc {
           format_config.matrixCoefficients = colorspace.matrix;
           format_config.colorRange = colorspace.full_range;
           format_config.chromaSamplePosition = buffer_is_yuv444() ? 0 : 1;
+          // Write timing_info into the AV1 sequence header. Costs a handful of
+          // bits per sequence header and is the only way a decoder can learn our
+          // frame duration: NVENC derives it from frameRateNum/frameRateDen,
+          // which we set above.
+          //
+          // This matters on webOS/NDL. That decoder presents AV1 off the decoder
+          // clock (HEVC presents on arrival instead), so without a frame duration
+          // it falls back to 60 Hz no matter what rate was requested -- measured
+          // on an LG G4 2026-08-28: same 72 fps source, av1_nvenc gave
+          // videooutput/getStatus frameRate=60 with visible cadence judder while
+          // hevc_nvenc gave 72 and was clean. NDL's own load API carries no
+          // framerate field, so the bitstream is the only channel we have.
+          // repeatSeqHdr above makes sure the header (and this timing) recurs
+          // rather than only leading the stream.
+          format_config.enableTimingInfo = 1;
 #if NVENCAPI_MAJOR_VERSION >= 13
           if (colorspace.tranfer_function == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084 &&
               hdr_metadata_valid && api::supports_hdr10_metadata(selected_api_version)) {

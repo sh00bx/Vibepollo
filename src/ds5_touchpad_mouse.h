@@ -36,6 +36,21 @@ namespace tpmouse {
   bool feed_usb_report(uintptr_t source, const uint8_t *usb, size_t len);
 
   /**
+   * @brief Same, for a DualShock 4's USB 0x01 report.
+   *
+   * A separate entry point rather than a sniffed one: both pads use report id
+   * 0x01 with the same length, and the touch block, the click bit and the pad
+   * clock all sit at different offsets with different units -- reading a DS4
+   * report with the DualSense map yields plausible garbage, not a failure. The
+   * caller knows which pad it bridged, so it says so.
+   *
+   * @return true when the mouse consumed this pad's touch; the caller then
+   *         lifts contacts (payload 34 and 38) and the click (payload byte 6,
+   *         bit 0x02) off the copy the virtual pad sees.
+   */
+  bool feed_ds4_usb_report(uintptr_t source, const uint8_t *usb, size_t len);
+
+  /**
    * @brief Feed a normalized moonlight controller-touch event.
    * Source semantics as in feed_usb_report().
    * @return true when the event was consumed for mouse synthesis (the caller

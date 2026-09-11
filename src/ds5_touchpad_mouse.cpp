@@ -21,6 +21,8 @@
 #include "process.h"
 #ifdef _WIN32
   #include "platform/windows/playnite_integration.h"
+
+  #include <windows.h>
 #endif
 
 using namespace std::chrono_literals;
@@ -30,8 +32,25 @@ namespace tpmouse {
   namespace {
 
     // DS5 touchpad sensor space (hid-playstation).
+    // DualSense touchpad, per hid-playstation's input_set_abs_params. The
+    // DualShock 4 shares the X range but is shorter (hid-sony: 1920 x 942), so
+    // the geometry travels with the report instead of being a constant.
     constexpr int PAD_W = 1920;
     constexpr int PAD_H = 1080;
+    constexpr int DS4_PAD_W = 1920;
+    constexpr int DS4_PAD_H = 942;
+    // Y units per X unit: both pads are about 52 x 23 mm, so the ratio is just
+    // (height in units / width in units) corrected to square. DS5 1080/1920 on
+    // that area gives 27/21; the DS4's 942 gives 1.11.
+    constexpr double PAD_XY_SCALE = 27.0 / 21.0;
+    constexpr double DS4_XY_SCALE = (942.0 / 23.0) / (1920.0 / 52.0);
+    // Pad clock: the DualSense counts 1/3 us per tick in a 32-bit field, the
+    // DualShock 4 counts 5.33 us (16/3) per tick in a 16-bit one -- so the DS4
+    // wraps every ~349 ms, and any step near that horizon is ambiguous rather
+    // than long. Both numbers are the kernel's (hid-playstation, hid-sony).
+    constexpr double DS5_US_PER_TICK = 1.0 / 3.0;
+    constexpr double DS4_US_PER_TICK = 16.0 / 3.0;
+    constexpr double DS4_DEV_DT_MAX_US = 280000.0;  // 80% of the 16-bit wrap
 
     // A tap is a short, still contact.
     constexpr auto TAP_MAX_DURATION = 280ms;
@@ -71,11 +90,20 @@ namespace tpmouse {
       bool have_move_time {false};
       double velocity_ema {0.0};  // device units per µs, smoothed
       // The pad's own free-running clock, when the report carries one. Raw
-      // ticks; the kernel divides by 3 for microseconds.
+      // ticks; us_per_tick and the wrap mask say which pad's ticks these are.
       bool dev_clock_valid {false};
       uint32_t dev_now_raw {0};
       uint32_t dev_prev_raw {0};
       bool have_dev_prev {false};
+      // Geometry and clock of the pad currently feeding us. Defaults are the
+      // DualSense's, which is also what the SDL touch path (normalised 0..1)
+      // wants: there the numbers are only an internal unit scale.
+      int pad_w {PAD_W};
+      int pad_h {PAD_H};
+      double xy_scale {PAD_XY_SCALE};
+      double dev_us_per_tick {DS5_US_PER_TICK};
+      uint32_t dev_tick_mask {0xffffffffu};
+      double dev_dt_max_us {1000000.0};
       // SDL path: map moonlight pointerId -> slot
       uint32_t ptr_id[2] {0, 0};
       bool ptr_used[2] {false, false};
@@ -90,6 +118,17 @@ namespace tpmouse {
     // The gate is evaluated at report rate; cache the verdict briefly so the
     // config mutex and process lock are not taken 250 times a second.
     std::atomic<int> gate_cache {-1};
+    // Consecutive "desktop" verdicts seen since the last "game" one. Engaging
+    // the mouse needs a run of them; releasing it needs a single verdict.
+    std::atomic<int> gate_desktop_streak {0};
+    // At one evaluation per 500 ms this is 2 s of settled desktop. A game does
+    // not stay fullscreen every single frame -- a loading screen, an overlay,
+    // an alt-tab all show through for a moment -- and each of those flipped the
+    // mouse back on mid-session (measured 2026-08-26: two engage/release pairs
+    // in 80 s of AC4), which silently steals the touchpad CLICK from the game
+    // for as long as it lasts. Asymmetric on purpose: handing the touchpad back
+    // to the game is the safe direction and stays instant.
+    constexpr int GATE_ENGAGE_SAMPLES = 4;
     std::atomic<int64_t> gate_stamp_ms {0};
 
     // Tuning values, mirrored out of the config at the same cadence: the
@@ -107,15 +146,60 @@ namespace tpmouse {
         .count();
     }
 
-    bool evaluate_gate() {
+#ifdef _WIN32
+    /// True when the foreground window covers its whole monitor and is not the
+    /// shell -- i.e. a game (or any fullscreen app) owns the screen.
+    ///
+    /// rcMonitor, not rcWork, is the deliberate comparison: a merely MAXIMISED
+    /// window stops at the work area and must stay on the desktop side of this
+    /// test, or the touchpad mouse would vanish the moment a window is
+    /// maximised. Called at most twice a second behind the gate cache.
+    bool fullscreen_app_foreground() {
+      HWND hwnd = GetForegroundWindow();
+      if (!hwnd || !IsWindowVisible(hwnd)) {
+        return false;
+      }
+      // The desktop itself is a full-monitor window; so is the taskbar's own
+      // fullscreen host. Neither means a game is running.
+      wchar_t cls[64] = {};
+      if (GetClassNameW(hwnd, cls, (int) (sizeof(cls) / sizeof(cls[0]))) > 0) {
+        for (const wchar_t *shell : {L"Progman", L"WorkerW", L"Shell_TrayWnd",
+                                     L"Windows.UI.Core.CoreWindow"}) {
+          if (wcscmp(cls, shell) == 0) {
+            return false;
+          }
+        }
+      }
+      RECT wr {};
+      if (!GetWindowRect(hwnd, &wr)) {
+        return false;
+      }
+      MONITORINFO mi {};
+      mi.cbSize = sizeof(mi);
+      if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+        return false;
+      }
+      // Borderless-fullscreen windows sometimes overshoot the monitor by a
+      // pixel or two; cover, not equal.
+      return wr.left <= mi.rcMonitor.left && wr.top <= mi.rcMonitor.top &&
+             wr.right >= mi.rcMonitor.right && wr.bottom >= mi.rcMonitor.bottom;
+    }
+#endif
+
+    // What evaluate_gate() decided, and on what authority. The hysteresis in
+    // active() applies to GATE_AUTO only: when the user has said "always", the
+    // mouse is theirs immediately, not after a settling run.
+    enum gate_verdict_e { GATE_OFF = 0, GATE_FORCED_ON = 1, GATE_AUTO = 2 };
+
+    gate_verdict_e evaluate_gate() {
       // The TV client's setting wins over the host config: the TV UI is where
       // the user actually flips this, and it re-asserts every session.
       int cm = client_mode.load(std::memory_order_relaxed);
       if (cm == 0) {
-        return false;
+        return GATE_OFF;
       }
       if (cm == 2) {
-        return true;
+        return GATE_FORCED_ON;
       }
       if (cm < 0) {
         std::string mode;
@@ -124,10 +208,10 @@ namespace tpmouse {
           mode = config::ds5b.touchpad_mouse;
         }
         if (mode == "off") {
-          return false;
+          return GATE_OFF;
         }
         if (mode == "always") {
-          return true;
+          return GATE_FORCED_ON;
         }
       }
       // "auto": only while no game is actually running. Two signals, because
@@ -138,7 +222,7 @@ namespace tpmouse {
       //    every Playnite-managed launch, no matter how the stream began.
 #ifdef _WIN32
       if (platf::playnite::get_active_game_status().active) {
-        return false;
+        return GATE_OFF;
       }
 #endif
       // 2. The streamed app's own metadata: anything that launches something
@@ -148,12 +232,23 @@ namespace tpmouse {
       //    its blocking undo commands, in the caller's thread) and belongs
       //    to the control thread's poll, not to a gate evaluated on the
       //    bridge and stream-input threads.
+      // 3. A fullscreen window owns the monitor. Signal 1 only sees launches
+      //    Playnite manages and signal 2 only sees what the CLIENT started, so
+      //    a game the user opened by hand inside a Desktop session (Steam, a
+      //    launcher, a shortcut) is invisible to both -- and its touchpad
+      //    belongs to the game: AC4 opens its map on the pad's click, which
+      //    this path would otherwise swallow along with the contacts.
+#ifdef _WIN32
+      if (fullscreen_app_foreground()) {
+        return GATE_OFF;
+      }
+#endif
       if (proc::proc.current_app_id() <= 0) {
         // No app at all: no active stream is feeding us anyway; allow, so the
         // brief window during session start behaves like the desktop it shows.
-        return true;
+        return GATE_AUTO;
       }
-      return proc::proc.running_app_launches_nothing();
+      return proc::proc.running_app_launches_nothing() ? GATE_AUTO : GATE_OFF;
     }
 
     int speed_percent() {
@@ -313,8 +408,8 @@ namespace tpmouse {
       // beyond a second the "interval" is a wrap-ambiguous pause whose speed
       // the arrival clock estimates just as well.
       constexpr double DEV_DT_MIN_US = 400.0;      // faster than the pad can report
-      constexpr double DEV_DT_MAX_US = 1000000.0;  // longer is a pause, not a step
-      constexpr double XY_SCALE = 27.0 / 21.0;
+      const double DEV_DT_MAX_US = st.dev_dt_max_us;  // longer is a pause, not a step
+      const double XY_SCALE = st.xy_scale;
       // Time constant of the velocity EMA; 1-exp(-4015/11000) = 0.30, the
       // per-event alpha the curve was tuned with at the pad's median cadence.
       // Substituted intervals carry no time information, so they keep the
@@ -330,9 +425,10 @@ namespace tpmouse {
       bool dev_dt_ok = false;
       bool dt_substituted = true;  // until a real interval replaces the default
       if (st.dev_clock_valid && st.have_dev_prev) {
-        // Unsigned arithmetic carries the 32-bit wrap (~24 min) on its own.
-        uint32_t ticks = st.dev_now_raw - st.dev_prev_raw;
-        double us = (double) ticks / 3.0;  // kernel: microseconds = raw / 3
+        // Unsigned arithmetic carries the wrap on its own; the mask picks the
+        // counter's width (32-bit DS5 ~24 min, 16-bit DS4 ~349 ms).
+        uint32_t ticks = (st.dev_now_raw - st.dev_prev_raw) & st.dev_tick_mask;
+        double us = (double) ticks * st.dev_us_per_tick;
         // Out of band means the clock is not telling us anything -- a pad that
         // never advances it would otherwise pin dt to the floor and make the
         // pointer race. Fall back to arrival time instead of clamping into
@@ -525,7 +621,19 @@ namespace tpmouse {
     int64_t now = now_ms();
     if (gate_cache.load(std::memory_order_relaxed) < 0 ||
         now - gate_stamp_ms.load(std::memory_order_relaxed) > 500) {
-      bool on = evaluate_gate();
+      const gate_verdict_e verdict = evaluate_gate();
+      bool on;
+      if (verdict == GATE_OFF) {
+        gate_desktop_streak.store(0, std::memory_order_relaxed);
+        on = false;
+      } else if (verdict == GATE_FORCED_ON) {
+        gate_desktop_streak.store(GATE_ENGAGE_SAMPLES, std::memory_order_relaxed);
+        on = true;
+      } else {
+        const int streak = gate_desktop_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+        // Already engaged: stay engaged, no re-qualifying every tick.
+        on = gate_cache.load(std::memory_order_relaxed) == 1 || streak >= GATE_ENGAGE_SAMPLES;
+      }
       {
         std::lock_guard lk(config::ds5b_mutex);
         speed_cache.store(config::ds5b.touchpad_mouse_speed, std::memory_order_relaxed);
@@ -564,46 +672,100 @@ namespace tpmouse {
     }
   }
 
-  bool feed_usb_report(uintptr_t source, const uint8_t *usb, size_t len) {
-    // USB 0x01 layout: payload p = usb + 1; touch points at p[32..35] / p[36..39]
-    // (bit7 of the first byte = finger up, low 7 bits = contact counter);
-    // touchpad click = p[9] & 0x02. Offsets per Linux hid-playstation, the
-    // same map the client's neutralizer uses.
-    if (!usb || len < 41 || usb[0] != 0x01) {
+  /**
+   * Where the two Sony pads keep the same things. Both stream a USB 0x01
+   * report whose touch section is a pair of 4-byte contacts in an identical
+   * bit layout (bit7 of the first byte = finger UP, low 7 bits = contact
+   * counter, then 12 bits of x and 12 of y) -- only the offsets, the pad
+   * geometry and the clock differ, so those travel in here instead of being
+   * baked into the reader.
+   *
+   * Offsets are payload-relative (payload = usb + 1) and come from the kernel:
+   * hid-playstation for the DualSense, hid-sony for the DualShock 4.
+   */
+  struct pad_layout_t {
+    size_t min_len;      // shortest USB report that still carries the touch block
+    int touch0;          // payload offset of contact 0; contact 1 follows 4 bytes later
+    int click_byte;      // payload byte whose 0x02 bit is the physical click
+    int clock;           // payload offset of the pad's free-running clock
+    int clock_bytes;     // width of that clock: 4 (DS5) or 2 (DS4)
+    int pad_w, pad_h;
+    double xy_scale;
+    double us_per_tick;
+    double dt_max_us;
+    uint32_t tick_mask;
+  };
+
+  static constexpr pad_layout_t DS5_LAYOUT = {
+      41, 32, 9, 27, 4, PAD_W, PAD_H, PAD_XY_SCALE, DS5_US_PER_TICK, 1000000.0, 0xffffffffu};
+  /* DS4 USB 0x01, offsets verified against hid-playstation's
+   * dualshock4_input_report_usb: status at payload 29, touch-report count at
+   * 32, then up to three 9-byte touch reports -- counter at 33, contacts at 34
+   * and 38. Click is the 0x02 bit of payload byte 6; the 16-bit sensor clock
+   * sits at payload 9..10 and counts 16/3 us per tick (kernel:
+   * sensor_timestamp * 16 / 3), against the DualSense's 1/3 us in 32 bits.
+   * Only the first of the batched touch reports is read, as SDL's own PS4
+   * driver does: the coordinates are absolute, so the newest sample already
+   * carries everything the intermediate ones would have said. Pad is
+   * 1920 x 942 (DS4_TOUCHPAD_WIDTH/HEIGHT); SDL scales Y by 920 instead
+   * because "it feels better", which is a pointer-feel choice, not the
+   * hardware's resolution. */
+  static constexpr pad_layout_t DS4_LAYOUT = {
+      43, 34, 6, 9, 2, DS4_PAD_W, DS4_PAD_H, DS4_XY_SCALE, DS4_US_PER_TICK, DS4_DEV_DT_MAX_US, 0xffffu};
+
+  static bool feed_usb_common(uintptr_t source, const uint8_t *usb, size_t len, const pad_layout_t &L) {
+    if (!usb || len < L.min_len || usb[0] != 0x01) {
       return false;
     }
     if (!active()) {
       return false;
     }
     const uint8_t *p = usb + 1;
-    const bool engaged = (p[32] & 0x80) == 0 || (p[36] & 0x80) == 0 || (p[9] & 0x02) != 0;
-    // Free-running pad clock at common[27..30] (hid-playstation.c,
-    // struct dualsense_input_report::sensor_timestamp). Little endian.
-    const uint32_t dev_raw = (uint32_t) p[27] | ((uint32_t) p[28] << 8) |
-                             ((uint32_t) p[29] << 16) | ((uint32_t) p[30] << 24);
+    const bool engaged = (p[L.touch0] & 0x80) == 0 || (p[L.touch0 + 4] & 0x80) == 0 ||
+                         (p[L.click_byte] & 0x02) != 0;
+    uint32_t dev_raw = 0;
+    for (int i = 0; i < L.clock_bytes; i++) {
+      dev_raw |= (uint32_t) p[L.clock + i] << (8 * i);  // little endian
+    }
     std::lock_guard lk(st.mtx);
     if (!acquire_source_locked(source, engaged)) {
       return false;
     }
+    // A pad that just took the gesture over brings its own geometry and clock
+    // with it; both are read under the same lock the reader uses.
+    st.pad_w = L.pad_w;
+    st.pad_h = L.pad_h;
+    st.xy_scale = L.xy_scale;
+    st.dev_us_per_tick = L.us_per_tick;
+    st.dev_tick_mask = L.tick_mask;
+    st.dev_dt_max_us = L.dt_max_us;
     st.dev_clock_valid = true;
     st.dev_now_raw = dev_raw;
     contact_t prev[2] = {st.c[0], st.c[1]};
     for (int i = 0; i < 2; i++) {
-      const uint8_t *t = p + 32 + i * 4;
+      const uint8_t *t = p + L.touch0 + i * 4;
       bool down = (t[0] & 0x80) == 0;
       uint8_t id = t[0] & 0x7f;
       int x = t[1] | ((t[2] & 0x0f) << 8);
       int y = (t[2] >> 4) | (t[3] << 4);
-      x = std::clamp(x, 0, PAD_W - 1);
-      y = std::clamp(y, 0, PAD_H - 1);
+      x = std::clamp(x, 0, st.pad_w - 1);
+      y = std::clamp(y, 0, st.pad_h - 1);
       set_contact_locked(i, down, id, x, y);
     }
-    bool click = (p[9] & 0x02) != 0;
+    bool click = (p[L.click_byte] & 0x02) != 0;
     process_locked(prev, click);
     // The clock reference is advanced inside move_pointer_locked, by motion
     // only -- a stationary report must lengthen the next step's interval,
     // not reset it.
     return true;
+  }
+
+  bool feed_usb_report(uintptr_t source, const uint8_t *usb, size_t len) {
+    return feed_usb_common(source, usb, len, DS5_LAYOUT);
+  }
+
+  bool feed_ds4_usb_report(uintptr_t source, const uint8_t *usb, size_t len) {
+    return feed_usb_common(source, usb, len, DS4_LAYOUT);
   }
 
   bool feed_touch_event(uintptr_t source, uint8_t event_type, uint32_t pointer_id, float x, float y) {
@@ -616,9 +778,18 @@ namespace tpmouse {
       return false;
     }
     // Moonlight touch events carry no pad clock; this path keeps libinput's
-    // arrival-time estimate.
+    // arrival-time estimate. The geometry goes back to the default too: these
+    // coordinates arrive normalised, so pad_w/pad_h are only the unit scale the
+    // gesture math works in, and inheriting a DualShock 4's shorter pad from a
+    // previous owner would quietly change this path's sensitivity.
     st.dev_clock_valid = false;
     st.have_dev_prev = false;
+    st.pad_w = PAD_W;
+    st.pad_h = PAD_H;
+    st.xy_scale = PAD_XY_SCALE;
+    st.dev_us_per_tick = DS5_US_PER_TICK;
+    st.dev_tick_mask = 0xffffffffu;
+    st.dev_dt_max_us = 1000000.0;
     contact_t prev[2] = {st.c[0], st.c[1]};
 
     if (event_type == LI_TOUCH_EVENT_CANCEL_ALL) {
@@ -662,8 +833,8 @@ namespace tpmouse {
       }
     }
 
-    int px = std::clamp((int) (x * (PAD_W - 1)), 0, PAD_W - 1);
-    int py = std::clamp((int) (y * (PAD_H - 1)), 0, PAD_H - 1);
+    int px = std::clamp((int) (x * (st.pad_w - 1)), 0, st.pad_w - 1);
+    int py = std::clamp((int) (y * (st.pad_h - 1)), 0, st.pad_h - 1);
     switch (event_type) {
       case LI_TOUCH_EVENT_DOWN:
         set_contact_locked(slot, true, (uint8_t) (pointer_id & 0x7f), px, py);

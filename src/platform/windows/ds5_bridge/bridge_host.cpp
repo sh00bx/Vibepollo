@@ -190,11 +190,33 @@ namespace platf::ds5_bridge {
             uint8_t usb[INPUT_REPORT_LEN];
             if (ds4_bt_input_to_usb(payload, h->payload_len, usb)) {
               // Follow the pad's own jack state for the audio route (Layout B
-              // auto-route); the TV-side patch forces 0xFF/0xDF over this for
-              // the user's explicit Headphones/Split modes.
+              // auto-route): jack -> stereo headphones, no jack -> split, which
+              // puts SBC channel 0 on the pad's own loudspeaker. The TV-side
+              // patch forces 0xFF/0xDF over this for the user's explicit
+              // Headphones/Split modes and passes it through in Auto.
+              //
+              // This deliberately never stores 0x00: end-of-stream reports use
+              // that value as the audio-plane disarm (ds4_audio.cpp
+              // STOP_REPORTS) and the TV honours it by NOT forcing a route back
+              // on, so a steady 0x00 here would read as "permanently stopped"
+              // and mute the pad outright. Auto briefly did mean "no target"
+              // (2026-08-26 morning) because the pad was echoing the whole game
+              // mix -- but that was Windows electing the pad as its default
+              // endpoint, fixed in audio.cpp's set_format, not a routing
+              // question.
               ds4_route_.store((usb[1 + DS4_STATUS_COMMON_OFFSET] & DS4_STATUS_HEADPHONES)
                                  ? DS4_ROUTE_HEADPHONES : DS4_ROUTE_SPLIT,
                                std::memory_order_relaxed);
+              // Desktop touchpad-mouse tap, same contract as the DS5 below:
+              // while the mouse consumes this pad's touch, lift the contacts
+              // and the touchpad click off the copy the virtual pad sees, so a
+              // host-side pad reader does not act on the same finger. DS4
+              // offsets: contacts at payload 34 / 38, click at payload byte 6.
+              if (tpmouse::feed_ds4_usb_report((uintptr_t) this, usb, sizeof(usb))) {
+                usb[1 + 34] |= 0x80;  // touch point 0: finger up
+                usb[1 + 38] |= 0x80;  // touch point 1: finger up
+                usb[1 + 6] &= ~0x02;  // touchpad click
+              }
               usbip_->set_input(slot_, usb);
             }
             break;
@@ -394,11 +416,13 @@ namespace platf::ds5_bridge {
       // free (the list holds 16) and keeps the advertisement correct no matter
       // when the HELLO arrives relative to the builder's construction.
       if (kind_ == pad_kind_e::ds4) {
-        // 0x17 is what this build emits; 0x14 is advertised too so a future
-        // 8 ms form needs no lockstep deploy.
-        cfg.paced_report_count = 2;
-        cfg.paced_report_ids[0] = DS4_BT_AUDIO_REPORT_ID;
-        cfg.paced_report_ids[1] = 0x14;
+        // Deliberately EMPTY for the DS4: every steady 0x17 still carries
+        // CTMB_FLAG_PACED (drain_outbox), which the client checks first, so the
+        // paced queue behaves exactly as before -- but the startup burst can
+        // now opt OUT of it. Listing 0x17 here would pace it by report id no
+        // matter what the flag says, and the client trims its paced ring to
+        // four entries, so a burst would be dropped rather than delivered.
+        cfg.paced_report_count = 0;
       } else {
         cfg.paced_report_count = 2;
         cfg.paced_report_ids[0] = 0x36;
@@ -519,8 +543,16 @@ namespace platf::ds5_bridge {
       dbg_fb_drops_ += drops;
       if (fb.fifo_count > dbg_fb_fifo_max_) dbg_fb_fifo_max_ = fb.fifo_count;
       if (++dbg_fb_n_ >= 40) {
-        BOOST_LOG(info) << "ds5-pace: adj=" << adj << "us ("
-                        << ((hap_ ? hap_->pace_base_us() : DS5_PACE_BASE_US) + adj)
+        // Report the grid this session actually runs, not the DS5's: the DS4
+        // pacer scales the servo by 3/2 onto a 16 ms base, so printing the
+        // DS5 numbers here made every DS4 session look like it paced at
+        // 10667 us -- exactly the wrong clue to hand the next investigation.
+        const bool ds4 = kind_ == pad_kind_e::ds4;
+        const int shown_adj = ds4 ? adj * 3 / 2 : adj;
+        const int shown_base = ds4 ? (ds4a_ ? ds4a_->pace_base_us() : DS4_PACE_BASE_US)
+                                   : (hap_ ? hap_->pace_base_us() : DS5_PACE_BASE_US);
+        BOOST_LOG(info) << (ds4 ? "ds4-pace: adj=" : "ds5-pace: adj=") << shown_adj << "us ("
+                        << (shown_base + shown_adj)
                         << "us/tick) fifo_max="
                         << dbg_fb_fifo_max_ << " q=" << (int) fb.outstanding
                         << "/" << fb.maxq << " drops+=" << dbg_fb_drops_
@@ -802,8 +834,19 @@ namespace platf::ds5_bridge {
 
     void drain_outbox() {
       if (!hello_seen_.load(std::memory_order_relaxed)) return;
+      std::deque<std::vector<uint8_t>> prime;
       std::deque<std::vector<uint8_t>> pending;
-      { std::lock_guard<std::mutex> lk(out_mtx_); pending.swap(outbox_); }
+      {
+        std::lock_guard<std::mutex> lk(out_mtx_);
+        prime.swap(outbox_prime_);
+        pending.swap(outbox_);
+      }
+      // The DS4 startup burst goes out UNPACED and before anything queued
+      // behind it: its whole purpose is to reach the controller faster than
+      // real time so the pad has a cushion before steady state begins.
+      for (auto &bt : prime) {
+        send_msg(CTMB_MSG_OUTPUT_REPORT, CTMB_FLAG_OK, 0, bt.data(), (uint32_t) bt.size());
+      }
       for (auto &bt : pending) {
         // Audio/haptic reports are paced (HOST_CONFIG advertises them); the
         // TV drains its PACED queue onto the raw-ACL injector at min(bt_pace_us,
@@ -838,7 +881,12 @@ namespace platf::ds5_bridge {
         int adj = fb_live ? pace_adj_us_.load(std::memory_order_relaxed)
                           : DS5_PACE_FALLBACK_ADJ_US;
         const int adj_scaled = adj * 3 / 2;
-        const auto period = microseconds(DS4_PACE_BASE_US + adj_scaled);
+        // While the builder is handing over the startup burst, run the grid at
+        // the prime cadence instead: the servo describes steady-state drift and
+        // has no meaning here.
+        const bool priming = ds4a_ && ds4a_->priming();
+        const auto period = priming ? microseconds(ds4a_->prime_pace_us())
+                                    : microseconds(DS4_PACE_BASE_US + adj_scaled);
         next += period;
         auto now = steady_clock::now();
         if (now - next > milliseconds(100)) next = now;  // genuine stall: no catch-up burst
@@ -847,7 +895,37 @@ namespace platf::ds5_bridge {
         if (ds4a_->build_0x17(rep, ds4_route_.load(std::memory_order_relaxed)) &&
             client_ready_.load(std::memory_order_relaxed)) {
           std::lock_guard<std::mutex> lk(out_mtx_);
-          if (outbox_.size() < 256) outbox_.emplace_back(rep, rep + DS4_0X17_LEN);
+          if (ds4a_->last_report_was_prime()) {
+            if (outbox_prime_.size() < 32) outbox_prime_.emplace_back(rep, rep + DS4_0X17_LEN);
+          } else if (outbox_.size() < 256) {
+            outbox_.emplace_back(rep, rep + DS4_0X17_LEN);
+          }
+        }
+        // 10 s speaker health, emitted only while the pad is being fed at all.
+        // built = 0x17 reports put on the wire (62.5/s while a stream runs,
+        // silence tails included), flush = stream ends closed out with such a
+        // tail, underrun = reports padded because our own ring ran dry,
+        // ringdrop = PCM frames cut on a feed overflow, prime = reports sent
+        // unpaced as a stream's startup burst (8 per stream when all land),
+        // endidle = how many of the flushes ended because the game closed its
+        // speaker endpoint rather than because it fell silent.
+        if (now_ms_v - ds4a_log_ms_ >= 10000) {
+          const uint64_t built = ds4a_->built();
+          if (built != ds4a_log_built_) {
+            BOOST_LOG(debug) << "ds4-audio/10s: built="sv << (built - ds4a_log_built_)
+                             << " underrun="sv << (ds4a_->underruns() - ds4a_log_under_)
+                             << " flush="sv << (ds4a_->flushes() - ds4a_log_flush_)
+                             << " endidle="sv << (ds4a_->flushes_idle() - ds4a_log_fidle_)
+                             << " prime="sv << (ds4a_->primed() - ds4a_log_prime_)
+                             << " ringdrop="sv << (ds4a_->dropped_frames() - ds4a_log_drop_);
+            ds4a_log_built_ = built;
+            ds4a_log_under_ = ds4a_->underruns();
+            ds4a_log_flush_ = ds4a_->flushes();
+            ds4a_log_prime_ = ds4a_->primed();
+            ds4a_log_fidle_ = ds4a_->flushes_idle();
+            ds4a_log_drop_ = ds4a_->dropped_frames();
+          }
+          ds4a_log_ms_ = now_ms_v;
         }
       }
     }
@@ -1039,7 +1117,7 @@ namespace platf::ds5_bridge {
       // the producers; the outbox drops what already accumulated.
       hello_seen_.store(false);
       client_ready_.store(false, std::memory_order_relaxed);
-      { std::lock_guard<std::mutex> lk(out_mtx_); outbox_.clear(); }
+      { std::lock_guard<std::mutex> lk(out_mtx_); outbox_.clear(); outbox_prime_.clear(); }
       // Fresh link may be a fresh pad connect: re-arm the lightbar-setup
       // release, lightbar ownership and the per-connect output diagnostics.
       // Zero (not now_ms()) so the window opens at the next HELLO -- there is
@@ -1167,6 +1245,15 @@ namespace platf::ds5_bridge {
     const pad_kind_e kind_ {pad_kind_e::ds5};
     // DS4 audio builder + the live auto-route byte (from the pad's jack bit).
     std::unique_ptr<ds4_audio_builder> ds4a_;
+    // ds4_pacer_run's 10 s diagnostics window (pacer thread only).
+    int64_t ds4a_log_ms_ = 0;
+    uint64_t ds4a_log_built_ = 0, ds4a_log_under_ = 0, ds4a_log_flush_ = 0, ds4a_log_drop_ = 0;
+    uint64_t ds4a_log_prime_ = 0, ds4a_log_fidle_ = 0;
+    // Silent until an input report says otherwise -- see on_message(): the
+    // speaker is opt-in, not the fallback.
+    // Never NONE at rest: that value is the end-of-stream disarm (see the
+    // store in CTMB_MSG_INPUT_REPORT). Split until the pad's first input
+    // report says whether a jack is in.
     std::atomic<uint8_t> ds4_route_ {DS4_ROUTE_SPLIT};
     // Desired HD-haptics state (config), pushed by the control thread on every
     // BRIDGE_START (incl. adopts); latched into haptics_on_ at the next HELLO so
@@ -1236,6 +1323,8 @@ namespace platf::ds5_bridge {
 
     std::mutex out_mtx_;
     std::deque<std::vector<uint8_t>> outbox_;
+    // DS4 speaker startup burst; drained before outbox_ and sent UNPACED.
+    std::deque<std::vector<uint8_t>> outbox_prime_;
 
     std::mutex feat_mtx_;
     std::array<std::array<uint8_t, 64>, 256> feat_cache_ {};
