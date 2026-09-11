@@ -94,10 +94,15 @@ namespace audio {
     ctx.control = std::move(value.control);
     ctx.sink = std::move(value.sink);
     ctx.restore_sink = value.restore_sink;
-    // The retained control is still assigned to the streaming sink. Mark the
-    // handoff as already assigned so reconnect does not write the default roles
-    // again before opening its microphone.
-    ctx.sink_flag->store(true, std::memory_order_release);
+    // Deliberately NOT marking the sink as already assigned (upstream 29dbfef3
+    // does): the reconnecting session re-asserts the streaming sink itself.
+    // Windows' default can move while the app runs unstreamed (a DS5/DS4 UAC
+    // endpoint arriving, HDMI audio after a display re-apply), and the capture
+    // is pinned to the assigned sink, so skipping set_sink here left the game
+    // playing to the new default and the stream silent until the app ended. It
+    // also retries a set_sink that failed in the first session. set_sink is
+    // built to be re-applied: the defaults to restore are captured only on
+    // the first assignment, so restore_sink still targets the original device.
     return true;
   }
 
