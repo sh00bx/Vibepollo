@@ -65,6 +65,11 @@ namespace platf::ds5_bridge {
     void set_audio_cushion(int n) { audio_cushion_.store(n); }
     /// AudioControl echo/noise-cancel bits in the audio SetState (next connect).
     void set_audio_cancel_bits(bool on) { audio_cancel_bits_.store(on); }
+    /// Negative rate-servo branch that makes up dropped audio (next connect).
+    void set_pace_refill(bool on, int cap_ms) {
+      pace_refill_.store(on);
+      pace_refill_cap_ms_.store(cap_ms);
+    }
 
     /// Synthetic lightbar color (0x00RRGGBB) or LIGHTBAR_OFF. Sessions read it
     /// live on every game output, so config changes apply immediately.
@@ -81,6 +86,8 @@ namespace platf::ds5_bridge {
     std::atomic<bool> audio_batched_ {false};
     std::atomic<int> audio_cushion_ {4};
     std::atomic<bool> audio_cancel_bits_ {false};
+    std::atomic<bool> pace_refill_ {false};
+    std::atomic<int> pace_refill_cap_ms_ {64};
     std::atomic<uint32_t> lightbar_rgb_ {LIGHTBAR_OFF};
     int port_ {48054};
 

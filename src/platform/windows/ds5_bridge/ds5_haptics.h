@@ -89,6 +89,15 @@ namespace platf::ds5_bridge {
   constexpr int DS5_PACE_BASE_BATCHED_US = 2 * DS5_PACE_BASE_US;  // ~46.9/s
   constexpr int DS5_PACE_ADJ_MAX_US = 140;        // slowest: ~92.5/s (-1.3%)
   constexpr int DS5_PACE_FALLBACK_ADJ_US = 35;    // no-feedback static margin (-0.33%)
+  // Negative branch (ds5_native_pace_refill, off by default). The servo above
+  // can only slow down, but every report the TV drops is audio the pad never
+  // gets: after an underrun it re-primes on what was actually delivered, so
+  // each drop leaves it one report shorter than its slider depth, for good.
+  // The refill runs the pacer up to 70 us per 0x36 period fast (+0.66%; the
+  // resampler follows the period, so this is a pitch shift under 1%) until the
+  // dropped audio has been made up on top of the drain rate.
+  constexpr int DS5_PACE_REFILL_MAX_US = 70;
+  constexpr int DS5_PACE_REFILL_STEP_US = 10;     // ramp per feedback sample (~4/s)
 
   /**
    * @brief Turns iso-OUT PCM into paced DS5 0x36 haptic reports.
