@@ -1559,6 +1559,33 @@ namespace video {
     std::chrono::steady_clock::time_point stable_since {};
   };
 
+  // Re-keying after a packet-queue overflow (see the consume_overflow() callers).
+  // One overflow empties the stale backlog and needs one IDR; further overflows
+  // in the same congested stretch only add frames to the backlog that caused
+  // them (on 2026-09-11 each one added an immediately encoded IDR: 1000-1150
+  // frames per 10 s at 72 fps, above the pacer cap, so the stretch sustained
+  // itself for 90 s). The queue spans ~0.44 s at 72 fps, so one re-key per
+  // second covers a stretch; losses after it are recovered by the client's own
+  // reference-invalidation requests.
+  struct overflow_rekey_t {
+    static constexpr auto min_interval = std::chrono::seconds(1);
+
+    std::chrono::steady_clock::time_point last {};
+    unsigned suppressed = 0;
+
+    bool admit(const std::chrono::steady_clock::time_point now) {
+      if (last != std::chrono::steady_clock::time_point {} && now - last < min_interval) {
+        ++suppressed;
+        return false;
+      }
+      BOOST_LOG(info) << "Video packet queue overflowed; re-keying on the next captured frame ("sv
+                      << suppressed << " further overflows since the previous re-key)"sv;
+      last = now;
+      suppressed = 0;
+      return true;
+    }
+  };
+
   struct sync_session_ctx_t {
     safe::signal_t *join_event;
     safe::mail_raw_t::event_t<bool> shutdown_event;
@@ -1575,6 +1602,7 @@ namespace video {
     // Last HDR info raised to this session's client, used to suppress duplicates on reinit.
     std::optional<hdr_info_raw_t> last_hdr_info;
     rtx_hdr_metadata_refresh_state_t rtx_hdr_metadata_refresh;
+    overflow_rekey_t overflow_rekey;
   };
 
   struct sync_session_t {
@@ -4835,6 +4863,12 @@ namespace video {
       std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
     } loop_stats;
 
+    overflow_rekey_t overflow_rekey;
+    // Set when an overflow admits a re-key: the NEXT captured frame becomes the IDR.
+    // Unlike idr_events it does not skip the image wait, so it never encodes an
+    // extra copy of the last image into a congested queue.
+    bool overflow_rekey_pending = false;
+
     while (true) {
       if (auto now = std::chrono::steady_clock::now(); now - loop_stats.last_log >= 10s) {
         BOOST_LOG(debug) << "Encode loop [" << channel_data << "] " << config.width << 'x' << config.height
@@ -4895,8 +4929,9 @@ namespace video {
         idr_events->pop();
       }
 
-      if (requested_idr_frame) {
+      if (requested_idr_frame || overflow_rekey_pending) {
         session->request_idr_frame();
+        overflow_rekey_pending = false;
       }
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
@@ -5075,12 +5110,11 @@ namespace video {
         ++loop_stats.dropped_submissions;
       }
 
-      if (packets->consume_overflow()) {
+      if (packets->consume_overflow() && overflow_rekey.admit(std::chrono::steady_clock::now())) {
         // The packet queue overflowed and drained its stale backlog (see
-        // start_broadcast); the client is missing references, so re-key
-        // immediately instead of waiting for its IDR request round trip.
-        BOOST_LOG(debug) << "Video packet queue overflowed; requesting an IDR frame to recover"sv;
-        idr_events->raise(true);
+        // videoBroadcastThread); the client is missing references, so re-key
+        // with the next frame instead of waiting for its IDR request round trip.
+        overflow_rekey_pending = true;
       }
 
 
@@ -5585,11 +5619,9 @@ namespace video {
             continue;
           }
 
-          if (ctx->packets->consume_overflow()) {
-            // The packet queue overflowed and drained its stale backlog (see
-            // start_broadcast); the client is missing references, so re-key
-            // immediately instead of waiting for its IDR request round trip.
-            BOOST_LOG(debug) << "Video packet queue overflowed; requesting an IDR frame to recover"sv;
+          if (ctx->packets->consume_overflow() && ctx->overflow_rekey.admit(std::chrono::steady_clock::now())) {
+            // Same re-key as the main loop. Here idr_events only marks the next
+            // encode (this loop encodes per captured image), so no extra frame.
             ctx->idr_events->raise(true);
           }
 

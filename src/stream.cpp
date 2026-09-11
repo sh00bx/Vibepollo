@@ -1926,6 +1926,13 @@ namespace stream {
   void videoBroadcastThread(udp::socket &sock) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    // The mail registry holds queues weakly. start_broadcast() sets this policy
+    // through a local pointer that dies when it returns, so if this thread had
+    // not picked the queue up by then, it got a fresh one with the default
+    // drop_oldest policy: the queue then stays full and overflows on every frame
+    // (2026-09-10/11: packet queue latency never below ~185 ms, 30-45 overflows/s).
+    // Set it on the instance this thread keeps for the whole broadcast.
+    packets->set_overflow_policy(safe::queue_t<video::packet_t>::overflow_e::drain_to_newest);
     auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread. The send pacer (pacing_max_bitrate_kbps)
