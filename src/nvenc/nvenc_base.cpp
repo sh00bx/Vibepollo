@@ -183,6 +183,9 @@ namespace nvenc {
       if (encoder) {
         if (nvenc_failed(nvenc->nvEncDestroyEncoder(encoder))) {
           BOOST_LOG(error) << "NvEnc: couldn't destroy the rejected API session: " << last_nvenc_error_string;
+          // The session is gone or unusable either way; do not let the fail
+          // guard send a second destroy (and an unregister) to the same handle.
+          encoder = nullptr;
           return false;
         }
         encoder = nullptr;
@@ -779,6 +782,7 @@ namespace nvenc {
         if (nvenc_failed(nvenc->nvEncDestroyEncoder(encoder))) {
           BOOST_LOG(error) << "NvEnc: couldn't destroy the rejected explicit-config session: "
                            << last_nvenc_error_string;
+          encoder = nullptr;  // same as destroy_api_attempt: no second destroy from the fail guard
           return false;
         }
         encoder = nullptr;

@@ -202,6 +202,10 @@ namespace platf::virtual_display_cleanup {
 
   cleanup_result_t terminate_all(const std::string_view reason) {
     std::lock_guard terminal_lock {g_terminal_cleanup_mutex};
+    // Hold the in-progress reservation across every step, not only run():
+    // a launch that waits on in_progress() must not create a display between
+    // the recovery cancel and the driver/watchdog shutdown below.
+    cleanup_reservation_t terminal_reservation;
     const std::string reason_text = reason.empty() ? "unspecified" : std::string(reason);
 
     // A previous app-triggered revert may still be queued for the end of the
@@ -229,6 +233,11 @@ namespace platf::virtual_display_cleanup {
     // stop is safe here because run() has already completed the synchronous
     // REVERT attempt and display teardown. Closing the driver transport stops
     // its lease/watchdog worker; a later session opens it again on demand.
+    // Mark the transport as not open first (same order as
+    // proc::onVDisplayWatchdogFailed), so the next launch runs
+    // initVDisplayDriver() again -- the SudoVDA backend only restarts its ping
+    // thread and render-adapter pin from there.
+    proc::vDisplayDriverStatus.store(VDISPLAY::DRIVER_STATUS::UNKNOWN, std::memory_order_release);
     VDISPLAY::closeVDisplayDevice();
     display_helper_integration::stop_watchdog(true);
     BOOST_LOG(info) << "Virtual display cleanup: terminal driver and helper watchdog shutdown completed (reason="
