@@ -1661,7 +1661,8 @@ namespace platf::audio {
         }
         std::wstring device_id = wstring_id.get();
 
-        bool matches = marker_id && *marker_id == device_id;
+        const bool exact = marker_id && *marker_id == device_id;
+        bool matches = exact;
         if (!matches) {
           audio::prop_t prop;
           prop_var_t adapter_friendly_name;
@@ -1680,13 +1681,25 @@ namespace platf::audio {
           continue;
         }
 
-        // Prefer a hidden match: duplicate registrations can leave an active
-        // sibling next to the endpoint that actually needs healing.
-        endpoint_id = std::move(device_id);
-        endpoint_state = state;
-        if (state != DEVICE_STATE_ACTIVE) {
+        // The marker's own endpoint wins outright. A name match only counts
+        // when it is active or hidden (DISABLED is what SetEndpointVisibility
+        // FALSE leaves): re-showing a NOTPRESENT/UNPLUGGED ghost of the same
+        // name would clear the marker and leave the real endpoint hidden.
+        // Among name matches prefer a hidden one: duplicate registrations can
+        // leave an active sibling next to the endpoint that needs healing.
+        if (exact) {
+          endpoint_id = std::move(device_id);
+          endpoint_state = state;
           break;
         }
+        if (state != DEVICE_STATE_ACTIVE && state != DEVICE_STATE_DISABLED) {
+          continue;
+        }
+        if (endpoint_state && *endpoint_state == DEVICE_STATE_DISABLED) {
+          continue;  // already holding a hidden name match; keep looking only for the exact id
+        }
+        endpoint_id = std::move(device_id);
+        endpoint_state = state;
       }
 
       switch (visibility_recovery::classify_heal(
