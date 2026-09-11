@@ -441,6 +441,15 @@ namespace config {
     // so how much latency a wrong refill could add). Read at session creation.
     bool native_pace_refill {false};
     int native_pace_refill_cap_ms {64};
+    // How the rumble-vs-haptics override hands the coils back (port plan W2-03).
+    // Off: clear both valid_flag0 rumble bits (the behavior since a6d6d6a2).
+    // On: the SundayMoments form -- keep COMPATIBLE_VIBRATION (0x01) with zero
+    // motors, clear HAPTICS_SELECT (0x02) and valid_flag2's rumble bits
+    // (0x04 COMPATIBLE_VIBRATION2, which firmware >= 2.21 reads as rumble, and
+    // 0x08), and also fire when a title sets only valid_flag2 0x08. Neither form
+    // is verified on our pad; OFF until the Ratchet/Forza hand-and-ear A/B.
+    // Read at session creation.
+    bool native_haptics_handback {false};
 
     // Synthetic lightbar color, hex "RRGGBB" (empty/"off" disables). PC games
     // via libScePad set the lightbar to black at pad init and never write a

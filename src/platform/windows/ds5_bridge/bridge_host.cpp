@@ -70,11 +70,12 @@ namespace platf::ds5_bridge {
 
     bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, pad_kind_e kind,
                    bool haptics, bool audio_batched, int audio_cushion, bool audio_cancel_bits,
-                   bool pace_refill, int pace_refill_cap_ms,
+                   bool pace_refill, int pace_refill_cap_ms, bool haptics_handback,
                    const std::atomic<uint32_t> *lightbar_rgb):
         usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport), kind_(kind),
         audio_batched_(audio_batched), audio_cushion_(audio_cushion), audio_cancel_bits_(audio_cancel_bits),
         pace_refill_(pace_refill), pace_refill_cap_us_((int64_t) pace_refill_cap_ms * 1000),
+        haptics_handback_(haptics_handback),
         lightbar_rgb_(lightbar_rgb) { haptics_want_.store(haptics); }
 
     pad_kind_e kind() const { return kind_; }
@@ -338,6 +339,9 @@ namespace platf::ds5_bridge {
         hap_->set_audio_control(audio_cancel_bits_ ? 0x0C : 0x00);
         if (audio_cancel_bits_) {
           BOOST_LOG(info) << "ds5-bridge: audio SetState AudioControl = 0x0C (echo + noise cancel bits)"sv;
+        }
+        if (haptics_handback_) {
+          BOOST_LOG(info) << "ds5-bridge: haptics override hands back as f0 0x01 without 0x02, f2 &= ~0x0C"sv;
         }
         if (pace_refill_) {
           BOOST_LOG(info) << "ds5-bridge: pace refill on (dropped audio is made up at up to +"sv
@@ -730,11 +734,28 @@ namespace platf::ds5_bridge {
       const bool motors_idle = (common[2] | common[3]) == 0;
       const bool coil_title = hap_ && haptics_on_.load(std::memory_order_relaxed) &&
                               hap_->coil_ever_active();
-      const bool rumble_flag_override = coil_title && motors_idle && (common[0] & 0x03) != 0;
+      //
+      // Two hand-back forms (ds5_native_haptics_handback). Default: clear both
+      // bits -- with zero motors, RUMBLE_EMULATION only re-asserts a zero
+      // rumble, and leaving it set keeps the emulation owning the coils. The
+      // alternative (SundayMoments): the pad leaves rumble mode only on 0x01
+      // WITHOUT 0x02, and firmware >= 2.21 also reads valid_flag2 0x04
+      // (COMPATIBLE_VIBRATION2) as rumble, so keep 0x01, clear 0x02 and
+      // valid_flag2 0x04/0x08, and also fire on a title that sets only
+      // valid_flag2 0x08. Neither is verified on our pad; 30 host logs up to
+      // 2026-09-11 show no title setting valid_flag2 0x04/0x08 at all.
+      const uint8_t raw_f2 = common[38];
+      const bool rumble_flag_override =
+        coil_title && motors_idle &&
+        (haptics_handback_ ? ((common[0] & 0x02) != 0 || (common[38] & 0x08) != 0)
+                           : (common[0] & 0x03) != 0);
       if (rumble_flag_override) {
-        // Clear both bits: with zero motors, RUMBLE_EMULATION only re-asserts a
-        // zero rumble, and leaving it set keeps the emulation owning the coils.
-        common[0] &= (uint8_t) ~0x03;
+        if (haptics_handback_) {
+          common[0] = (uint8_t) ((common[0] | 0x01) & ~0x02);
+          common[38] &= (uint8_t) ~0x0C;
+        } else {
+          common[0] &= (uint8_t) ~0x03;
+        }
       }
       // The HELLO-time lightbar-setup release can arrive before the pad has
       // switched to extended BT mode (the 0x05/0x09/0x20 feature reads do the
@@ -778,7 +799,7 @@ namespace platf::ds5_bridge {
       // their OWN change, throttled only enough to survive a title that
       // animates trigger effects per report.
       const uint64_t dbg_sig = ((uint64_t) raw_f0) | ((uint64_t) common[1] << 8) |
-                               ((uint64_t) common[38] << 16) | ((uint64_t) common[2] << 24) |
+                               ((uint64_t) raw_f2 << 16) | ((uint64_t) common[2] << 24) |
                                ((uint64_t) common[3] << 32) | ((uint64_t) common[10] << 40) |
                                ((uint64_t) common[21] << 48) | ((uint64_t) common[43] << 56);
       const bool sig_changed = dbg_sig != dbg_sig_;
@@ -794,7 +815,7 @@ namespace platf::ds5_bridge {
         std::snprintf(msg, sizeof(msg),
                       "ds5-out: f0=%02x f1=%02x f2=%02x motors=%02x/%02x rt=%02x lt=%02x "
                       "setup=%02x pled=%02x rgb=%02x%02x%02x%s",
-                      raw_f0, common[1], common[38], common[2], common[3],
+                      raw_f0, common[1], raw_f2, common[2], common[3],
                       common[10], common[21],
                       common[41], common[43], common[44], common[45], common[46],
                       rumble_flag_override ? " [haptics-override]" : "");
@@ -1348,6 +1369,7 @@ namespace platf::ds5_bridge {
     const bool audio_cancel_bits_ {false};
     const bool pace_refill_ {false};          // negative servo branch (DS5 only)
     const int64_t pace_refill_cap_us_ {0};
+    const bool haptics_handback_ {false};     // override form, see on_game_output
     std::atomic<bool> haptics_on_ {false};
 
     std::unique_ptr<ds5_haptic_builder> hap_;   // Phase 2 0x36 builder (gated by haptics_on_)
@@ -1570,6 +1592,7 @@ namespace platf::ds5_bridge {
                                                   audio_batched_.load(), audio_cushion_.load(),
                                                   audio_cancel_bits_.load(),
                                                   pace_refill_.load(), pace_refill_cap_ms_.load(),
+                                                  haptics_handback_.load(),
                                                   &lightbar_rgb_);
       sess->start();
       sessions_[dport] = std::move(sess);

@@ -70,6 +70,8 @@ namespace platf::ds5_bridge {
       pace_refill_.store(on);
       pace_refill_cap_ms_.store(cap_ms);
     }
+    /// Rumble-vs-haptics override hand-back form (next connect).
+    void set_haptics_handback(bool on) { haptics_handback_.store(on); }
 
     /// Synthetic lightbar color (0x00RRGGBB) or LIGHTBAR_OFF. Sessions read it
     /// live on every game output, so config changes apply immediately.
@@ -88,6 +90,7 @@ namespace platf::ds5_bridge {
     std::atomic<bool> audio_cancel_bits_ {false};
     std::atomic<bool> pace_refill_ {false};
     std::atomic<int> pace_refill_cap_ms_ {64};
+    std::atomic<bool> haptics_handback_ {false};
     std::atomic<uint32_t> lightbar_rgb_ {LIGHTBAR_OFF};
     int port_ {48054};
 

@@ -2017,6 +2017,7 @@ namespace config {
       bool_f(vars, "ds5_native_audio_cancel_bits", ds5b.native_audio_cancel_bits);
       bool_f(vars, "ds5_native_pace_refill", ds5b.native_pace_refill);
       int_between_f(vars, "ds5_native_pace_refill_cap_ms", ds5b.native_pace_refill_cap_ms, {0, 256});
+      bool_f(vars, "ds5_native_haptics_handback", ds5b.native_haptics_handback);
       string_f(vars, "ds5_lightbar_color", ds5b.lightbar_color);
       string_f(vars, "ds5_touchpad_mouse", ds5b.touchpad_mouse);
       if (ds5b.touchpad_mouse != "off" && ds5b.touchpad_mouse != "auto" && ds5b.touchpad_mouse != "always") {
