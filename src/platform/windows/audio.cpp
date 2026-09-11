@@ -18,6 +18,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // platform includes
@@ -655,7 +656,7 @@ namespace platf::audio {
       return capture_e::ok;
     }
 
-    int init(std::uint32_t sample_rate, std::uint32_t frame_size, std::uint32_t channels_out, bool continuous) {
+    int init(std::uint32_t sample_rate, std::uint32_t frame_size, std::uint32_t channels_out, bool continuous, device_t capture_device) {
       audio_event.reset(CreateEventA(nullptr, FALSE, FALSE, nullptr));
       if (!audio_event) {
         BOOST_LOG(error) << "Couldn't create Event handle"sv;
@@ -686,7 +687,8 @@ namespace platf::audio {
         return -1;
       }
 
-      auto device = default_device(device_enum);
+      select_capture_device(std::move(capture_device));
+
       if (!device) {
         return -1;
       }
@@ -769,6 +771,20 @@ namespace platf::audio {
       return 0;
     }
 
+    /**
+     * @brief Select the endpoint used by this capture stream.
+     *
+     * @param capture_device Explicit endpoint to capture, or an empty pointer to follow the default endpoint.
+     */
+    void select_capture_device(device_t capture_device) {
+      follows_default_device = !capture_device;
+      if (follows_default_device) {
+        device = default_device(device_enum);
+      } else {
+        device = std::move(capture_device);
+      }
+    }
+
     ~mic_wasapi_t() override {
       if (device_enum) {
         device_enum->UnregisterEndpointNotificationCallback(&endpt_notification);
@@ -805,8 +821,11 @@ namespace platf::audio {
           (*default_endpt_changed_cb)();
         }
 
-        // Reinitialize to pick up the new default device
-        return capture_e::reinit;
+        // Reinitialize to pick up the new default device, unless capture is
+        // pinned to an explicitly requested sink
+        if (follows_default_device) {
+          return capture_e::reinit;
+        }
       }
 
       status = WaitForSingleObjectEx(audio_event.get(), default_latency_ms, FALSE);
@@ -895,6 +914,7 @@ namespace platf::audio {
     float *sample_buf_pos;
     int channels;
     bool continuous_audio;
+    bool follows_default_device {true};  ///< Whether capture follows the default render device rather than an explicit sink.
 
     HANDLE mmcss_task_handle = nullptr;
   };
@@ -993,10 +1013,66 @@ namespace platf::audio {
       return std::nullopt;
     }
 
+    /**
+     * @brief Resolve a sink name to the audio endpoint device it refers to.
+     *
+     * @param sink Sink name, virtual sink descriptor, or device identifier.
+     * @return Endpoint device to capture from, or an empty pointer if the sink couldn't be resolved.
+     */
+    device_t get_sink_device(const std::string &sink) {
+      std::wstring device_id;
+      if (auto virtual_sink_info = extract_virtual_sink_info(sink)) {
+        device_id = virtual_sink_info->first;
+      } else if (auto matched = find_device_id(match_all_fields(utf_utils::from_utf8(sink)))) {
+        device_id = matched->second;
+      } else {
+        return nullptr;
+      }
+
+      device_t device;
+      if (FAILED(device_enum->GetDevice(device_id.c_str(), &device))) {
+        return nullptr;
+      }
+
+      if (DWORD device_state {}; FAILED(device->GetState(&device_state)) || device_state != DEVICE_STATE_ACTIVE) {
+        return nullptr;
+      }
+
+      return device;
+    }
+
     std::unique_ptr<mic_t> microphone(const std::uint8_t *mapping, int channels, std::uint32_t sample_rate, std::uint32_t frame_size, bool continuous_audio, [[maybe_unused]] bool host_audio_enabled) override {
       auto mic = std::make_unique<mic_wasapi_t>();
 
-      if (mic->init(sample_rate, frame_size, channels, continuous_audio)) {
+      // Prefer the sink that was assigned to this capture session since it accounts
+      // for the priority between virtual and configured sinks. set_sink() publishes
+      // assigned_sink under the pending-restore mutex, and a second capture can get
+      // here while the first one is still inside set_sink(), so copy it under the
+      // same lock.
+      std::string requested_sink;
+      {
+        std::scoped_lock lock(pending_restore_mutex_ref());
+        requested_sink = assigned_sink;
+      }
+      if (requested_sink.empty()) {
+        requested_sink = config::audio.sink;
+      }
+
+      // Capture the requested sink directly instead of relying on it being the default
+      // render device, so that capture keeps working when the default device differs
+      // from the sink or changes during the session.
+      device_t capture_device;
+      if (!requested_sink.empty()) {
+        capture_device = get_sink_device(requested_sink);
+        if (!capture_device) {
+          BOOST_LOG(error) << "Couldn't resolve audio sink ["sv << requested_sink << "] to a capture device"sv;
+          return nullptr;
+        }
+
+        BOOST_LOG(info) << "Capturing audio from sink ["sv << requested_sink << ']';
+      }
+
+      if (mic->init(sample_rate, frame_size, channels, continuous_audio, std::move(capture_device))) {
         return nullptr;
       }
 
