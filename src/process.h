@@ -179,6 +179,24 @@ namespace proc {
     std::unordered_map<std::string, std::string> config_overrides;
   };
 
+  /**
+   * @brief How proc_t::running() may reap an app that has exited.
+   *
+   * Reaping runs terminate(), which needs the stream lifecycle gate
+   * (nvhttp::stream_lifecycle_mutex()).
+   */
+  enum class running_cleanup_e {
+    wait_for_gate,  ///< Block on the gate. For callers that act on the result.
+    gate_held,  ///< The caller already holds the gate.
+    /**
+     * Never wait on the gate: while lifecycle work owns it, report the exited
+     * app as not running and leave the cleanup to the next running() caller.
+     * Only for status pollers that merely report the result; the app id and
+     * the rest of the session state stay stale until that cleanup runs.
+     */
+    skip_if_gate_busy,
+  };
+
   class proc_t {
   public:
     proc_t() = default;
@@ -203,9 +221,10 @@ namespace proc {
     int execute(const ctx_t &_app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session);
 
     /**
+     * @param cleanup How to reap an app that has exited; see running_cleanup_e.
      * @return `_app_id` if a process is running, otherwise returns `0`
      */
-    int running();
+    int running(running_cleanup_e cleanup = running_cleanup_e::wait_for_gate);
 
     /**
      * @return A side-effect-free snapshot of the current application ID.

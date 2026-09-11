@@ -3000,6 +3000,17 @@ namespace nvhttp {
 
       auto local_endpoint = request->local_endpoint();
 
+      // Sample the app state BEFORE taking the apply read gate below. Reaping
+      // an exited app runs terminate(), which ends in config::apply_config_now()
+      // and its exclusive lock on that same gate: taken while this thread holds
+      // it shared, the single discovery worker deadlocks with the lifecycle gate
+      // held, and the host is gone until restart. Never park on the lifecycle
+      // gate either (vibepollo#326).
+      [[maybe_unused]] int running_appid = 0;
+      if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+        running_appid = proc::proc.running(proc::running_cleanup_e::skip_if_gate_busy);
+      }
+
       // Status-pool handler: launch() runs config::apply_config_now() on the
       // blocking pool during every reconnect, wholesale-reassigning the config
       // globals read below (sunshine_name, server_cmds). Hold the shared apply
@@ -3112,7 +3123,7 @@ namespace nvhttp {
       tree.put("root.PairStatus", pair_status);
 
       if constexpr (std::is_same_v<SunshineHTTPS, T>) {
-        int current_appid = proc::proc.running();
+        int current_appid = running_appid;
         // When input only mode is enabled, the only resume method should be launching the same app again.
         if (config::input.enable_input_only_mode && current_appid != proc::input_only_app_id) {
           current_appid = 0;
@@ -3254,6 +3265,10 @@ namespace nvhttp {
     void applist(resp_https_t response, req_https_t request) {
       print_req<SunshineHTTPS>(request);
 
+      // Before the apply read gate, like serverinfo: a reap ends in
+      // config::apply_config_now(), which takes that gate exclusively.
+      const int running_appid = proc::proc.running(proc::running_cleanup_e::skip_if_gate_busy);
+
       // Status-pool handler: see serverinfo — config globals (input, sunshine.
       // legacy_ordering) are reassigned by launch's apply_config_now().
       auto _apply_gate = config::acquire_apply_read_gate();
@@ -3274,7 +3289,7 @@ namespace nvhttp {
 
       auto verified_client = get_verified_cert(request);
       if (has_client_perm(verified_client, PERM::_all_actions)) {
-        auto current_appid = proc::proc.running();
+        const auto current_appid = running_appid;
         // Only expose the special "Terminate" entry (and the "busy minimal list" behavior)
         // when input-only mode is enabled. Otherwise, Moonlight handles terminate/resume UI
         // without needing a fake app entry in the list.
@@ -4838,8 +4853,11 @@ namespace nvhttp {
     https_server.resource["^/launch$"]["GET"] = [&host_audio, run_blocking_nvhttp](auto resp, auto req) {
       run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req)]() mutable {
         std::lock_guard launch_lock {launch_request_mutex};
-        (void) proc::proc.running();
         std::lock_guard lifecycle_lock {stream_lifecycle_gate};
+        // Reap an app that has exited under the gate, so the id read below is
+        // current: an app that exits while this request waits for the gate would
+        // otherwise surface as 400 "already running" or a resume of a dead process.
+        (void) proc::proc.running(proc::running_cleanup_e::gate_held);
         const int current_appid = proc::proc.current_app_id();
         launch(host_audio, std::move(resp), std::move(req), current_appid);
       });
@@ -4847,8 +4865,9 @@ namespace nvhttp {
     https_server.resource["^/resume$"]["GET"] = [&host_audio, run_blocking_nvhttp](auto resp, auto req) {
       run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req)]() mutable {
         std::lock_guard launch_lock {launch_request_mutex};
-        (void) proc::proc.running();
         std::lock_guard lifecycle_lock {stream_lifecycle_gate};
+        // See /launch: reap under the gate so the id read below is current.
+        (void) proc::proc.running(proc::running_cleanup_e::gate_held);
         const int current_appid = proc::proc.current_app_id();
         resume(host_audio, std::move(resp), std::move(req), current_appid);
       });

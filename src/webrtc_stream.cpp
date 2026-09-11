@@ -3007,7 +3007,6 @@ namespace webrtc_stream {
       // observation until launch_session_raise() publishes the pending owner.
       // Take it before the WebRTC mutex to keep one lock order and prevent two
       // first sessions from applying different process-wide runtime layers.
-      (void) proc::proc.running();
       std::unique_lock<std::mutex> lifecycle_lock;
       for (;;) {
         lifecycle_lock =
@@ -3025,6 +3024,10 @@ namespace webrtc_stream {
           return !webrtc_capture.teardown_in_progress.load(std::memory_order_acquire);
         });
       }
+      // Reap an app that has exited under the gate, so the id read below is
+      // current (see nvhttp's /launch): an app that exits while we wait for the
+      // gate would otherwise be resumed or joined as if it were still running.
+      (void) proc::proc.running(proc::running_cleanup_e::gate_held);
       const int current_app_id = proc::proc.current_app_id();
       if (rtsp_stream::has_pending_launch_or_startup()) {
         return std::string {"RTSP session launch is pending"};

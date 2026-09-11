@@ -2262,7 +2262,7 @@ namespace proc {
     return 0;
   }
 
-  int proc_t::running() {
+  int proc_t::running(running_cleanup_e cleanup) {
 #ifndef _WIN32
     // On POSIX OSes, we must periodically wait for our children to avoid
     // them becoming zombies. This must be synchronized carefully with
@@ -2279,13 +2279,29 @@ namespace proc {
       // the session outlives the launch.
       return _app_id;
     }
-    if (_deferred_launch_failed.exchange(false)) {
-      BOOST_LOG(error) << "Deferred launch failed; terminating session.";
-      // The worker no longer runs teardown itself (launch_app_commands with
-      // terminate_on_failure=false), so run the cleanup it used to trigger
-      // here, from running()'s usual calling context.
-      terminate();
-      return 0;
+    if (_deferred_launch_failed.load(std::memory_order_acquire)) {
+      // A status poller must not park on the lifecycle gate here either (see
+      // the exit cleanup at the end). Take the gate before consuming the
+      // one-shot signal: if it is busy, the signal stays set for the next
+      // caller. Leaving it set is safe because terminate() and execute() clear
+      // it under the gate and the worker only raises it for its own session
+      // generation, so it can never carry over into a successor session.
+      std::unique_lock<std::mutex> stream_lifecycle_lock;
+      if (cleanup == running_cleanup_e::skip_if_gate_busy) {
+        stream_lifecycle_lock = std::unique_lock<std::mutex> {nvhttp::stream_lifecycle_mutex(), std::try_to_lock};
+        if (!stream_lifecycle_lock.owns_lock()) {
+          BOOST_LOG(debug) << "[running] Deferred launch failed but stream lifecycle work owns the gate; leaving cleanup to the next caller.";
+          return 0;
+        }
+      }
+      if (_deferred_launch_failed.exchange(false)) {
+        BOOST_LOG(error) << "Deferred launch failed; terminating session.";
+        // The worker no longer runs teardown itself (launch_app_commands with
+        // terminate_on_failure=false), so run the cleanup it used to trigger
+        // here, from running()'s usual calling context.
+        terminate(false, true, false, cleanup != running_cleanup_e::wait_for_gate);
+        return 0;
+      }
     }
     if (_deferred_launch) {
       if (platf::is_running_as_system()) {
@@ -2476,7 +2492,26 @@ namespace proc {
 
     // Perform cleanup actions now if needed
     if (_process) {
-      terminate();
+      // Port of upstream 251a1d65 (vibepollo#326), limited to status pollers:
+      // the single discovery worker (serverinfo/applist) used to notice the app
+      // exit here and park on the lifecycle gate behind an in-flight teardown,
+      // taking the host off 47984/47989 for the whole teardown tail. Upstream
+      // applies the non-blocking gate to every caller; here the other callers
+      // keep waiting, because they act on the result: /launch and /resume would
+      // read a stale app id (400 "already running", or a resume of a dead
+      // process), the stream control loop would end the session without the
+      // cleanup and its teardown would then pause the dead app, and /cancel
+      // would leave it unreaped. Those callers wait for the gate anyway.
+      std::unique_lock<std::mutex> stream_lifecycle_lock;
+      if (cleanup == running_cleanup_e::skip_if_gate_busy) {
+        stream_lifecycle_lock = std::unique_lock<std::mutex> {nvhttp::stream_lifecycle_mutex(), std::try_to_lock};
+        if (!stream_lifecycle_lock.owns_lock()) {
+          BOOST_LOG(debug) << "[running] App exited but stream lifecycle work owns the gate; leaving cleanup to the next caller.";
+          return 0;
+        }
+      }
+      BOOST_LOG(info) << "[running] _process.running() is false; calling terminate(). App exited with code ["sv << _process.native_exit_code() << "] for app '" << _app.name << "' (id=" << _app_id << ")";
+      terminate(false, true, false, cleanup != running_cleanup_e::wait_for_gate);
     }
 
     return 0;
@@ -4174,7 +4209,17 @@ namespace proc {
     // Replacing it would drop tracking state and cause the active stream loop
     // to think no app is running, prematurely terminating the session.
     // Instead, update only the applications list to reflect the latest config.
-    if (proc.running() > 0) {
+    //
+    // Decide on the app id, not on running(): running() reports 0 for an app
+    // that has exited but not been cleaned up yet (a status poller skipped the
+    // cleanup, or another thread is inside terminate() and has already reset
+    // _process), and move-assigning proc while terminate() still walks it is
+    // undefined behaviour. The Web UI app editor and the Playnite sync call in
+    // here without the lifecycle gate. An exited app that keeps its id only
+    // gets its app list updated here; the reap's terminate() then refreshes the
+    // full state. terminate() clears the id before its own refresh() call, so
+    // that nested refresh still replaces the instance.
+    if (proc.current_app_id() > 0) {
       // Move the parsed apps list and environment into the existing proc instance
       // Use proc.update_apps(...) which safely replaces the app list and env
       proc.update_apps(proc_opt->release_apps(), proc_opt->release_env());

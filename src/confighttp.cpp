@@ -3239,7 +3239,8 @@ namespace confighttp {
 
     nlohmann::json output_tree;
     const int active = rtsp_stream::session_count() + static_cast<int>(webrtc_stream::active_session_count());
-    const bool app_running = proc::proc.running() > 0;
+    // Status poll: never park on the lifecycle gate behind an in-flight teardown.
+    const bool app_running = proc::proc.running(proc::running_cleanup_e::skip_if_gate_busy) > 0;
     output_tree["activeSessions"] = active;
     output_tree["appRunning"] = app_running;
     output_tree["appName"] = app_running ? proc::proc.get_last_run_app_name() : "";
