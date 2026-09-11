@@ -330,9 +330,13 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
             // console-session relaunch may hang on it. An unreaped child makes
             // the final SERVICE_STOPPED carry an error instead of success.
             const auto wait_result = WaitForSingleObject(process_info.hProcess, FORCED_EXIT_WAIT_MS);
-            if (wait_result != WAIT_OBJECT_0) {
+            const DWORD wait_error = wait_result == WAIT_FAILED ? GetLastError() : NO_ERROR;
+            // Only the stop that ends the service reports it: a child left
+            // behind by a console-session relaunch must not turn every later,
+            // clean stop into an error (event 7023) days after it is gone.
+            if (wait_result != WAIT_OBJECT_0 && WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) {
               if (wait_result == WAIT_FAILED) {
-                unreaped_child_error = GetLastError();
+                unreaped_child_error = wait_error;
               } else {
                 unreaped_child_error = termination_error != NO_ERROR ? termination_error : WAIT_TIMEOUT;
               }

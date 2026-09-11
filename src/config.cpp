@@ -2958,9 +2958,23 @@ namespace config {
     }
   }  // namespace
 
-  // Acquire a shared lock while preparing/starting sessions.
-  std::shared_lock<std::shared_mutex> acquire_apply_read_gate() {
-    return std::shared_lock<std::shared_mutex>(g_apply_gate);
+  namespace {
+    thread_local int t_apply_read_gate_depth = 0;
+  }  // namespace
+
+  apply_read_gate_t::apply_read_gate_t(std::shared_mutex &gate):
+      lock_(gate) {
+    ++t_apply_read_gate_depth;
+  }
+
+  apply_read_gate_t::~apply_read_gate_t() {
+    --t_apply_read_gate_depth;
+  }
+
+  // Acquire a shared lock while preparing/starting sessions. Returned as a
+  // prvalue (guaranteed elision), so the per-thread count never moves threads.
+  apply_read_gate_t acquire_apply_read_gate() {
+    return apply_read_gate_t(g_apply_gate);
   }
 
   void record_active_adapter_config() {
@@ -3107,6 +3121,15 @@ namespace config {
   }
 
   void apply_config_now() {
+    if (t_apply_read_gate_depth > 0) {
+      // This thread holds the read gate (e.g. /launch terminating an app whose
+      // prep command failed): taking the write gate here would wait on
+      // ourselves forever, with the launch and lifecycle gates held. Defer;
+      // maybe_apply_deferred() runs it once no session holds the gate.
+      BOOST_LOG(warning) << "Hot apply requested while this thread holds the session apply gate; deferring it"sv;
+      mark_deferred_reload();
+      return;
+    }
     // Ensure only one apply runs at a time and block session start/resume while applying.
     std::unique_lock<std::shared_mutex> write_gate(g_apply_gate);
     std::unique_lock<std::mutex> apply_once(g_apply_mutex);

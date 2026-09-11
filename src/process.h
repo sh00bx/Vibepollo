@@ -281,6 +281,7 @@ namespace proc {
     bp::environment release_env();
 
   private:
+    void schedule_exit_cleanup_recheck();
     /**
      * @brief Run the launched app's prep commands and start it.
      * @param stream_lifecycle_lock_held Whether the caller already holds the stream

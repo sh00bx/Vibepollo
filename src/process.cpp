@@ -2262,6 +2262,27 @@ namespace proc {
     return 0;
   }
 
+  namespace {
+    std::atomic_bool g_exit_cleanup_recheck_pending {false};
+  }  // namespace
+
+  // A status poller found the app gone but could not take the busy lifecycle
+  // gate. Without a stream nothing else may poll again soon (TV app closed), so
+  // the VDD, display revert, undo commands and the retained audio sink would
+  // wait for the next client. One detached waiter takes the gate FIRST and only
+  // then re-checks under it: checking before waiting would terminate whatever a
+  // /launch holding the gate started in the meantime.
+  void proc_t::schedule_exit_cleanup_recheck() {
+    if (g_exit_cleanup_recheck_pending.exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+    std::thread([this]() {
+      std::unique_lock<std::mutex> gate {nvhttp::stream_lifecycle_mutex()};
+      g_exit_cleanup_recheck_pending.store(false, std::memory_order_release);
+      (void) running(running_cleanup_e::gate_held);
+    }).detach();
+  }
+
   int proc_t::running(running_cleanup_e cleanup) {
 #ifndef _WIN32
     // On POSIX OSes, we must periodically wait for our children to avoid
@@ -2506,7 +2527,8 @@ namespace proc {
       if (cleanup == running_cleanup_e::skip_if_gate_busy) {
         stream_lifecycle_lock = std::unique_lock<std::mutex> {nvhttp::stream_lifecycle_mutex(), std::try_to_lock};
         if (!stream_lifecycle_lock.owns_lock()) {
-          BOOST_LOG(debug) << "[running] App exited but stream lifecycle work owns the gate; leaving cleanup to the next caller.";
+          BOOST_LOG(debug) << "[running] App exited but stream lifecycle work owns the gate; cleaning up once it is released.";
+          schedule_exit_cleanup_recheck();
           return 0;
         }
       }
@@ -2954,10 +2976,14 @@ namespace proc {
 
     _active_client_uuid.clear();
     _app_launch_time = {};
-    _app_id = -1;
     _app_name.clear();
     {
+      // _app_id with _app under _apps_mutex: refresh() now routes through
+      // update_apps() while this tail runs (it keys on current_app_id()), and
+      // update_apps() re-derives _app_id from _app under the same mutex -- a
+      // reset outside it could be undone and leave "running" with no app.
       std::scoped_lock lk(_apps_mutex);
+      _app_id = -1;
       _app = {};
     }
     display_name.clear();

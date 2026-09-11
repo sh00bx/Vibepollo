@@ -590,7 +590,22 @@ namespace config {
   void maybe_apply_deferred();
 
   // Gate helpers so session start/resume can hold a shared lock while apply holds a unique lock.
-  std::shared_lock<std::shared_mutex> acquire_apply_read_gate();
+  // The holder is also counted per thread: apply_config_now() on a thread that
+  // already holds the read gate would wait on itself forever (a launch whose app
+  // fails to start terminates it, and terminate applies the global config), so
+  // such an apply is turned into a deferred reload instead.
+  class apply_read_gate_t {
+  public:
+    explicit apply_read_gate_t(std::shared_mutex &gate);
+    ~apply_read_gate_t();
+    apply_read_gate_t(const apply_read_gate_t &) = delete;
+    apply_read_gate_t &operator=(const apply_read_gate_t &) = delete;
+
+  private:
+    std::shared_lock<std::shared_mutex> lock_;
+  };
+
+  apply_read_gate_t acquire_apply_read_gate();
   void record_active_adapter_config();
 
   // Runtime, non-persisted config overrides (e.g. per-application overrides).

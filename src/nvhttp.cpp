@@ -3129,7 +3129,9 @@ namespace nvhttp {
           current_appid = 0;
         }
         tree.put("root.currentgame", current_appid);
-        tree.put("root.currentgameuuid", proc::proc.get_running_app_uuid());
+        // A skipped cleanup (running() could not take the busy lifecycle gate)
+        // reports 0 while the old app's uuid is still set: keep the pair consistent.
+        tree.put("root.currentgameuuid", running_appid > 0 ? proc::proc.get_running_app_uuid() : std::string {});
         tree.put("root.state", current_appid > 0 ? "SUNSHINE_SERVER_BUSY" : "SUNSHINE_SERVER_FREE");
       } else {
         tree.put("root.currentgame", 0);
