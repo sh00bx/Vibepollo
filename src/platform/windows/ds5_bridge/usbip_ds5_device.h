@@ -51,6 +51,12 @@ namespace platf::ds5_bridge {
     int usb_output_payload_len;       // 47 / 31
     int iso_bytes_per_frame;          // 8 (4ch s16) / 4 (2ch s16)
     int iso_sample_rate;              // 48000 / 32000
+    // iso-IN (microphone, EP 0x82) bytes per 1 ms packet at the endpoint's
+    // nominal rate: DS5 192 (2ch s16 @48 kHz, wMaxPacketSize 196), DS4 32
+    // (1ch s16 @16 kHz, wMaxPacketSize 34). Used only when a slot supplies
+    // on_iso_in; without a source the endpoint keeps completing zero-filled
+    // packets of the requested length.
+    int iso_in_bytes_per_ms;
     // Static fallback for EP0 GET_REPORT(feature) when the slot has no live
     // provider hit; returns bytes written into out (up to 64), 0 for none.
     int (*feature_fallback)(uint8_t report_id, uint8_t *out);
@@ -92,6 +98,14 @@ namespace platf::ds5_bridge {
     // the iso URB is simply completed and the PCM discarded. Must not block long.
     using iso_out_cb = std::function<void(const uint8_t *pcm, size_t len)>;
     iso_out_cb on_iso_out;
+
+    // Optional (W3-02 -- microphone uplink): called on the iso pacer thread to
+    // fill @p pcm with @p len bytes for the DS5's capture endpoint (EP 0x82,
+    // 2ch/16-bit/48 kHz interleaved), one URB at a time, right before its
+    // paced completion. Must fill the whole buffer (silence when it has
+    // nothing) and must not block. Unset: the URB completes zero-filled.
+    using iso_in_cb = std::function<void(uint8_t *pcm, size_t len)>;
+    iso_in_cb on_iso_in;
 
     std::mutex input_mtx;
     uint8_t input_report[INPUT_REPORT_LEN] {};

@@ -465,6 +465,14 @@ namespace config {
     // is verified on our pad; OFF until the Ratchet/Forza hand-and-ear A/B.
     // Read at session creation.
     bool native_haptics_handback {false};
+    // Microphone uplink (port plan W3-02): decode the TV's DS5 mic Opus frames
+    // (CTMB_MSG_DS5_MIC) into the virtual pad's capture endpoint, so Windows'
+    // "Headset Microphone (Wireless Controller)" carries the pad's mic. OFF by
+    // default: without it the host neither advertises the capability nor
+    // decodes a frame, and the endpoint stays silent as before. Arming the
+    // pad's mic is NOT done by the host (see ds5_mic.h); this only consumes
+    // what the TV forwards. Read at session creation (next controller connect).
+    bool native_mic {false};
 
     // Synthetic lightbar color, hex "RRGGBB" (empty/"off" disables). PC games
     // via libScePad set the lightbar to black at pad init and never write a

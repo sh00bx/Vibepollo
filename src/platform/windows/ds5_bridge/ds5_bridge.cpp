@@ -52,7 +52,7 @@ namespace ds5_bridge_provider {
       using namespace std::chrono_literals;
       bool started = false;
       while (!st.stop_requested()) {
-        bool enable, haptics, audio_batched, audio_cancel_bits, haptics_handback;
+        bool enable, haptics, audio_batched, audio_cancel_bits, haptics_handback, mic;
         int audio_cushion;
         int port;
         std::string lightbar;
@@ -65,6 +65,7 @@ namespace ds5_bridge_provider {
           audio_cushion = config::ds5b.native_audio_cushion_frames;
           audio_cancel_bits = config::ds5b.native_audio_cancel_bits;
           haptics_handback = config::ds5b.native_haptics_handback;
+          mic = config::ds5b.native_mic;
           lightbar = config::ds5b.lightbar_color;
         }
 
@@ -78,6 +79,7 @@ namespace ds5_bridge_provider {
         host().set_audio_cushion(audio_cushion);
         host().set_audio_cancel_bits(audio_cancel_bits);
         host().set_haptics_handback(haptics_handback);
+        host().set_mic(mic);
         host().set_lightbar(parse_lightbar(lightbar));
         if (want && !started) {
           started = host().start(port);

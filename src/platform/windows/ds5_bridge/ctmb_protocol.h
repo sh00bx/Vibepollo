@@ -45,10 +45,16 @@ namespace platf::ds5_bridge {
     // TV -> host: user preference for the DS5 touchpad-mouse synthesis
     // (ds5_touchpad_mouse). Sent once after the HOST_CONFIG handshake.
     CTMB_MSG_TPMOUSE = 12,
+    // TV -> host: one DS5 microphone Opus packet (ctmb_ds5_mic_t + bytes).
+    // Sent ONLY when HOST_CONFIG advertised CTMB_HOSTCFG_DS5_MIC, i.e. when
+    // ds5_native_mic is enabled on this host (port plan W3-02).
+    CTMB_MSG_DS5_MIC = 13,
   };
 
   // ctmb_host_config_t.reserved[0] capability bits (0 on a CTM host).
   constexpr uint8_t CTMB_HOSTCFG_PACE_FEEDBACK = 0x01;
+  // Host decodes CTMB_MSG_DS5_MIC into the virtual pad's capture endpoint.
+  constexpr uint8_t CTMB_HOSTCFG_DS5_MIC = 0x02;
 
   // ctmb_device_caps_t.flags capability bits (0x0001 is the client's existing
   // baseline flag): client accepts batched 0x39 DS5 audio output reports.
@@ -125,6 +131,21 @@ namespace platf::ds5_bridge {
     uint8_t reserved[16];
   };
   static_assert(sizeof(ctmb_pace_feedback_t) == 32, "pace feedback layout drift");
+
+  // CTMB_MSG_DS5_MIC payload header, followed by frame_len bytes of Opus.
+  // seq: per-session counter the TV app keeps for the mic stream (starts at 0,
+  // wraps at 16 bits) -- NOT the pad's 4-bit report sequence, which is shared
+  // with the pad-state reports and useless as a mic sequence. format: 1 = the
+  // DualSense BT mic packet as captured (Opus, 48 kHz, stereo, 10 ms = 480
+  // samples, TOC 0xd4, 71 bytes); other values are dropped by the host.
+  constexpr uint8_t CTMB_DS5_MIC_FORMAT_OPUS_48K_10MS = 1;
+  struct ctmb_ds5_mic_t {
+    uint16_t seq;
+    uint8_t format;
+    uint8_t frame_len;
+    uint32_t reserved;
+  };
+  static_assert(sizeof(ctmb_ds5_mic_t) == 8, "ds5 mic layout drift");
 #pragma pack(pop)
 
 }  // namespace platf::ds5_bridge

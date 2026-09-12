@@ -32,6 +32,7 @@
 #include "src/platform/windows/ds5_bridge/ds4_audio.h"
 #include "src/platform/windows/ds5_bridge/ds4_reports.h"
 #include "src/platform/windows/ds5_bridge/ds5_haptics.h"
+#include "src/platform/windows/ds5_bridge/ds5_mic.h"
 #include "src/platform/windows/ds5_bridge/ds5_reports.h"
 #include "src/platform/windows/ds5_bridge/vhci_attach.h"
 
@@ -70,11 +71,11 @@ namespace platf::ds5_bridge {
 
     bridge_session(usbip_ds5_device *usbip, std::string ctmb_busid, int dport, pad_kind_e kind,
                    bool haptics, bool audio_batched, int audio_cushion, bool audio_cancel_bits,
-                   bool haptics_handback,
+                   bool haptics_handback, bool mic,
                    const std::atomic<uint32_t> *lightbar_rgb):
         usbip_(usbip), ctmb_busid_(std::move(ctmb_busid)), dport_(dport), kind_(kind),
         audio_batched_(audio_batched), audio_cushion_(audio_cushion), audio_cancel_bits_(audio_cancel_bits),
-        haptics_handback_(haptics_handback),
+        haptics_handback_(haptics_handback), mic_want_(mic),
         lightbar_rgb_(lightbar_rgb) { haptics_want_.store(haptics); }
 
     pad_kind_e kind() const { return kind_; }
@@ -254,6 +255,9 @@ namespace platf::ds5_bridge {
         case CTMB_MSG_PACE_FEEDBACK:
           on_pace_feedback(h, payload);
           break;
+        case CTMB_MSG_DS5_MIC:
+          on_mic(h, payload);
+          break;
         case CTMB_MSG_TPMOUSE:
           if (h->payload_len >= sizeof(ctmb_tpmouse_t)) {
             ctmb_tpmouse_t tp;
@@ -358,6 +362,27 @@ namespace platf::ds5_bridge {
         slot_->on_iso_out = [this](const uint8_t *pcm, size_t len) {
           if (hap_ && haptics_on_.load(std::memory_order_relaxed)) hap_->feed_pcm(pcm, len);
         };
+        // W3-02 microphone uplink: the TV's CTMB_MSG_DS5_MIC Opus packets feed
+        // a per-session decoder + ring, and the usbip iso pacer pulls the PCM
+        // for every EP 0x82 IN URB. Created here, before the vhci attach, so
+        // the pacer thread (which only exists once the vhci imports the
+        // device) never races the assignment; destroyed with the session,
+        // after remove_slot has joined the pacer. Config OFF (the default) or
+        // a decoder failure leaves on_iso_in unset: the endpoint keeps
+        // completing silence exactly as before, and the HOST_CONFIG capability
+        // bit below is not advertised, so the TV does not even send.
+        if (mic_want_) {
+          mic_ = std::make_unique<ds5_mic_uplink>();
+          if (mic_->ok()) {
+            slot_->on_iso_in = [this](uint8_t *pcm, size_t len) {
+              if (mic_) mic_->pull(pcm, len);
+            };
+            BOOST_LOG(info) << "ds5-mic: uplink enabled for this session (Opus 48 kHz stereo 10 ms -> EP 0x82, "sv
+                            << DS5_MIC_BYTES_PER_MS << " B/ms, prebuffer 40 ms, ring 200 ms)"sv;
+          } else {
+            mic_.reset();
+          }
+        }
         pacer_stop_.store(false);
         pacer_thread_ = std::thread(&bridge_session::pacer_run, this);
         // Attach off the session thread: `usbip attach` spawns a CLI + two port
@@ -417,6 +442,10 @@ namespace platf::ds5_bridge {
       // the daemon's inject-queue telemetry as CTMB_MSG_PACE_FEEDBACK. Old
       // clients ignore reserved bytes and simply never send it.
       cfg.reserved[0] = CTMB_HOSTCFG_PACE_FEEDBACK;
+      // Microphone uplink: only a session with a live decoder asks the TV for
+      // CTMB_MSG_DS5_MIC; everything else (config off, DS4, decoder failure)
+      // leaves the bit clear and the TV forwards nothing over WiFi.
+      if (mic_) cfg.reserved[0] |= CTMB_HOSTCFG_DS5_MIC;
       cfg.input_report_len = caps.input_report_len;
       cfg.output_report_len = kind_ == pad_kind_e::ds4 ? DS4_BT_OUTPUT_LEN : BT_OUTPUT_LEN;
       cfg.feature_report_len = caps.feature_report_len;
@@ -570,6 +599,38 @@ namespace platf::ds5_bridge {
         dbg_fb_drops_ = 0;
         dbg_fb_fifo_max_ = 0;
       }
+    }
+
+    // Session/run thread: one DS5 microphone Opus packet from the TV. Only
+    // reachable with a decoder (the TV sends only when HOST_CONFIG advertised
+    // CTMB_HOSTCFG_DS5_MIC, which mic_ gates); anything else is dropped.
+    void on_mic(const ctmb_header_t *h, const uint8_t *payload) {
+      if (!mic_) return;
+      if (h->payload_len < sizeof(ctmb_ds5_mic_t)) return;
+      ctmb_ds5_mic_t m;
+      std::memcpy(&m, payload, sizeof(m));
+      if (m.format != CTMB_DS5_MIC_FORMAT_OPUS_48K_10MS) return;
+      if (m.frame_len == 0 || (uint32_t) sizeof(m) + m.frame_len > h->payload_len) return;
+      mic_->feed(m.seq, payload + sizeof(m), m.frame_len);
+    }
+
+    // Session thread: microphone counters every 30 s, only while the uplink
+    // carried or concealed anything in the window (an idle mic logs nothing).
+    // Never per frame.
+    void maybe_log_mic() {
+      if (!mic_) return;
+      const int64_t now = now_ms();
+      if (mic_log_ms_ == 0) { mic_log_ms_ = now; return; }
+      if (now - mic_log_ms_ < 30000) return;
+      mic_log_ms_ = now;
+      const auto s = mic_->take_stats();
+      if (s.frames == 0 && s.plc == 0 && s.bad == 0 && s.drop_bytes == 0) return;
+      BOOST_LOG(info) << "ds5-mic: 30s frames="sv << s.frames << " plc="sv << s.plc << " bad="sv << s.bad
+                      << " drop_ms="sv << (s.drop_bytes / DS5_MIC_BYTES_PER_MS)
+                      << " out_ms="sv << (s.pulled_bytes / DS5_MIC_BYTES_PER_MS)
+                      << " silence_ms="sv << (s.silence_bytes / DS5_MIC_BYTES_PER_MS)
+                      << " starts="sv << s.starts
+                      << " fill_ms="sv << (s.fill_bytes / DS5_MIC_BYTES_PER_MS);
     }
 
     // usbip server thread (DS4 slot): the game wrote a 31-byte USB 0x05 output
@@ -1123,6 +1184,9 @@ namespace platf::ds5_bridge {
         // no game owns the bar.
         maybe_repaint_lightbar();
 
+        // 3c) Microphone uplink telemetry (30 s, idle-silent).
+        maybe_log_mic();
+
         // 4) A dropped link recycles the transport (the client reconnects to the
         // same port and re-HELLOs) — the virtual device + vhci stay attached.
         if (link_down_) reset_transport();
@@ -1156,6 +1220,10 @@ namespace platf::ds5_bridge {
       // flows again. The learned adj is kept; it decays on clean samples.
       fb_seen_ = false;
       fb_last_ms_.store(0, std::memory_order_relaxed);
+      // The TV is gone, so whatever microphone audio it sent belongs to a
+      // stream that no longer exists: clear it, or the reconnected session
+      // would open on the old one's tail (rhoquinn's ~109 MB "dropped" burst).
+      if (mic_) mic_->reset();
       // The touchpad-mouse only advances on reports; with the link gone a
       // held synthesized button would stay down forever. Scoped to this pad:
       // a second pad's live gesture must survive. The client preference falls
@@ -1300,9 +1368,15 @@ namespace platf::ds5_bridge {
     const int audio_cushion_ {4};
     const bool audio_cancel_bits_ {false};
     const bool haptics_handback_ {false};     // override form, see on_game_output
+    const bool mic_want_ {false};             // ds5_native_mic at session creation
     std::atomic<bool> haptics_on_ {false};
 
     std::unique_ptr<ds5_haptic_builder> hap_;   // Phase 2 0x36 builder (gated by haptics_on_)
+    // W3-02 microphone uplink (DS5 only, created on the first HELLO when
+    // mic_want_). Fed on the session thread, pulled on the usbip pacer thread,
+    // reset on link drop; its lifetime is the session's (see on_hello).
+    std::unique_ptr<ds5_mic_uplink> mic_;
+    int64_t mic_log_ms_ {0};                  // session thread only
     std::thread pacer_thread_;
     std::atomic<bool> pacer_stop_ {false};
 
@@ -1515,6 +1589,7 @@ namespace platf::ds5_bridge {
                                                   audio_batched_.load(), audio_cushion_.load(),
                                                   audio_cancel_bits_.load(),
                                                   haptics_handback_.load(),
+                                                  mic_.load(),
                                                   &lightbar_rgb_);
       sess->start();
       sessions_[dport] = std::move(sess);

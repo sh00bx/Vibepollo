@@ -237,13 +237,13 @@ namespace platf::ds5_bridge {
       "DualSense", 0x054C, 0x0CE6,
       DEVICE_DESC, CONFIG_DESC, (int) sizeof(CONFIG_DESC), 204,
       HID_REPORT_DESC, (int) sizeof(HID_REPORT_DESC),
-      0x02, OUTPUT_PAYLOAD_LEN, 8, 48000, ds5_feature_fallback,
+      0x02, OUTPUT_PAYLOAD_LEN, 8, 48000, 192, ds5_feature_fallback,
     };
     const usb_model_t DS4_MODEL = {
       "DualShock 4", 0x054C, 0x09CC,
       DS4_DEVICE_DESC, DS4_CONFIG_DESC, (int) sizeof(DS4_CONFIG_DESC), 202,
       DS4_HID_REPORT_DESC, (int) sizeof(DS4_HID_REPORT_DESC),
-      0x05, 31, 4, 32000, ds4_feature_fallback,
+      0x05, 31, 4, 32000, 32, ds4_feature_fallback,
     };
 
     // ---- big-endian write helpers -----------------------------------------
@@ -357,9 +357,16 @@ namespace platf::ds5_bridge {
       }
 
       // ISO transfer reply — actual_length + npkts + echoed packet descriptors.
+      // pkt_actual (optional, IN only): per-packet actual lengths. The usbip
+      // wire carries ISO-IN data PACKED in packet order (each packet's
+      // actual_length bytes, no gaps; the vhci scatters them to the packet
+      // offsets), so in_data/in_len must be that packed stream and
+      // actual_length its total. Without it every packet reports its full
+      // requested length, which is what the zero-fill path relies on.
       void iso_ret_submit(uint32_t seqnum, uint32_t devid, uint32_t direction, uint32_t ep,
                           int actual_length, const uint8_t *in_data, int in_len,
-                          const std::vector<uint8_t> &iso_desc_in, int npkts) {
+                          const std::vector<uint8_t> &iso_desc_in, int npkts,
+                          const std::vector<uint32_t> *pkt_actual = nullptr) {
         std::vector<uint8_t> v;
         put32(v, RET_SUBMIT); put32(v, seqnum); put32(v, devid);
         put32(v, direction);  put32(v, ep);
@@ -374,7 +381,8 @@ namespace platf::ds5_bridge {
         for (int i = 0; i < npkts; i++) {
           const uint8_t *d = iso_desc_in.data() + (size_t) i * 16;
           uint32_t off = rd32(d), len = rd32(d + 4);
-          put32(v, off); put32(v, len); put32(v, len); put32(v, 0);  // actual=len, status=0
+          const uint32_t actual = (pkt_actual && (size_t) i < pkt_actual->size()) ? (*pkt_actual)[(size_t) i] : len;
+          put32(v, off); put32(v, len); put32(v, actual); put32(v, 0);  // status=0
         }
         send_all(v.data(), (int) v.size());
       }
@@ -509,8 +517,9 @@ namespace platf::ds5_bridge {
             iso_q_.pop_front();
           }
           // Virtual audio clock: this URB completes `duration` after the previous
-          // one in the same direction. OUT is clocked by its PCM content; IN (mic
-          // — no PCM source, zero-filled) by its packet count (1 ms per packet).
+          // one in the same direction. OUT is clocked by its PCM content; IN (mic)
+          // by its packet count (1 ms per packet), whether the packets carry the
+          // session's uplink PCM or silence.
           const bool dir_in = (job.dir == DIR_IN);
           std::chrono::nanoseconds duration;
           if (dir_in) {
@@ -575,9 +584,36 @@ namespace platf::ds5_bridge {
           }
           if (stop.load()) return;
           if (dir_in) {
-            std::vector<uint8_t> in_buf((size_t) job.xfer_len, 0);
-            iso_ret_submit(job.seqnum, job.devid, DIR_IN, job.ep, job.xfer_len,
-                           in_buf.data(), (int) in_buf.size(), job.iso_desc, job.npkts);
+            // Microphone. With a PCM source on the slot (W3-02: the session's
+            // Opus uplink decoder), each 1 ms packet carries the endpoint's
+            // NOMINAL bytes (192 = 48 frames x 2ch x s16 for the DS5), not its
+            // wMaxPacketSize (196): the 4 spare bytes are the async endpoint's
+            // rate-adjust headroom, and filling them would clock the stream 2%
+            // fast and drain the ring into a 10 ms hole every half second. The
+            // per-packet actual length says so to the vhci, the data goes out
+            // packed (see iso_ret_submit), and the source fills the whole
+            // buffer -- silence when it has nothing -- so the capture clock
+            // never sees a short packet. Without a source: zero-filled full
+            // packets, exactly as before.
+            const int in_bpm = slot ? slot->model->iso_in_bytes_per_ms : 0;
+            if (slot && slot->on_iso_in && in_bpm > 0 && job.npkts > 0 &&
+                (int) job.iso_desc.size() >= job.npkts * 16) {
+              std::vector<uint32_t> actual((size_t) job.npkts);
+              size_t total = 0;
+              for (int i = 0; i < job.npkts; ++i) {
+                const uint32_t len = rd32(job.iso_desc.data() + (size_t) i * 16 + 4);
+                actual[(size_t) i] = std::min<uint32_t>((uint32_t) in_bpm, len);
+                total += actual[(size_t) i];
+              }
+              std::vector<uint8_t> in_buf(total, 0);
+              if (total) slot->on_iso_in(in_buf.data(), in_buf.size());
+              iso_ret_submit(job.seqnum, job.devid, DIR_IN, job.ep, (int) total,
+                             in_buf.data(), (int) in_buf.size(), job.iso_desc, job.npkts, &actual);
+            } else {
+              std::vector<uint8_t> in_buf((size_t) job.xfer_len, 0);
+              iso_ret_submit(job.seqnum, job.devid, DIR_IN, job.ep, job.xfer_len,
+                             in_buf.data(), (int) in_buf.size(), job.iso_desc, job.npkts);
+            }
           } else {
             iso_ret_submit(job.seqnum, job.devid, DIR_OUT, job.ep,
                            job.xfer_len, nullptr, 0, job.iso_desc, job.npkts);

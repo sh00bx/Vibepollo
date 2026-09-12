@@ -67,6 +67,11 @@ namespace platf::ds5_bridge {
     void set_audio_cancel_bits(bool on) { audio_cancel_bits_.store(on); }
     /// Rumble-vs-haptics override hand-back form (next connect).
     void set_haptics_handback(bool on) { haptics_handback_.store(on); }
+    /// Microphone uplink (W3-02): decode the TV's CTMB_MSG_DS5_MIC Opus frames
+    /// into the virtual pad's capture endpoint. Read when a session is created
+    /// (next controller connect); the HOST_CONFIG capability bit that makes the
+    /// TV send at all is advertised only while this is on.
+    void set_mic(bool on) { mic_.store(on); }
 
     /// Synthetic lightbar color (0x00RRGGBB) or LIGHTBAR_OFF. Sessions read it
     /// live on every game output, so config changes apply immediately.
@@ -84,6 +89,7 @@ namespace platf::ds5_bridge {
     std::atomic<int> audio_cushion_ {4};
     std::atomic<bool> audio_cancel_bits_ {false};
     std::atomic<bool> haptics_handback_ {false};
+    std::atomic<bool> mic_ {false};
     std::atomic<uint32_t> lightbar_rgb_ {LIGHTBAR_OFF};
     int port_ {48054};
 

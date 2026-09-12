@@ -2101,6 +2101,7 @@ namespace config {
       int_f(vars, "ds5_native_audio_cushion_frames", ds5b.native_audio_cushion_frames);
       bool_f(vars, "ds5_native_audio_cancel_bits", ds5b.native_audio_cancel_bits);
       bool_f(vars, "ds5_native_haptics_handback", ds5b.native_haptics_handback);
+      bool_f(vars, "ds5_native_mic", ds5b.native_mic);
       string_f(vars, "ds5_lightbar_color", ds5b.lightbar_color);
       string_f(vars, "ds5_touchpad_mouse", ds5b.touchpad_mouse);
       if (ds5b.touchpad_mouse != "off" && ds5b.touchpad_mouse != "auto" && ds5b.touchpad_mouse != "always") {
