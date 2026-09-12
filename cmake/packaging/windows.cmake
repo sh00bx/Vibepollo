@@ -24,7 +24,10 @@ endif()
 # time so RTX HDR cannot be shipped in a silently disabled state. Force the
 # cache value on so older local build trees do not keep the previous optional
 # default. Only the TrueHDR feature DLL is bundled; VSR is not used.
-set(SUNSHINE_REQUIRE_TRUEHDR_RUNTIME ON CACHE BOOL "Fail Windows packaging when the TrueHDR runtime DLLs are missing." FORCE)
+# Not forced: a developer build that never packages an installer (and does not
+# use RTX TrueHDR) can pass -DSUNSHINE_REQUIRE_TRUEHDR_RUNTIME=OFF instead of
+# staging the runtime; installer builds keep the default ON.
+option(SUNSHINE_REQUIRE_TRUEHDR_RUNTIME "Fail Windows packaging when the TrueHDR runtime DLLs are missing." ON)
 set(SUNSHINE_TRUEHDR_RUNTIME_DIR "${CMAKE_BINARY_DIR}/truehdr-runtime" CACHE PATH "Directory containing vibeshine_truehdr.dll and the NVIDIA NGX TrueHDR runtime DLL")
 if("${SUNSHINE_TRUEHDR_RUNTIME_DIR}" STREQUAL "${CMAKE_BINARY_DIR}")
     set(SUNSHINE_TRUEHDR_RUNTIME_DIR "${CMAKE_BINARY_DIR}/truehdr-runtime" CACHE PATH "Directory containing vibeshine_truehdr.dll and the NVIDIA NGX TrueHDR runtime DLL" FORCE)
