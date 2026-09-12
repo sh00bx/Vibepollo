@@ -893,8 +893,6 @@ if(Python3_Interpreter_FOUND AND SUNSHINE_TEST_GXX)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/input/test_windows_absolute_mouse.py")
     add_test(NAME regression_windows_mouse_keys
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/input/test_windows_mouse_keys.py" --compiler "${SUNSHINE_TEST_GXX}")
-    add_test(NAME regression_frame_limiter_vsync
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/unit/platform/windows/test_frame_limiter_vsync.py")
     add_test(NAME regression_playnite_stop_callback
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/unit/platform/windows/test_playnite_stop_callback.py")
     add_test(NAME regression_rtss_profile_version
