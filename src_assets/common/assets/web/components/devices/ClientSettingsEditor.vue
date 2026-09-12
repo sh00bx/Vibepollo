@@ -2,7 +2,9 @@
 import { computed, reactive, toRaw, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 
+import ClientCommands from '@/components/devices/ClientCommands.vue';
 import SettingsOverrideEditor from '@/components/settings/SettingsOverrideEditor.vue';
+import DisplayTopologyEditor from '@/components/devices/DisplayTopologyEditor.vue';
 import { AppButton, SettingRow, StatusBadge, UiIcon } from '@/components/ui';
 
 export type ClientVirtualDisplayMode = 'global' | 'per_client' | 'shared' | 'disabled' | null;
@@ -784,6 +786,17 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
       :display-selection="visibleOverrideDisplaySelection"
       :hidden-keys="hiddenOverrideKeys"
       :control-id-prefix="`${controlIdPrefix}-override`"
+    />
+
+    <DisplayTopologyEditor v-if="isWindows" :client-uuid="controlIdPrefix.replace(/^client-/, '')" compact />
+
+    <ClientCommands
+      v-model:allow-client-commands="draft.allowClientCommands"
+      v-model:do-commands="draft.doCommands"
+      v-model:undo-commands="draft.undoCommands"
+      :platform="metadata.platform"
+      :disabled="busy"
+      :control-id-prefix="`${controlIdPrefix}-commands`"
     />
 
     <div class="client-settings-editor__footer">

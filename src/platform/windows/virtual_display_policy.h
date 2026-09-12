@@ -19,8 +19,26 @@ namespace VDISPLAY::policy {
     return !session_uses_virtual_display;
   }
 
+  // Encoder discovery never owns a monitor. It uses an existing physical
+  // output or waits until a requesting client creates its own display.
+  constexpr bool should_create_host_probe_display() noexcept {
+    return false;
+  }
+
   constexpr bool should_prepare_display_for_new_session(const bool no_active_sessions) noexcept {
     return no_active_sessions;
+  }
+
+  // Composed multi-client topologies own each stable VDD independently. A
+  // peer-preserving create may neither remove other identities up front nor
+  // restart the shared adapter after failure, because both actions tear down
+  // displays that are still owned by other clients.
+  constexpr bool should_teardown_conflicting_virtual_displays(const bool preserve_peer_displays) noexcept {
+    return !preserve_peer_displays;
+  }
+
+  constexpr bool may_restart_adapter_after_create_failure(const bool preserve_peer_displays) noexcept {
+    return !preserve_peer_displays;
   }
 
   // The temporary output created by ensure_display() is probe-scoped. Once a

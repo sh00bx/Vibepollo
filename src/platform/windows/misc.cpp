@@ -51,6 +51,9 @@
 #define NTDDI_VERSION NTDDI_WIN10
 #include <Shlwapi.h>
 
+// lib includes
+#include <libvirtualgamepad/client.h>
+
 // local includes
 #include "misc.h"
 #include "src/platform/common_services.h"
@@ -334,6 +337,17 @@ namespace platf {
     }
 
     return local_ip;
+  }
+
+  bool is_virtual_gamepad_driver_available() {
+    // Opening the control interface is the only honest test: the driver package
+    // can be staged while the source device is not started, and a stream would
+    // fail in exactly that case.
+    lvg::client probe;
+    if (probe.connect() != ERROR_SUCCESS) {
+      return false;
+    }
+    return probe.available_profiles() != 0;
   }
 
   bool is_vigem_installed(std::string *version_out) {
@@ -704,23 +718,6 @@ namespace platf {
 
     CloseDesktop(hDesk);
     return locked;
-  }
-
-  bool is_default_input_desktop_active() {
-    HDESK hDesk = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
-    if (!hDesk) {
-      return false;
-    }
-
-    bool is_default = false;
-    wchar_t name[256] {};
-    DWORD needed = 0;
-    if (GetUserObjectInformationW(hDesk, UOI_NAME, name, sizeof(name), &needed)) {
-      is_default = (_wcsicmp(name, L"Default") == 0);
-    }
-
-    CloseDesktop(hDesk);
-    return is_default;
   }
 
   // Note: This does NOT append a null terminator
@@ -3062,4 +3059,3 @@ static int setClipboardData(const std::wstring &utf16Str) {
 
   return 0;
 }
-

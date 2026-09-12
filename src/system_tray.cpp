@@ -51,6 +51,7 @@
   // local includes
   #include "config.h"
   #include "confighttp.h"
+  #include "nvhttp.h"
   #include "logging.h"
   #include "network.h"
   #include "platform/common.h"
@@ -104,7 +105,7 @@ namespace system_tray {
   void
     tray_force_stop_cb(struct tray_menu *item) {
     BOOST_LOG(info) << "Force stop from system tray"sv;
-    proc::proc.terminate(true);
+    nvhttp::request_force_stop();
   }
 
   void tray_restart_cb([[maybe_unused]] struct tray_menu *item) {
@@ -138,7 +139,7 @@ namespace system_tray {
     .menu =
       (struct tray_menu[]) {
         // todo - use boost/locale to translate menu strings
-        {.text = "Open Apollo", .cb = tray_open_ui_cb},
+        {.text = "Open Vibepollo", .cb = tray_open_ui_cb},
         {.text = "-"},
         // { .text = "-" },
         // { .text = "Donate",
@@ -411,14 +412,10 @@ namespace system_tray {
 #endif
     if (tray_thread.joinable()) {
       // end_tray() can run on the tray thread itself: a tray menu action
-      // (Restart/Quit) calls platf::restart()/lifetime::exit_sunshine(), which
-      // raises SIGINT. The SIGINT handler executes synchronously on the calling
-      // (tray) thread and invokes end_tray(). Joining our own thread throws
-      // std::system_error(resource_deadlock_would_occur); that exception is
-      // uncaught, so std::terminate()/abort() kills the process during shutdown
-      // (FAST_FAIL_FATAL_APP_EXIT). Detach in that case and let the tray loop
-      // unwind on its own once it observes tray_shutdown_requested after we
-      // return to the message pump. The main-thread shutdown path still joins.
+      // Keep self-join protection for any tray-thread caller. Joining our own
+      // thread throws std::system_error(resource_deadlock_would_occur); detach
+      // in that case and let the tray loop unwind after the callback returns.
+      // The main-thread shutdown path still joins.
       if (tray_thread.get_id() == std::this_thread::get_id()) {
         tray_thread.detach();
       } else {
@@ -546,7 +543,7 @@ namespace system_tray {
       tray.notification_text = s_notification_text.c_str();
       tray.notification_cb = []() {
         BOOST_LOG(info) << "Force stop from notification"sv;
-        proc::proc.terminate();
+        nvhttp::request_force_stop();
       };
       tray.tooltip = PROJECT_NAME;
       s_last_playing_app.clear();

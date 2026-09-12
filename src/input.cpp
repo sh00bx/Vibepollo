@@ -43,8 +43,6 @@ using namespace std::literals;
 namespace input {
 
   constexpr auto MAX_GAMEPADS = std::min((std::size_t) platf::MAX_GAMEPADS, sizeof(std::int16_t) * 8);
-#define DISABLE_LEFT_BUTTON_DELAY ((thread_pool_util::ThreadPool::task_id_t) 0x01)
-#define ENABLE_LEFT_BUTTON_DELAY nullptr
 
   constexpr auto VKEY_SHIFT = 0x10;
   constexpr auto VKEY_LSHIFT = 0xA0;
@@ -116,6 +114,9 @@ namespace input {
   static task_pool_util::TaskPool::task_id_t key_press_repeat_id {};
   static std::unordered_map<key_press_id_t, bool> key_press {};
   static std::array<std::uint8_t, 5> mouse_press {};
+  // The logical release may precede the host release by 10 ms. Keep ownership
+  // until the host receives the release, including during session cleanup.
+  static std::array<input_t *, 5> mouse_press_owner {};
 
   static platf::input_t platf_input;
 
@@ -262,6 +263,7 @@ namespace input {
     std::atomic_bool input_queue_task_scheduled;
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;
+    bool mouse_left_button_delay = true;
 
     input::touch_port_t touch_port;
 
@@ -605,7 +607,7 @@ namespace input {
       return;
     }
 
-    input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
+    input->mouse_left_button_delay = false;
     mouse_controller->move_relative({util::endian::big(packet->deltaX), util::endian::big(packet->deltaY)});
   }
 
@@ -710,9 +712,7 @@ namespace input {
       return;
     }
 
-    if (input->mouse_left_button_timeout == DISABLE_LEFT_BUTTON_DELAY) {
-      input->mouse_left_button_timeout = ENABLE_LEFT_BUTTON_DELAY;
-    }
+    input->mouse_left_button_delay = true;
 
     float x = util::endian::big(packet->x);
     float y = util::endian::big(packet->y);
@@ -766,6 +766,12 @@ namespace input {
     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
     auto button = util::endian::big(packet->button);
     if (button > 0 && button < mouse_press.size()) {
+      // An overlapping press from another client may have been ignored below.
+      // Its release must not change the accepted owner's logical state or
+      // leave that owner's delayed host release without a responsible timer.
+      if (release && mouse_press_owner[button] != input.get()) {
+        return;
+      }
       if (mouse_press[button] != release) {
         // button state is already what we want
         return;
@@ -784,20 +790,18 @@ namespace input {
      *
      * Try to make sure BUTTON_RIGHT gets called before BUTTON_LEFT is released.
      *
-     * input->mouse_left_button_timeout can only be nullptr
-     * when the last mouse coordinates were absolute
+     * Keep the coordinate mode separate from the pending task so a mouse
+     * move cannot discard the handle needed to cancel a delayed release.
      */
-    if (button == BUTTON_LEFT && release && !input->mouse_left_button_timeout) {
-      auto f = [=]() {
-        auto left_released = mouse_press[BUTTON_LEFT];
-        if (left_released) {
-          // Already released left button
+    if (button == BUTTON_LEFT && release && input->mouse_left_button_delay && !input->mouse_left_button_timeout) {
+      auto f = [input]() {
+        input->mouse_left_button_timeout = nullptr;
+        if (mouse_press[BUTTON_LEFT] || mouse_press_owner[BUTTON_LEFT] != input.get()) {
+          // A newer press must not be released by this old timer.
           return;
         }
-        platf::button_mouse(platf_input, BUTTON_LEFT, release);
-
-        mouse_press[BUTTON_LEFT] = false;
-        input->mouse_left_button_timeout = nullptr;
+        platf::button_mouse(platf_input, BUTTON_LEFT, true);
+        mouse_press_owner[BUTTON_LEFT] = nullptr;
       };
 
       input->mouse_left_button_timeout = task_pool.pushDelayed(std::move(f), 10ms).task_id;
@@ -805,18 +809,22 @@ namespace input {
       return;
     }
     if (
-      button == BUTTON_RIGHT && !release &&
-      input->mouse_left_button_timeout > DISABLE_LEFT_BUTTON_DELAY
+      button == BUTTON_RIGHT && !release && input->mouse_left_button_delay &&
+      input->mouse_left_button_timeout
     ) {
       platf::button_mouse(platf_input, BUTTON_RIGHT, false);
       platf::button_mouse(platf_input, BUTTON_RIGHT, true);
 
       mouse_press[BUTTON_RIGHT] = false;
+      mouse_press_owner[BUTTON_RIGHT] = nullptr;
 
       return;
     }
 
     platf::button_mouse(platf_input, button, release);
+    if (button > 0 && button < mouse_press_owner.size()) {
+      mouse_press_owner[button] = release ? nullptr : input.get();
+    }
   }
 
   short map_keycode(short keycode) {
@@ -2000,11 +2008,18 @@ namespace input {
 #endif
 
   void reset(std::shared_ptr<input_t> &input) {
-    task_pool.cancel(key_press_repeat_id);
-    task_pool.cancel(input->mouse_left_button_timeout);
+    {
+      std::lock_guard<std::mutex> lg(input->input_queue_lock);
+      input->input_queue.clear();
+    }
 
-    // Ensure input is synchronous, by using the task_pool
+    // Cancellation and release share the single input worker with passthrough
+    // and timer callbacks. A callback already running finishes before cleanup.
     task_pool.push([input]() {
+      task_pool.cancel(key_press_repeat_id);
+      task_pool.cancel(input->mouse_left_button_timeout);
+      input->mouse_left_button_timeout = nullptr;
+
 #ifdef _WIN32
       // Touchpad-mouse buttons bypass mouse_press[] (they go straight to
       // platf::button_mouse), so release them separately -- but only this
@@ -2016,9 +2031,10 @@ namespace input {
 #endif
 
       for (int x = 0; x < mouse_press.size(); ++x) {
-        if (mouse_press[x]) {
+        if (mouse_press_owner[x] == input.get()) {
           platf::button_mouse(platf_input, x, true);
           mouse_press[x] = false;
+          mouse_press_owner[x] = nullptr;
         }
       }
 

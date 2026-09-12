@@ -140,6 +140,10 @@ TEST(SunshineVirtualDisplay, EncoderProbeEnsureDisplaySkippedForPerClientVirtual
   EXPECT_FALSE(VDISPLAY::policy::should_ensure_probe_display(true));
 }
 
+TEST(SunshineVirtualDisplay, EncoderProbeNeverCreatesHostOwnedDisplay) {
+  EXPECT_FALSE(VDISPLAY::policy::should_create_host_probe_display());
+}
+
 TEST(SunshineVirtualDisplay, EnsureDisplayAppliesConfiguredRenderAdapterBeforeTemporaryCreation) {
   EXPECT_TRUE(VDISPLAY::policy::adapter_preference_allows_creation(true));
   EXPECT_FALSE(VDISPLAY::policy::adapter_preference_allows_creation(false));
@@ -207,6 +211,13 @@ TEST(SunshineVirtualDisplay, ResumeRequiresExactVirtualDisplayMatch) {
 TEST(SunshineVirtualDisplay, ActiveRtspJoinSkipsVirtualDisplayPreparation) {
   EXPECT_FALSE(VDISPLAY::policy::should_prepare_display_for_new_session(false));
   EXPECT_TRUE(VDISPLAY::policy::should_prepare_display_for_new_session(true));
+}
+
+TEST(SunshineVirtualDisplay, PeerPreservingCreateCannotTeardownOrRestartSharedAdapter) {
+  EXPECT_FALSE(VDISPLAY::policy::should_teardown_conflicting_virtual_displays(true));
+  EXPECT_FALSE(VDISPLAY::policy::may_restart_adapter_after_create_failure(true));
+  EXPECT_TRUE(VDISPLAY::policy::should_teardown_conflicting_virtual_displays(false));
+  EXPECT_TRUE(VDISPLAY::policy::may_restart_adapter_after_create_failure(false));
 }
 
 TEST(SunshineVirtualDisplay, StableIdentityResolverUsesEdidBeforeFriendlyName) {

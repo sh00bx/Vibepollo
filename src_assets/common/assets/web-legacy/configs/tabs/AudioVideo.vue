@@ -266,6 +266,12 @@ function selectVirtualDisplayLayout(v: unknown) {
     <PlatformLayout>
       <template #windows>
         <ConfigFieldRenderer
+          setting-key="audio_sink_capture_only"
+          v-model="config.audio_sink_capture_only"
+          class="mb-6"
+        />
+
+        <ConfigFieldRenderer
           setting-key="virtual_sink"
           v-model="config.virtual_sink"
           class="mb-6"
@@ -482,6 +488,80 @@ function selectVirtualDisplayLayout(v: unknown) {
                 </p>
               </div>
             </transition>
+
+            <div
+              class="mt-4 rounded-lg border border-dark/10 bg-surface/20 p-3 dark:border-light/10 sm:p-4"
+            >
+              <n-checkbox v-model:checked="config.remote_monitor_confirm_app_replacement">
+                <div class="flex flex-col">
+                  <span class="text-sm font-medium">
+                    {{ $t('config.remote_monitor_confirm_app_replacement') }}
+                  </span>
+                  <span class="mt-1 text-[11px] leading-snug opacity-70">
+                    {{ $t('config.remote_monitor_confirm_app_replacement_desc') }}
+                  </span>
+                </div>
+              </n-checkbox>
+            </div>
+
+            <PlatformLayout>
+              <template #windows>
+                <div
+                  class="mt-4 rounded-lg border border-dark/10 bg-surface/20 p-3 dark:border-light/10 sm:p-4"
+                >
+                  <div class="text-sm font-semibold">
+                    {{ $t('config.remote_monitor_options_title') }}
+                  </div>
+                  <p class="mt-1 text-[11px] leading-snug opacity-70">
+                    {{ $t('config.remote_monitor_options_desc') }}
+                  </p>
+                  <div class="mt-4 space-y-4">
+                    <n-checkbox v-model:checked="config.remote_monitor_mute_audio">
+                      <div class="flex flex-col">
+                        <span class="text-sm font-medium">
+                          {{ $t('config.remote_monitor_mute_audio') }}
+                        </span>
+                        <span class="mt-1 text-[11px] leading-snug opacity-70">
+                          {{ $t('config.remote_monitor_mute_audio_desc') }}
+                        </span>
+                      </div>
+                    </n-checkbox>
+                    <n-checkbox v-model:checked="config.remote_monitor_disconnect_on_stream_end">
+                      <div class="flex flex-col">
+                        <span class="text-sm font-medium">
+                          {{ $t('config.remote_monitor_disconnect_on_stream_end') }}
+                        </span>
+                        <span class="mt-1 text-[11px] leading-snug opacity-70">
+                          {{ $t('config.remote_monitor_disconnect_on_stream_end_desc') }}
+                        </span>
+                      </div>
+                    </n-checkbox>
+                    <n-checkbox
+                      v-model:checked="config.remote_monitor_disconnect_on_client_disconnect"
+                    >
+                      <div class="flex flex-col">
+                        <span class="text-sm font-medium">
+                          {{ $t('config.remote_monitor_disconnect_on_client_disconnect') }}
+                        </span>
+                        <span class="mt-1 text-[11px] leading-snug opacity-70">
+                          {{ $t('config.remote_monitor_disconnect_on_client_disconnect_desc') }}
+                        </span>
+                      </div>
+                    </n-checkbox>
+                    <n-checkbox v-model:checked="config.remote_monitor_terminate_on_first_request">
+                      <div class="flex flex-col">
+                        <span class="text-sm font-medium">
+                          {{ $t('config.remote_monitor_terminate_on_first_request') }}
+                        </span>
+                        <span class="mt-1 text-[11px] leading-snug opacity-70">
+                          {{ $t('config.remote_monitor_terminate_on_first_request_desc') }}
+                        </span>
+                      </div>
+                    </n-checkbox>
+                  </div>
+                </div>
+              </template>
+            </PlatformLayout>
 
             <div
               class="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4"

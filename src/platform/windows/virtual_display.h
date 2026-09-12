@@ -166,7 +166,8 @@ namespace VDISPLAY {
     int framegen_refresh_multiplier = 1,
     bool hdr_requested = false,
     bool allow_pending_enumeration = false,
-    bool replace_existing = true
+    bool replace_existing = true,
+    bool preserve_peer_displays = false
   );
 
   // Apply an HDR color profile to a physical output (best-effort).
@@ -183,6 +184,8 @@ namespace VDISPLAY {
   bool removeVirtualDisplay(const GUID &guid);
   bool removeAllVirtualDisplays();
   void schedule_virtual_display_recovery_monitor(const VirtualDisplayRecoveryParams &params);
+  // Stop recovery for one ended display without removing or untracking it.
+  void cancel_virtual_display_recovery_monitor(const GUID &guid);
   // Stop session recovery workers without removing or untracking their displays.
   // Unlike process shutdown, later sessions may schedule fresh monitors.
   void cancel_all_virtual_display_recovery_monitors();
@@ -258,17 +261,23 @@ namespace VDISPLAY {
     std::string device_id;
     std::string display_name;
 
-    [[nodiscard]] bool ready_for_probe() const {
+    [[nodiscard]] bool ready_for_capture() const {
       return readiness == ensure_display_readiness_e::existing_display ||
              (readiness == ensure_display_readiness_e::target_ready && !display_name.empty());
+    }
+
+    [[nodiscard]] bool owns_temporary_probe_request() const {
+      return tracks_temporary_for_probe && temporary_generation != 0;
     }
 
   };
 
   /**
-   * @brief Ensures a display is available for capture/encoding.
-   * If no active physical displays exist, automatically creates a temporary virtual display.
-   * @return Ownership, exact target identity, and readiness for encoder probing.
+   * @brief Creates or acquires an owned temporary display for encoder probing.
+   * @details Encoder capability validation uses synthetic surfaces and does not
+   *          wait for this target to receive a GDI/DXGI capture identity.
+   *          ready_for_capture() reports the separate publication state.
+   * @return Driver ownership and the currently observed capture readiness.
    */
   ensure_display_result ensure_display(const std::optional<LUID> &required_adapter_luid = std::nullopt);
 

@@ -66,12 +66,6 @@ namespace platf {
   bool is_lock_screen_active();
 
   /**
-   * @brief Check whether the active input desktop is the normal interactive desktop.
-   * @return true when the current desktop is Default, false otherwise.
-   */
-  bool is_default_input_desktop_active();
-
-  /**
    * @brief Cache the interactive user's screen saver enabled state before launching an app.
    * @details Repeated calls preserve the first captured value until it is restored.
    */
@@ -160,6 +154,14 @@ namespace platf {
    * @return true if the ViGEmBus driver file is present, false otherwise.
    */
   bool is_vigem_installed(std::string *version_out = nullptr);
+
+  /**
+   * @brief Check whether Vibeshine's own virtual gamepad driver is usable.
+   * @details Probes the driver's private control interface, so it reports what a stream would
+   *          actually get rather than merely whether files are present.
+   * @return true when a virtual controller can be created without ViGEmBus.
+   */
+  bool is_virtual_gamepad_driver_available();
 
   /**
    * @brief Check whether the Sunshine Vulkan HDR implicit layer is registered for the system.

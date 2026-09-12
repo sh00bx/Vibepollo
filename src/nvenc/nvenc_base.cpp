@@ -8,6 +8,7 @@
 
 // standard includes
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <format>
@@ -139,6 +140,12 @@ namespace nvenc {
     NV_ENC_BUFFER_FORMAT buffer_format,
     const SS_HDR_METADATA *initial_hdr_metadata
   ) {
+    context_guard_t context_guard {*this};
+    if (!context_guard) {
+      BOOST_LOG(error) << "NvEnc: couldn't enter the platform device context while creating the encoder";
+      return false;
+    }
+
     const auto encode_guid = encode_guid_from_video_format(client_config.videoFormat);
     if (!encode_guid) {
       BOOST_LOG(error) << "NvEnc: unknown video format " << client_config.videoFormat;
@@ -185,7 +192,10 @@ namespace nvenc {
           BOOST_LOG(error) << "NvEnc: couldn't destroy the rejected API session: " << last_nvenc_error_string;
           // The session is gone or unusable either way; do not let the fail
           // guard send a second destroy (and an unregister) to the same handle.
-          encoder = nullptr;
+          // Native backends may keep the handle to quarantine their resources.
+          if (!preserve_encoder_on_destroy_failure()) {
+            encoder = nullptr;
+          }
           return false;
         }
         encoder = nullptr;
@@ -782,7 +792,10 @@ namespace nvenc {
         if (nvenc_failed(nvenc->nvEncDestroyEncoder(encoder))) {
           BOOST_LOG(error) << "NvEnc: couldn't destroy the rejected explicit-config session: "
                            << last_nvenc_error_string;
-          encoder = nullptr;  // same as destroy_api_attempt: no second destroy from the fail guard
+          // same as destroy_api_attempt: no second destroy from the fail guard
+          if (!preserve_encoder_on_destroy_failure()) {
+            encoder = nullptr;
+          }
           return false;
         }
         encoder = nullptr;
@@ -900,7 +913,12 @@ namespace nvenc {
   }
 
   bool nvenc_base::destroy_encoder() {
-    bool destroyed = true;
+    context_guard_t context_guard {*this};
+    if (!context_guard) {
+      BOOST_LOG(error) << "NvEnc: couldn't enter the platform device context while destroying the encoder";
+      return false;
+    }
+
     if (output_bitstream) {
       if (nvenc_failed(nvenc->nvEncDestroyBitstreamBuffer(encoder, output_bitstream))) {
         BOOST_LOG(error) << "NvEnc: NvEncDestroyBitstreamBuffer() failed: " << last_nvenc_error_string;
@@ -923,7 +941,10 @@ namespace nvenc {
     if (encoder) {
       if (nvenc_failed(nvenc->nvEncDestroyEncoder(encoder))) {
         BOOST_LOG(error) << "NvEnc: NvEncDestroyEncoder() failed: " << last_nvenc_error_string;
-        destroyed = false;
+        if (!preserve_encoder_on_destroy_failure()) {
+          encoder = nullptr;
+        }
+        return false;
       }
       encoder = nullptr;
     }
@@ -933,7 +954,7 @@ namespace nvenc {
     hdr_metadata_valid = false;
     hdr_metadata = {};
     selected_api_version = 0;
-    return destroyed;
+    return true;
   }
 
   void nvenc_base::set_hdr_metadata(const SS_HDR_METADATA &metadata) {
@@ -945,11 +966,18 @@ namespace nvenc {
   }
 
   nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr) {
-    // Both clock reads are skipped unless the debug log level is active.
-    encoder_state.encode_latency_logger.first_point_now();
+    const auto encode_started = std::chrono::steady_clock::now();
     auto latency_guard = util::fail_guard([&] {
-      encoder_state.encode_latency_logger.second_point_now_and_log();
+      encoder_state.encode_latency_logger.collect_and_log(
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - encode_started).count()
+      );
     });
+
+    context_guard_t context_guard {*this};
+    if (!context_guard) {
+      BOOST_LOG(error) << "NvEnc: couldn't enter the platform device context while encoding";
+      return {};
+    }
 
     if (!encoder) {
       return {};
@@ -1083,6 +1111,11 @@ namespace nvenc {
   }
 
   bool nvenc_base::invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) {
+    context_guard_t context_guard {*this};
+    if (!context_guard) {
+      return false;
+    }
+
     if (!encoder || !encoder_params.rfi) {
       return false;
     }
@@ -1121,6 +1154,11 @@ namespace nvenc {
   }
 
   bool nvenc_base::set_bitrate(int bitrate_kbps) {
+    context_guard_t context_guard {*this};
+    if (!context_guard) {
+      return false;
+    }
+
     if (!encoder || !nvenc) {
       BOOST_LOG(warning) << "NvEnc: encoder not initialized; cannot change bitrate";
       return false;
@@ -1132,7 +1170,7 @@ namespace nvenc {
       return false;
     }
 
-    const bool is_hevc = (saved_init_params.encodeGUID == NV_ENC_CODEC_HEVC_GUID);
+    const bool is_hevc = equal_guids(saved_init_params.encodeGUID, NV_ENC_CODEC_HEVC_GUID);
     const uint32_t new_bitrate_bps = static_cast<uint32_t>(bitrate_kbps) * 1000u;
     const uint32_t prev_bitrate_bps = current_enc_config.rcParams.averageBitRate;
 

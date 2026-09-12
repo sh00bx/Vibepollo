@@ -5,7 +5,9 @@
 #include "../tests_common.h"
 
 #include <atomic>
+#include <chrono>
 #include <deque>
+#include <future>
 #include <src/audio_lifecycle_policy.h>
 #include <src/audio_lifecycle_state.h>
 #include <src/audio_policy.h>
@@ -36,23 +38,23 @@ TEST(AudioLifecycleState, BlocksReconnectUntilTerminalRestoreCompletes) {
   ASSERT_TRUE(state.retain(retained, true));
   ASSERT_TRUE(state.begin_terminal());
 
-  std::atomic_bool reconnect_started {false};
   std::atomic_bool reconnect_finished {false};
   std::atomic_bool reclaimed {false};
+  auto reconnect_waiting = std::promise<void> {};
+  auto reconnect_waiting_future = reconnect_waiting.get_future();
   std::thread reconnect([&]() {
-    reconnect_started.store(true, std::memory_order_release);
     lifecycle_token_t reconnect_token {};
-    reclaimed.store(
-      state.reclaim(reconnect_token, true),
-      std::memory_order_release
-    );
+    reclaimed.store(state.reclaim(reconnect_token, true, [&reconnect_waiting]() {
+      reconnect_waiting.set_value();
+    }),
+                    std::memory_order_release);
     reconnect_finished.store(true, std::memory_order_release);
   });
 
-  while (!reconnect_started.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
-  }
-  EXPECT_TRUE(reconnect_started.load(std::memory_order_acquire));
+  EXPECT_EQ(
+    reconnect_waiting_future.wait_for(std::chrono::seconds {5}),
+    std::future_status::ready
+  );
   EXPECT_FALSE(reconnect_finished.load(std::memory_order_acquire));
 
   state.complete_terminal_restore();
@@ -150,6 +152,56 @@ TEST(AudioSinkPolicy, PreservesPriorityAndEmptyFallbacks) {
 
   const sink_catalog_t no_virtual {"", std::nullopt, std::nullopt, std::nullopt};
   EXPECT_TRUE(select_sink(no_virtual, "", 2, false).empty());
+}
+
+TEST(AudioSinkPolicy, CaptureOnlyRequiresExplicitSelectedSinkAndPreservesVirtualRouting) {
+  const sink_catalog_t sinks {"host", "virtual-stereo", "virtual-51", "virtual-71"};
+  const auto physical = select_sink(sinks, "second-device", 2, true);
+  EXPECT_TRUE(capture_sink_without_routing(true, "second-device", "", physical));
+  EXPECT_FALSE(capture_sink_without_routing(false, "second-device", "", physical));
+  EXPECT_FALSE(capture_sink_without_routing(true, "", "", "host"));
+
+  // Virtual sinks still take precedence when host audio is disabled or a
+  // managed virtual sink is explicitly configured.
+  const auto automatic_virtual = select_sink(sinks, "second-device", 2, false);
+  EXPECT_FALSE(capture_sink_without_routing(true, "second-device", "", automatic_virtual));
+  const auto managed_virtual = select_sink(sinks, "second-device", 2, false);
+  EXPECT_FALSE(capture_sink_without_routing(true, "second-device", "second-device", managed_virtual));
+
+  const sink_catalog_t no_virtual {"host", std::nullopt, std::nullopt, std::nullopt};
+  const auto selected = select_sink(no_virtual, "second-device", 2, false);
+  EXPECT_TRUE(capture_sink_without_routing(true, "second-device", "", selected));
+  EXPECT_TRUE(capture_sink_without_routing(true, "host", "", "host"));
+}
+
+TEST(AudioSinkPolicy, ManagedVirtualSinkOverridesHostAudioRequest) {
+  const sink_catalog_t sinks {
+    "host",
+    "sink-sunshine-stereo",
+    "sink-sunshine-surround51",
+    "sink-sunshine-surround71"
+  };
+
+  EXPECT_EQ(
+    select_stream_sink(
+      sinks,
+      "host",
+      "sink-sunshine-stereo",
+      2,
+      true
+    ),
+    "sink-sunshine-stereo"
+  );
+  EXPECT_EQ(
+    select_stream_sink(
+      sinks,
+      "host",
+      "sink-sunshine-stereo",
+      6,
+      true
+    ),
+    "sink-sunshine-surround51"
+  );
 }
 
 namespace {

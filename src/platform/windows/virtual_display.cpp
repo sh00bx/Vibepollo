@@ -493,13 +493,15 @@ namespace VDISPLAY_SUNSHINE {
     int framegen_refresh_multiplier,
     bool hdr_requested,
     bool allow_pending_enumeration,
-    bool replace_existing
+    bool replace_existing,
+    bool preserve_peer_displays
   );
   void applyHdrProfileToOutput(const char *s_client_name, const char *s_hdr_profile, const char *s_device_id);
   void restorePhysicalHdrProfiles();
   bool removeVirtualDisplay(const GUID &guid);
   bool removeAllVirtualDisplays();
   void schedule_virtual_display_recovery_monitor(const VirtualDisplayRecoveryParams &params);
+  void cancel_virtual_display_recovery_monitor(const GUID &guid);
   void cancel_all_virtual_display_recovery_monitors();
   void request_virtual_display_recovery_shutdown();
   void join_virtual_display_recovery_monitors();
@@ -564,13 +566,16 @@ namespace VDISPLAY_SUDOVDA {
     bool framegen_refresh_active,
     int framegen_refresh_multiplier,
     bool hdr_requested,
-    bool replace_existing
+    bool allow_pending_enumeration,
+    bool replace_existing,
+    bool preserve_peer_displays
   );
   void applyHdrProfileToOutput(const char *s_client_name, const char *s_hdr_profile, const char *s_device_id);
   void restorePhysicalHdrProfiles();
   bool removeVirtualDisplay(const GUID &guid);
   bool removeAllVirtualDisplays();
   void schedule_virtual_display_recovery_monitor(const VirtualDisplayRecoveryParams &params);
+  void cancel_virtual_display_recovery_monitor(const GUID &guid);
   void cancel_all_virtual_display_recovery_monitors();
   void request_virtual_display_recovery_shutdown();
   void join_virtual_display_recovery_monitors();
@@ -741,12 +746,13 @@ namespace VDISPLAY {
     int framegen_refresh_multiplier,
     bool hdr_requested,
     bool allow_pending_enumeration,
-    bool replace_existing
+    bool replace_existing,
+    bool preserve_peer_displays
   ) {
     if (use_sunshine_driver()) {
-      return VDISPLAY_SUNSHINE::createVirtualDisplay(s_client_uid, s_client_name, s_hdr_profile, width, height, fps, guid, base_fps_millihz, framegen_refresh_active, framegen_refresh_multiplier, hdr_requested, allow_pending_enumeration, replace_existing);
+      return VDISPLAY_SUNSHINE::createVirtualDisplay(s_client_uid, s_client_name, s_hdr_profile, width, height, fps, guid, base_fps_millihz, framegen_refresh_active, framegen_refresh_multiplier, hdr_requested, allow_pending_enumeration, replace_existing, preserve_peer_displays);
     }
-    return VDISPLAY_SUDOVDA::createVirtualDisplay(s_client_uid, s_client_name, s_hdr_profile, width, height, fps, guid, base_fps_millihz, framegen_refresh_active, framegen_refresh_multiplier, hdr_requested, replace_existing);
+    return VDISPLAY_SUDOVDA::createVirtualDisplay(s_client_uid, s_client_name, s_hdr_profile, width, height, fps, guid, base_fps_millihz, framegen_refresh_active, framegen_refresh_multiplier, hdr_requested, allow_pending_enumeration, replace_existing, preserve_peer_displays);
   }
 
   void applyHdrProfileToOutput(const char *s_client_name, const char *s_hdr_profile, const char *s_device_id) {
@@ -776,6 +782,13 @@ namespace VDISPLAY {
     } else {
       VDISPLAY_SUDOVDA::schedule_virtual_display_recovery_monitor(params);
     }
+  }
+
+  void cancel_virtual_display_recovery_monitor(const GUID &guid) {
+    // The display may have been created by either backend before a
+    // configuration change, so cancel the matching identity in both.
+    VDISPLAY_SUNSHINE::cancel_virtual_display_recovery_monitor(guid);
+    VDISPLAY_SUDOVDA::cancel_virtual_display_recovery_monitor(guid);
   }
 
   void cancel_all_virtual_display_recovery_monitors() {

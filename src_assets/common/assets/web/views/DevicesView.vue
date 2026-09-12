@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, toRaw } from 'vue';
+import { useUnsavedChanges } from '@/composables/useUnsavedChanges';
 import { useI18n } from 'vue-i18n';
 
 import { ApiError, apiGet, apiPost } from '@/api/client';
@@ -20,6 +21,7 @@ import ClientSettingsEditor, {
   type DisplayDevice,
   type HdrProfileEntry,
 } from '@/components/devices/ClientSettingsEditor.vue';
+import DisplayTopologyEditor from '@/components/devices/DisplayTopologyEditor.vue';
 import { settingsDefaults } from '@/configs/settingsSchema';
 import { formatRelativeTime } from '@/utils/format';
 
@@ -65,6 +67,27 @@ interface PendingAction {
   device: PairedDevice;
 }
 
+const unpairAllOpen = ref(false);
+const unpairAllBusy = ref(false);
+async function unpairAll(): Promise<void> {
+  if (unpairAllBusy.value) return;
+  unpairAllBusy.value = true;
+  try {
+    const result = await apiPost<MutationResponse>('/api/clients/unpair-all');
+    if (result.status !== true) throw new Error('unpair-rejected');
+    drafts.value = {};
+    draftOrigins.value = {};
+    openEditors.value = new Set();
+    unpairAllOpen.value = false;
+    notice.value = t('ui.devices.unpair_all.success');
+    await loadDevices(true);
+  } catch {
+    error.value = t('ui.devices.error.action');
+  } finally {
+    unpairAllBusy.value = false;
+  }
+}
+
 const devices = ref<PairedDevice[]>([]);
 const drafts = ref<Record<string, ClientDeviceDraft>>({});
 const draftOrigins = ref<Record<string, ClientDeviceDraft>>({});
@@ -90,6 +113,15 @@ const openEditors = ref<Set<string>>(new Set());
 const pendingAction = ref<PendingAction | null>(null);
 const confirmOpen = ref(false);
 let refreshTimer: number | undefined;
+
+useUnsavedChanges(
+  computed(() =>
+    Object.keys(drafts.value).some(
+      (uuid) =>
+        draftOrigins.value[uuid] && !sameDraft(drafts.value[uuid], draftOrigins.value[uuid]),
+    ),
+  ),
+);
 
 const filteredDevices = computed(() => {
   const needle = query.value.trim().toLocaleLowerCase(locale.value);
@@ -162,6 +194,15 @@ function normalizeCommands(value: unknown): ClientCommandEntry[] {
     if (!command) return [];
     return [{ command, elevated: Boolean((entry as Record<string, unknown>).elevated) }];
   });
+}
+
+function serializeCommands(commands: ClientCommandEntry[]): ClientCommandEntry[] {
+  return commands.reduce<ClientCommandEntry[]>((result, entry) => {
+    const command = entry.command.trim();
+    if (!command) return result;
+    result.push({ command, elevated: entry.elevated === true });
+    return result;
+  }, []);
 }
 
 function normalizeVirtualMode(value: unknown): ClientDeviceDraft['virtualDisplayMode'] {
@@ -416,8 +457,14 @@ function updatePayload(device: PairedDevice, draft: ClientDeviceDraft): Record<s
     perm: draft.permissions & PERMISSION_ALL,
     enable_legacy_ordering: draft.enableLegacyOrdering,
     allow_client_commands: draft.allowClientCommands,
-    do: draft.doCommands.map((entry) => ({ cmd: entry.command.trim(), elevated: entry.elevated })),
-    undo: draft.undoCommands.map((entry) => ({ cmd: entry.command.trim(), elevated: entry.elevated })),
+    do: serializeCommands(draft.doCommands).map((entry) => ({
+      cmd: entry.command,
+      elevated: entry.elevated,
+    })),
+    undo: serializeCommands(draft.undoCommands).map((entry) => ({
+      cmd: entry.command,
+      elevated: entry.elevated,
+    })),
     display_mode: draft.displayMode.trim(),
     output_name_override: outputName,
     always_use_virtual_display:
@@ -444,6 +491,8 @@ const draftScalarKeys = [
   'permissions',
   'enableLegacyOrdering',
   'allowClientCommands',
+  'doCommands',
+  'undoCommands',
   'displayMode',
   'displayOverrideEnabled',
   'displaySelection',
@@ -617,7 +666,7 @@ onBeforeUnmount(() => {
       <template #meta>
         <StatusBadge
           :label="t('ui.devices.count.streaming', { count: deviceCounts.streaming })"
-          tone="success"
+          :tone="deviceCounts.streaming ? 'success' : 'neutral'"
           compact
         />
         <StatusBadge
@@ -812,6 +861,36 @@ onBeforeUnmount(() => {
       </ul>
     </div>
 
+    <details class="devices-layout">
+      <summary>
+        <UiIcon name="devices" :size="20" />
+        <span
+          ><strong>{{ t('ui.devices.layout.title') }}</strong
+          ><span>{{ t('ui.devices.layout.description') }}</span></span
+        >
+        <UiIcon class="devices-layout__chevron" name="chevron-down" />
+      </summary>
+      <DisplayTopologyEditor />
+    </details>
+
+    <section v-if="devices.length" class="devices-bulk-actions">
+      <AppButton
+        variant="tertiary"
+        :label="t('ui.devices.unpair_all.action')"
+        :disabled="Boolean(busyUuid)"
+        @click="unpairAllOpen = true"
+      />
+    </section>
+    <ConfirmDialog
+      v-model:open="unpairAllOpen"
+      :title="t('ui.devices.unpair_all.title')"
+      :description="t('ui.devices.unpair_all.description')"
+      :confirm-label="t('ui.devices.unpair_all.action')"
+      :busy="unpairAllBusy"
+      :close-on-confirm="false"
+      tone="danger"
+      @confirm="unpairAll"
+    />
     <ConfirmDialog
       v-model:open="confirmOpen"
       :title="confirmTitle"
@@ -833,6 +912,51 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.devices-layout {
+  border: 1px solid var(--vs-color-border-subtle);
+  border-radius: var(--vs-radius-card);
+  background: var(--vs-color-bg-surface);
+}
+.devices-layout > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--vs-space-16);
+  padding: var(--vs-space-20);
+  list-style: none;
+  cursor: pointer;
+  color: var(--vs-color-text-muted);
+  border-radius: inherit;
+}
+.devices-layout > summary::-webkit-details-marker {
+  display: none;
+}
+.devices-layout > summary:hover {
+  background: var(--vs-color-bg-subtle);
+}
+.devices-layout > summary > span {
+  flex: 1;
+  min-width: 0;
+}
+.devices-layout strong {
+  display: block;
+  color: var(--vs-color-text-primary);
+  font-size: var(--vs-type-size-control);
+  font-weight: var(--vs-type-weight-medium);
+}
+.devices-layout > summary > span > span {
+  display: block;
+  margin-top: var(--vs-space-4);
+  font-size: var(--vs-type-size-metadata);
+}
+.devices-layout[open] .devices-layout__chevron {
+  transform: rotate(180deg);
+}
+.devices-layout :deep(.topology-editor) {
+  border: 0;
+  border-top: 1px solid var(--vs-color-border-subtle);
+  border-radius: 0 0 var(--vs-radius-card) var(--vs-radius-card);
+}
+
 .devices-page,
 .devices-stack {
   display: grid;

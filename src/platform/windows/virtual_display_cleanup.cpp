@@ -7,6 +7,7 @@
   #include "src/platform/windows/impersonating_display_device.h"
   #include "src/platform/windows/virtual_display.h"
   #include "src/process.h"
+  #include "src/remote_display_topology.h"
 
   #include <algorithm>
   #include <array>
@@ -112,6 +113,18 @@ namespace platf::virtual_display_cleanup {
       std::memcpy(&guid, guid_bytes->data(), sizeof(guid));
       return VDISPLAY::removeVirtualDisplay(guid);
     }
+
+    void disengage_recovery_monitors(const std::optional<std::array<std::uint8_t, 16>> &guid_bytes) {
+      if (!guid_bytes || guid_bytes_are_empty(*guid_bytes)) {
+        VDISPLAY::cancel_all_virtual_display_recovery_monitors();
+        return;
+      }
+
+      GUID guid {};
+      static_assert(sizeof(guid) == 16);
+      std::memcpy(&guid, guid_bytes->data(), sizeof(guid));
+      VDISPLAY::cancel_virtual_display_recovery_monitor(guid);
+    }
   }  // namespace
 
   cleanup_result_t run(
@@ -119,12 +132,37 @@ namespace platf::virtual_display_cleanup {
     const bool enforce_db_restore,
     const revert_order_t revert_order,
     const bool prefer_golden_if_current_missing,
-    const std::optional<std::array<std::uint8_t, 16>> virtual_display_guid_bytes
+    const std::optional<std::array<std::uint8_t, 16>> virtual_display_guid_bytes,
+    const recovery_monitor_policy_t recovery_monitor_policy,
+    const cleanup_admission_policy_t cleanup_admission_policy
   ) {
     cleanup_reservation_t cleanup_reservation;
     cleanup_result_t result;
 
     const std::string reason_text = reason.empty() ? "unspecified" : std::string(reason);
+    if (recovery_monitor_policy == recovery_monitor_policy_t::disengage_before_admission) {
+      // Terminal intent is authoritative even while a managed session still
+      // owns the display. Cancel before the ownership guard so an intentionally
+      // expired or externally removed lease can never be classified as a crash
+      // and recreated by that ended session's recovery worker.
+      disengage_recovery_monitors(virtual_display_guid_bytes);
+      BOOST_LOG(info) << "Virtual display cleanup: recovery monitors disengaged before terminal cleanup admission (reason="
+                      << reason_text << ").";
+    }
+    const bool managed_cleanup_allowed = remote_display_topology::instance().generic_virtual_display_cleanup_allowed();
+    if (!cleanup_admitted(managed_cleanup_allowed, cleanup_admission_policy)) {
+      if (enforce_db_restore) {
+        proc::defer_display_revert();
+      }
+      BOOST_LOG(info) << "Virtual display cleanup: deferred (reason=" << reason_text
+                      << ") until the remaining managed client display sessions release ownership.";
+      return result;
+    }
+    if (!managed_cleanup_allowed) {
+      BOOST_LOG(warning) << "Virtual display cleanup: overriding managed display ownership for terminal user action (reason="
+                         << reason_text << ").";
+    }
+
     BOOST_LOG(info) << "Virtual display cleanup: begin (reason=" << reason_text
                     << ", enforce_db_restore=" << (enforce_db_restore ? "true" : "false")
                     << ", revert_order="
@@ -140,7 +178,10 @@ namespace platf::virtual_display_cleanup {
         return;
       }
 
-      result.helper_revert_dispatched = display_helper_integration::revert(prefer_golden_if_current_missing);
+      result.helper_revert_dispatched = display_helper_integration::revert(
+        prefer_golden_if_current_missing,
+        cleanup_admission_policy == cleanup_admission_policy_t::override_managed_owners
+      );
       if (result.helper_revert_dispatched) {
         result.database_restore_applied = true;
       }
@@ -208,25 +249,23 @@ namespace platf::virtual_display_cleanup {
     cleanup_reservation_t terminal_reservation;
     const std::string reason_text = reason.empty() ? "unspecified" : std::string(reason);
 
-    // A previous app-triggered revert may still be queued for the end of the
-    // final stream. This action consumes that intent now, so it must not fire
-    // again later.
+    // A previous ordinary cleanup may have queued a restore behind the same
+    // managed-owner gate this terminal action intentionally overrides. This
+    // action consumes that intent now, so it must not fire again later.
     proc::clear_deferred_display_revert();
 
-    // Terminal intent is authoritative: stop session recovery workers before
-    // any display is removed, so an intentionally removed display is never
-    // classified as a crash and recreated by the recovery worker. Cancellation
-    // is non-latching; a later session arms fresh monitors.
-    VDISPLAY::cancel_all_virtual_display_recovery_monitors();
-    BOOST_LOG(info) << "Virtual display cleanup: recovery monitors disengaged before terminal cleanup (reason="
-                    << reason_text << ").";
-
+    // Terminal intent is authoritative: run() disengages the session recovery
+    // workers before any display is removed, so an intentionally removed
+    // display is never classified as a crash and recreated by the recovery
+    // worker. Cancellation is non-latching; a later session arms fresh monitors.
     const auto result = run(
       reason,
       true,
       revert_order_t::restore_before_remove,
       true,
-      std::nullopt
+      std::nullopt,
+      recovery_monitor_policy_t::disengage_before_admission,
+      cleanup_admission_policy_t::override_managed_owners
     );
 
     // A terminal user action must also end the helper restart loop. Forced
@@ -244,7 +283,6 @@ namespace platf::virtual_display_cleanup {
                     << reason_text << ").";
     return result;
   }
-
   bool in_progress() {
     return g_cleanup_reservations.load(std::memory_order_acquire) != 0;
   }

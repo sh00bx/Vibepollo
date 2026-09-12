@@ -13,6 +13,8 @@
 
 // standard includes
 #include <array>
+#include <optional>
+#include <string>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -22,6 +24,12 @@ extern "C" {
 struct AVPacket;
 
 namespace video {
+  enum class capture_source_e : std::uint8_t {
+    active_output,
+    exact_output,
+    synthetic_black,
+  };
+
 
   /* Encoding configuration requested by remote client */
   struct config_t {
@@ -63,8 +71,13 @@ namespace video {
 
     int enableIntraRefresh;  // 0 - disabled, 1 - enabled
 
-    int encodingFramerate;  // Requested display framerate
-    bool input_only;
+    int encodingFramerate = 0;  // Requested display framerate
+    bool input_only = false;
+    // Capture ownership is session-local. Exact remote outputs must not fall
+    // back through the mutable process-wide output selection, while input-only
+    // sessions use an in-memory black producer and never initialize capture.
+    capture_source_e capture_source {capture_source_e::active_output};
+    std::optional<std::string> capture_output;
     // Opt into the smallest supported host-side queues for a launch-qualified VRR
     // session. This remains false for clients that do not negotiate the mode.
     bool vrr_low_latency = false;
@@ -291,9 +304,13 @@ namespace video {
   extern encoder_t nvenc;  // available for windows and linux
 #endif
 
+#if defined(__linux__)
+  extern encoder_t nvenc_legacy;
+#endif
+
 #ifdef _WIN32
-  extern encoder_t amdvce;
-  extern encoder_t amdvce_legacy;
+  extern encoder_t amdvce_experimental;
+  extern encoder_t amdvce_ffmpeg;
   extern encoder_t quicksync;
   extern encoder_t mediafoundation;
 #endif
