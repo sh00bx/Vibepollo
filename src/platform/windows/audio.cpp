@@ -321,6 +321,40 @@ namespace platf::audio {
   }
 
   /**
+   * @brief Process-wide count of Steam endpoint hide/show transitions in flight.
+   *
+   * The marker on disk cannot tell "we died mid-transition" from "another
+   * audio_control_t in this process is hiding the endpoint right now": the
+   * pending-restore worker runs its own control and outlives the session one.
+   * Invariant: the marker is only interpreted as an interrupted transition
+   * while this count is zero.
+   */
+  static std::atomic<int> &visibility_transition_depth_ref() {
+    static std::atomic<int> depth {0};
+    return depth;
+  }
+
+  static bool visibility_transition_in_flight() {
+    return visibility_transition_depth_ref().load(std::memory_order_acquire) > 0;
+  }
+
+  /**
+   * @brief Marks a hide/show transition as in flight for its whole scope.
+   */
+  struct visibility_transition_guard_t {
+    visibility_transition_guard_t() {
+      visibility_transition_depth_ref().fetch_add(1, std::memory_order_release);
+    }
+
+    ~visibility_transition_guard_t() {
+      visibility_transition_depth_ref().fetch_sub(1, std::memory_order_release);
+    }
+
+    visibility_transition_guard_t(const visibility_transition_guard_t &) = delete;
+    visibility_transition_guard_t &operator=(const visibility_transition_guard_t &) = delete;
+  };
+
+  /**
    * @brief Whether process shutdown has started.
    *
    * Hiding an endpoint while the process is going down risks dying between the
@@ -1309,7 +1343,20 @@ namespace platf::audio {
       // Remember the assigned sink name, so we have it for later if we need to set it
       // back after another application changes it
       if (assignment_active && !failure) {
+        // Invariant: assigned_device_id names the endpoint the roles point at
+        // right now, so restore_sink()/reset_failed_default_roles() recognize
+        // our own assignment. A control reclaimed across a reconnect can assign
+        // a different sink than its first session did (sink changed in the UI,
+        // virtual sink appeared/disappeared); keeping the first device id here
+        // would make both rollback paths skip every role. The restore targets
+        // stay in captured_default_device_ids, which is still filled only on the
+        // first assignment above. Only a fully applied assignment updates this,
+        // so a partial failure keeps the id of the endpoint the roles still hold.
+        // Written under pending_restore_mutex like assigned_sink: set_sink() is
+        // also entered from the default-endpoint callback thread, and this is
+        // no longer a one-time write before any callback exists.
         std::scoped_lock lock(pending_restore_mutex_ref());
+        assigned_device_id = *device_id;
         if (policy_assignment_epoch_ref() == assignment_epoch) {
           assigned_sink = sink;
         }
@@ -1665,6 +1712,15 @@ namespace platf::audio {
      */
     void recover_interrupted_visibility_transition() {
       if (!visibility_marker_present()) {
+        return;
+      }
+
+      // A transition of another control in this process (the pending-restore
+      // worker, which has its own audio_control_t) writes the same marker while
+      // it runs. Healing it here would re-show Steam inside the fallback window,
+      // letting Windows pick it as the default again, and would delete the
+      // marker that protects the endpoint.
+      if (visibility_transition_in_flight()) {
         return;
       }
 
@@ -2689,7 +2745,9 @@ namespace platf::audio {
       }
 
       // Record the transition first so an interrupted hide/show is healed at
-      // the next startup instead of leaving the endpoint hidden forever.
+      // the next startup instead of leaving the endpoint hidden forever. The
+      // guard keeps a concurrent recovery pass out of this window.
+      const visibility_transition_guard_t visibility_guard;
       if (!write_visibility_marker(steam_device_id)) {
         BOOST_LOG(warning) << "Couldn't record the Steam audio visibility transition; skipping the visibility fallback"sv;
         return reset_result_e::fatal;
@@ -2997,7 +3055,9 @@ namespace platf::audio {
       }
 
       // Record the transition first so an interrupted hide/show is healed at
-      // the next startup instead of leaving the endpoint hidden forever.
+      // the next startup instead of leaving the endpoint hidden forever. The
+      // guard keeps a concurrent recovery pass out of this window.
+      const visibility_transition_guard_t visibility_guard;
       if (!write_visibility_marker(steam_device_id)) {
         BOOST_LOG(warning) << "Couldn't record the Steam audio visibility transition; skipping the visibility fallback"sv;
         return reset_result_e::fatal;

@@ -300,8 +300,17 @@ namespace audio {
 #endif
       {
         // If the selected sink is different than the current one, change sinks.
-        ref->restore_sink = ref->sink.host != sink;
-        if (ref->restore_sink) {
+        const bool sink_differs = ref->sink.host != sink;
+        // Invariant: restore_sink only ever latches. A reclaimed control (see
+        // reclaim_retained_audio()) carries restore_sink=true from the session
+        // that hijacked the default endpoint; recomputing it here would clear
+        // that debt whenever this session streams the host sink (HOST_AUDIO or
+        // a channel count without a matching virtual sink), and stop_audio_control()
+        // would then return early and leave Windows' default on the streaming
+        // sink forever. A fresh session starts with restore_sink=false
+        // (start_audio_control()), so this is the previous behaviour there.
+        ref->restore_sink = ref->restore_sink || sink_differs;
+        if (sink_differs) {
           if (control->set_sink(sink)) {
             return;
           }

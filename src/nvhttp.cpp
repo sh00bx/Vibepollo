@@ -3450,7 +3450,9 @@ namespace nvhttp {
     template<class T>
     void pair(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
       print_req<T>(request);
-      std::lock_guard pairing_lock {pairing_sessions_mutex};
+      // unique_lock, not lock_guard: the PIN_STDIN path below must release the
+      // mutex while it waits for console input.
+      std::unique_lock pairing_lock {pairing_sessions_mutex};
       // Every later pairing phase must come from the peer that opened the session:
       // Moonlight-derived clients share one fixed uniqueid (GHSA-36ff).
       const auto peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
@@ -3563,11 +3565,28 @@ namespace nvhttp {
 
           if (config::sunshine.flags[config::flag::PIN_STDIN]) {
             std::string pin;
+            const auto session_created_at = ptr->second.created_at;
+            const auto session_key = ptr->first;
 
+            // Never block the other handlers (and this server's io thread) on
+            // console input: the mutex is released for the duration of the read.
+            pairing_lock.unlock();
             std::cout << "Please insert pin: "sv;
             std::getline(std::cin, pin);
+            pairing_lock.lock();
 
-            getservercert(ptr->second, tree, pin);
+            // The session may have expired or been replaced while we waited, and
+            // ptr may have been invalidated by an insertion in the meantime.
+            auto stdin_sess_it = map_id_sess.find(session_key);
+            if (stdin_sess_it == std::end(map_id_sess) ||
+                stdin_sess_it->second.created_at != session_created_at) {
+              tree.put("root.paired", 0);
+              tree.put("root.<xmlattr>.status_code", 408);
+              tree.put("root.<xmlattr>.status_message", "Pairing session expired");
+              return;
+            }
+
+            getservercert(stdin_sess_it->second, tree, pin);
           } else {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
             system_tray::update_tray_require_pin();
@@ -5870,7 +5889,14 @@ namespace nvhttp {
     auto args = request->parse_query_string();
     const auto appid = get_arg(args, "appid", "0");
     const auto appuuid = get_arg(args, "appuuid", "");
-    const auto current_appid = proc::proc.running();
+    // This handler is bound directly to the HTTPS route, i.e. it runs on the
+    // server's single io thread. It must neither park on the lifecycle gate nor
+    // reap: even a try-lock running() would run the whole terminate() (display
+    // revert, undo commands) on the only acceptor if this request happens to be
+    // the first observer of an app exit. The id is only read below, so the
+    // passive accessor is enough; a stale id just means the artwork of an app
+    // that is already gone.
+    const auto current_appid = proc::proc.current_app_id();
     const auto synthetic_control = remote_session::identify(util::from_view(appid), appuuid, current_appid);
     auto app_ctx = proc::proc.resolve_app(appid, appuuid);
     std::string app_image;

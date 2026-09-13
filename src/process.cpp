@@ -2941,9 +2941,33 @@ namespace proc {
           schedule_exit_cleanup_recheck();
           return 0;
         }
+      } else if (cleanup == running_cleanup_e::wait_for_gate) {
+        // Take the gate HERE instead of letting terminate() do it, and only then
+        // re-check the observation above under it -- the same order as
+        // schedule_exit_cleanup_recheck(). A /launch can hold the gate for
+        // seconds; terminating after that wait without re-checking would tear
+        // down the session it started in the meantime (a relaunch of the very
+        // same app id included, hence the generation and not _app_id).
+        std::uint64_t observed_generation;
+        {
+          std::lock_guard lg {_deferred_mutex};
+          observed_generation = _session_generation;
+        }
+        stream_lifecycle_lock = std::unique_lock<std::mutex> {nvhttp::stream_lifecycle_mutex()};
+        std::uint64_t current_generation;
+        {
+          std::lock_guard lg {_deferred_mutex};
+          current_generation = _session_generation;
+        }
+        if (current_generation != observed_generation) {
+          BOOST_LOG(info) << "[running] App exited, but the session changed while waiting for the stream lifecycle gate; leaving the current session alone.";
+          return _app_id;
+        }
       }
       BOOST_LOG(info) << "[running] _process.running() is false; calling terminate(). App exited with code ["sv << _process.native_exit_code() << "] for app '" << _app.name << "' (id=" << _app_id << ")";
-      terminate(false, true, false, cleanup != running_cleanup_e::wait_for_gate);
+      // The gate is held in every path here now (gate_held: by the caller;
+      // otherwise: by stream_lifecycle_lock above).
+      terminate(false, true, false, true);
     }
 
     return 0;

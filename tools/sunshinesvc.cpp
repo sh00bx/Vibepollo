@@ -24,9 +24,13 @@ constexpr auto SERVICE_NAME = "ApolloService";
 constexpr DWORD FAST_EXIT_WINDOW_MS = 60 * 1000;
 constexpr DWORD CRASH_LOOP_RESTART_DELAY_MS = 30 * 1000;
 constexpr DWORD CRASH_LOOP_FAST_EXIT_THRESHOLD = 3;
-// Graceful stop waits 20 s; this bound on the forced kill keeps the whole stop
-// inside the 30 s wait hint HandlerEx reports to SCM.
+// Every wait in the stop path is bounded, so a stop always completes: the
+// termination helper (5 s) + the graceful exit of the child (20 s) + this bound
+// on the forced kill (10 s) = 35 s worst case, which is what the wait hint
+// HandlerEx reports to SCM covers.
+constexpr DWORD TERMINATION_HELPER_WAIT_MS = 5 * 1000;
 constexpr DWORD FORCED_EXIT_WAIT_MS = 10 * 1000;
+constexpr DWORD STOP_WAIT_HINT_MS = 40 * 1000;
 
 DWORD WINAPI HandlerEx(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext) {
   switch (dwControl) {
@@ -44,10 +48,10 @@ DWORD WINAPI HandlerEx(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, L
     case SERVICE_CONTROL_PRESHUTDOWN:
       // The system is shutting down
     case SERVICE_CONTROL_STOP:
-      // Let SCM know we're stopping in up to 30 seconds
+      // Let SCM know we're stopping in up to STOP_WAIT_HINT_MS
       service_status.dwCurrentState = SERVICE_STOP_PENDING;
       service_status.dwControlsAccepted = 0;
-      service_status.dwWaitHint = 30 * 1000;
+      service_status.dwWaitHint = STOP_WAIT_HINT_MS;
       SetServiceStatus(service_status_handle, &service_status);
 
       // Trigger ServiceMain() to start cleanup
@@ -159,12 +163,24 @@ bool RunTerminationHelper(HANDLE console_token, DWORD pid) {
     return false;
   }
 
-  // Wait for the termination helper to complete
-  WaitForSingleObject(process_info.hProcess, INFINITE);
+  // Wait for the termination helper to complete. Bounded: the helper only
+  // attaches to the child's console and posts Ctrl-C (DoGracefulTermination),
+  // so it returns in well under a second -- but AttachConsole against an
+  // unresponsive console session can block, and the service must never sit in
+  // STOP_PENDING forever. A timeout counts as failure, which sends the caller
+  // into the bounded forced-kill path. The helper stays detached; if it does
+  // deliver the Ctrl-C later, that is the effect we asked for anyway.
+  const DWORD helper_wait = WaitForSingleObject(process_info.hProcess, TERMINATION_HELPER_WAIT_MS);
 
-  // Check the exit status of the helper process
-  DWORD exit_code;
-  GetExitCodeProcess(process_info.hProcess, &exit_code);
+  // Check the exit status of the helper process. A timeout is NOT a failure
+  // for the caller: the helper is running detached and its Ctrl-C may still
+  // land, so the caller must wait out the graceful window instead of jumping
+  // to the forced kill (which would skip the child's clean exit). The stop
+  // stays bounded either way (5 s here + 20 s graceful + 10 s forced < hint).
+  DWORD exit_code = 0;
+  if (helper_wait == WAIT_OBJECT_0) {
+    GetExitCodeProcess(process_info.hProcess, &exit_code);
+  }
 
   // Cleanup handles
   CloseHandle(process_info.hProcess);
@@ -314,6 +330,9 @@ VOID WINAPI ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
         case WAIT_OBJECT_0:
           // The service is shutting down, so try to gracefully terminate Sunshine.exe.
           // If it doesn't terminate in 20 seconds, we will forcefully terminate it.
+          // A helper that could not even be started (false) skips straight to
+          // the forced kill; a helper that merely timed out counts as started
+          // (see RunTerminationHelper), so the 20 s graceful window is waited out.
           if (!RunTerminationHelper(console_token, process_info.dwProcessId) ||
               WaitForSingleObject(process_info.hProcess, 20000) != WAIT_OBJECT_0) {
             // If it won't terminate gracefully, kill it now. This also fails

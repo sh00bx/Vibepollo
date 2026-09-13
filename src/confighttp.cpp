@@ -5666,8 +5666,12 @@ namespace confighttp {
             .perm = crypto::PERM::_all,
           };
           BOOST_LOG(info) << "Launching app ["sv << app.name << "] from web UI"sv;
-          (void) proc::proc.running();
           std::unique_lock<std::mutex> lifecycle_lock(nvhttp::stream_lifecycle_mutex());
+          // Reap an app that has exited under the gate, so execute() below acts
+          // on the current session (same order as the /launch route in nvhttp):
+          // reaping before taking the gate leaves a window in which another
+          // client can start an app that this launch would then not see.
+          (void) proc::proc.running(proc::running_cleanup_e::gate_held);
           auto launch_session = nvhttp::make_launch_session(true, false, request->parse_query_string(), &named_cert);
           auto err = proc::proc.execute(app, launch_session);
           if (err) {
