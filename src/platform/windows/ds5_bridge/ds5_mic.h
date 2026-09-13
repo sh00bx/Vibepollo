@@ -88,7 +88,8 @@ namespace platf::ds5_bridge {
       uint64_t frames;        // Opus packets decoded
       uint64_t plc;           // concealment frames synthesized
       uint64_t bad;           // packets rejected (not one 10 ms 48 kHz packet / decode error)
-      uint64_t drop_bytes;    // PCM discarded on ring overflow (oldest first)
+      uint64_t drop_bytes;    // PCM discarded oldest-first: ring overflow (RING_CAP) OR the
+                              // latency servo trimming MAX_FILL back to PREBUFFER (logged as drop_ms)
       uint64_t pulled_bytes;  // PCM handed to the endpoint from the ring
       uint64_t silence_bytes; // endpoint bytes filled with silence instead
       uint64_t starts;        // stream (re)starts (idle -> live)

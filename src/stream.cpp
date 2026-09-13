@@ -861,6 +861,11 @@ namespace stream {
     // behalf of a session that already ended (possibly revived by the NEXT
     // session satisfying the global running-count predicate).
     uint64_t epoch = 0;
+    // A non-game first RTSP session (Remote Monitor / Remote Input) has no
+    // frame-limiter policy to apply but still needs streaming_will_start
+    // (NVIDIA Control Panel + WLAN mode, ~500ms) -- off the RTSP thread like
+    // everything else here, so ANNOUNCE is not stalled by it.
+    bool platform_only = false;
   };
 
   std::mutex &deferred_stream_start_mutex() {
@@ -955,6 +960,11 @@ namespace stream {
       if (deferred.epoch != stream_actions_epoch().load(std::memory_order_acquire) ||
           !rtsp_stream_start_actions_still_needed()) {
         BOOST_LOG(debug) << "Stream-start actions skipped; stream ended before the worker ran.";
+        return;
+      }
+      if (deferred.platform_only) {
+        BOOST_LOG(info) << "Deferred stream-start actions applied (platform tuning only, no game session yet, off the RTSP thread).";
+        session::start_shared_platform_if_needed();
         return;
       }
       BOOST_LOG(info) << "Deferred stream-start actions applied (frame limiter + platform tuning, off the RTSP thread).";
@@ -3408,6 +3418,13 @@ namespace stream {
         stream_actions_epoch().fetch_add(1, std::memory_order_acq_rel);
         clear_deferred_stream_start_actions();
         platf::frame_limiter_streaming_stop(platf::frame_limiter_owner::rtsp, true);
+        // The surviving non-game sessions still want the platform tuning if the
+        // cleared payload had not run yet (idempotent once it has).
+        deferred_stream_start_t platform_only {
+          .epoch = stream_actions_epoch().load(std::memory_order_acquire),
+          .platform_only = true,
+        };
+        defer_stream_start_actions(std::move(platform_only));
       }
 #endif
       if (last_rtsp_session) {
@@ -3626,7 +3643,15 @@ namespace stream {
           BOOST_LOG(info) << "Stream-start actions deferred until user session is ready.";
         }
       } else if (first_rtsp_session) {
-        session::start_shared_platform_if_needed();
+        // Same ~500ms streaming_will_start cost as above, same reason to keep
+        // it off the ANNOUNCE path; a game session joining later replaces this
+        // payload with the full one (start_shared_platform_if_needed is
+        // idempotent either way).
+        deferred_stream_start_t deferred {
+          .epoch = stream_actions_epoch().load(std::memory_order_acquire),
+          .platform_only = true,
+        };
+        defer_stream_start_actions(std::move(deferred));
       }
 #else
       if (first_rtsp_session) {
