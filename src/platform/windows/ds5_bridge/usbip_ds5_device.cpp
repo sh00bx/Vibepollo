@@ -574,9 +574,18 @@ namespace platf::ds5_bridge {
           now = clock::now();
           if (deadline > now) {
             if (hpt && *hpt) {
-              // Not interruptible by stop, but bounded by one URB (~10 ms) —
-              // teardown just joins a beat later.
-              hpt->sleep_for(deadline - now);
+              // hpt->sleep_for is not interruptible, and one URB is NOT ~10 ms:
+              // an IN URB clocks 1 ms per packet and npkts is only rejected
+              // above 1024, i.e. up to ~1 s — the very deadline remove_slot
+              // waits for before it declares that no callback can survive. So
+              // sleep in short slices and re-check stop between them.
+              while (true) {
+                now = clock::now();
+                if (now >= deadline || stop.load()) break;
+                hpt->sleep_for(std::min<std::chrono::nanoseconds>(
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now),
+                  std::chrono::milliseconds(10)));
+              }
             } else {
               std::unique_lock<std::mutex> lk(iso_mtx_);
               iso_cv_.wait_until(lk, deadline, [this] { return stop.load(); });

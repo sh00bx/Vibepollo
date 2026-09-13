@@ -2995,6 +2995,15 @@ namespace stream {
 
   namespace session {
     std::atomic_uint running_sessions;
+    // RTSP sessions with the game role only. The frame limiter / stream-start
+    // actions belong to the GAME session's lifetime, not to whichever RTSP
+    // session happened to connect first: a Remote Monitor (or Remote Input)
+    // session carries its own fps and virtual-display parameters and used to
+    // consume the once-per-stream hook, leaving the game session that joined
+    // afterwards without RTSS limit, NVCP policy and capture-backend override.
+    // INVARIANT: incremented/decremented exactly for role_e::game sessions, in
+    // lockstep with running_sessions (session_t::remote_role never changes).
+    std::atomic_uint game_sessions;
     std::atomic_uint teardown_sessions;
     std::atomic_uint cleanup_reservations;
     bool shared_platform_started;
@@ -3382,7 +3391,25 @@ namespace stream {
       teardown_reservation.disable();
 
       const bool last_rtsp_session = --running_sessions == 0;
+      // Mirror of the start side: the frame limiter belongs to the game
+      // session's lifetime. Releasing it only with the last RTSP session left
+      // RTSS/NVCP on the dead game's cadence while a Remote Monitor session
+      // stayed connected — and the next game start was session #2 and never
+      // re-armed it.
+      [[maybe_unused]] const bool last_game_session =
+        session.remote_role == remote_session::role_e::game && --game_sessions == 0;
       bool finalized_shared_runtime = false;
+#ifdef _WIN32
+      if (last_game_session && !last_rtsp_session) {
+        // Other sessions still own the shared runtime, so only the limiter is
+        // released here (keep_rtss_running); the block below does the full stop
+        // when the game session is also the last RTSP session.
+        std::lock_guard<std::mutex> apply_lock(stream_actions_apply_mutex());
+        stream_actions_epoch().fetch_add(1, std::memory_order_acq_rel);
+        clear_deferred_stream_start_actions();
+        platf::frame_limiter_streaming_stop(platf::frame_limiter_owner::rtsp, true);
+      }
+#endif
       if (last_rtsp_session) {
         webrtc_stream::set_rtsp_sessions_active(false);
         const bool rtsp_pending = rtsp_stream::has_pending_launch_or_startup();
@@ -3531,71 +3558,82 @@ namespace stream {
       }
 
       // If this is the first session, invoke the platform callbacks
-      if (++running_sessions == 1) {
+      const bool first_rtsp_session = (++running_sessions == 1);
+      // The frame limiter and the deferred stream-start actions hang off the
+      // first GAME session instead, which is not necessarily the first RTSP
+      // session (see game_sessions above); role_e::game also implies
+      // !input_only, which is set for role_e::input only.
+      [[maybe_unused]] const bool first_game_session =
+        session.remote_role == remote_session::role_e::game && ++game_sessions == 1;
+      if (first_rtsp_session) {
         if (!webrtc_stream::has_active_or_pending_sessions()) {
           webrtc_stream::set_rtsp_capture_config(session.config.monitor, session.config.audio);
         }
         webrtc_stream::set_rtsp_sessions_active(true);
+      }
 #ifdef _WIN32
-        if (!session.config.monitor.input_only) {
-          // Apply RTSS frame limit if enabled (Windows-only)
-          std::optional<int> lossless_rtss_limit;
-          const bool using_lossless_provider = session.config.lossless_scaling_framegen &&
-                                               boost::iequals(session.config.frame_generation_provider, "lossless-scaling");
-          if (using_lossless_provider) {
-            if (session.config.lossless_scaling_rtss_limit && *session.config.lossless_scaling_rtss_limit > 0) {
-              lossless_rtss_limit = session.config.lossless_scaling_rtss_limit;
-            } else if (session.config.lossless_scaling_target_fps && *session.config.lossless_scaling_target_fps > 0) {
-              int computed = (int) std::lround(*session.config.lossless_scaling_target_fps * 0.5);
-              if (computed > 0) {
-                lossless_rtss_limit = computed;
-              }
+      if (first_game_session) {
+        // Apply RTSS frame limit if enabled (Windows-only)
+        std::optional<int> lossless_rtss_limit;
+        const bool using_lossless_provider = session.config.lossless_scaling_framegen &&
+                                             boost::iequals(session.config.frame_generation_provider, "lossless-scaling");
+        if (using_lossless_provider) {
+          if (session.config.lossless_scaling_rtss_limit && *session.config.lossless_scaling_rtss_limit > 0) {
+            lossless_rtss_limit = session.config.lossless_scaling_rtss_limit;
+          } else if (session.config.lossless_scaling_target_fps && *session.config.lossless_scaling_target_fps > 0) {
+            int computed = (int) std::lround(*session.config.lossless_scaling_target_fps * 0.5);
+            if (computed > 0) {
+              lossless_rtss_limit = computed;
             }
           }
-          // Keep the client stream cadence separate from its exact display-mode
-          // override so RTSS can preserve each without conflating the two.
-          const auto policy = framegen::make_stream_start_policy({
-            .fps = session.stream_fps,
-            .fps_scaled = session.stream_fps_scaled,
-            .display_refresh_millihz = session.client_display_refresh_millihz,
-            .frame_generation_enabled = session.config.frame_generation_enabled,
-            .gen1_framegen_fix = session.config.gen1_framegen_fix,
-            .gen2_framegen_fix = session.config.gen2_framegen_fix,
-            .lossless_scaling_framegen = session.config.lossless_scaling_framegen,
-            .lossless_rtss_limit = lossless_rtss_limit,
-            .frame_generation_provider = session.config.frame_generation_provider,
-            .uses_virtual_display = session.virtual_display.active,
-            .capture_mode = config::video.capture,
-            .auto_capture_uses_wgc = platf::dxgi::should_use_wgc_default(),
-            .auto_virtual_framegen_limiter = config::frame_limiter.virtual_display_limiter_enabled(),
-            .virtual_display_refresh_multiplier = config::frame_limiter.fixed_virtual_display_refresh_multiplier(),
-          });
-          // Always defer these: frame_limiter_streaming_start (RTSS property
-          // writes, ~600ms) + streaming_will_start (NVIDIA Control Panel +
-          // WLAN mode, ~500ms) ran synchronously inside cmd_announce's
-          // session-start path and stalled the RTSP ANNOUNCE response —
-          // measured 2026-07-12 as the client's entire 850-1400ms "RTSP
-          // handshake" stage. The control-server loop applies deferred
-          // actions within one 1-15ms iterate() tick, off the RTSP thread,
-          // with the existing user-session/teardown guards.
-          // Ordering-critical config writes (capture backend) go in
-          // synchronously — capture init reads config::video.capture long
-          // before the deferred worker gets past its GPU probes.
-          platf::frame_limiter_streaming_prepare(policy);
-          deferred_stream_start_t deferred {
-            .policy = policy,
-            .epoch = stream_actions_epoch().load(std::memory_order_acquire),
-          };
-          defer_stream_start_actions(std::move(deferred));
-          if (platf::is_running_as_system() && !user_session_ready()) {
-            BOOST_LOG(info) << "Stream-start actions deferred until user session is ready.";
-          }
-        } else {
-          session::start_shared_platform_if_needed();
         }
-#else
+        // Keep the client stream cadence separate from its exact display-mode
+        // override so RTSS can preserve each without conflating the two.
+        const auto policy = framegen::make_stream_start_policy({
+          .fps = session.stream_fps,
+          .fps_scaled = session.stream_fps_scaled,
+          .display_refresh_millihz = session.client_display_refresh_millihz,
+          .frame_generation_enabled = session.config.frame_generation_enabled,
+          .gen1_framegen_fix = session.config.gen1_framegen_fix,
+          .gen2_framegen_fix = session.config.gen2_framegen_fix,
+          .lossless_scaling_framegen = session.config.lossless_scaling_framegen,
+          .lossless_rtss_limit = lossless_rtss_limit,
+          .frame_generation_provider = session.config.frame_generation_provider,
+          .uses_virtual_display = session.virtual_display.active,
+          .capture_mode = config::video.capture,
+          .auto_capture_uses_wgc = platf::dxgi::should_use_wgc_default(),
+          .auto_virtual_framegen_limiter = config::frame_limiter.virtual_display_limiter_enabled(),
+          .virtual_display_refresh_multiplier = config::frame_limiter.fixed_virtual_display_refresh_multiplier(),
+        });
+        // Always defer these: frame_limiter_streaming_start (RTSS property
+        // writes, ~600ms) + streaming_will_start (NVIDIA Control Panel +
+        // WLAN mode, ~500ms) ran synchronously inside cmd_announce's
+        // session-start path and stalled the RTSP ANNOUNCE response —
+        // measured 2026-07-12 as the client's entire 850-1400ms "RTSP
+        // handshake" stage. The control-server loop applies deferred
+        // actions within one 1-15ms iterate() tick, off the RTSP thread,
+        // with the existing user-session/teardown guards.
+        // Ordering-critical config writes (capture backend) go in
+        // synchronously — capture init reads config::video.capture long
+        // before the deferred worker gets past its GPU probes.
+        platf::frame_limiter_streaming_prepare(policy);
+        deferred_stream_start_t deferred {
+          .policy = policy,
+          .epoch = stream_actions_epoch().load(std::memory_order_acquire),
+        };
+        defer_stream_start_actions(std::move(deferred));
+        if (platf::is_running_as_system() && !user_session_ready()) {
+          BOOST_LOG(info) << "Stream-start actions deferred until user session is ready.";
+        }
+      } else if (first_rtsp_session) {
         session::start_shared_platform_if_needed();
+      }
+#else
+      if (first_rtsp_session) {
+        session::start_shared_platform_if_needed();
+      }
 #endif
+      if (first_rtsp_session) {
         proc::proc.resume();
       }
 

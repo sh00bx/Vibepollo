@@ -1117,6 +1117,29 @@ namespace platf::audio {
         }
       }
 
+      // A re-assert of the sink that is already assigned (keep_default recovery:
+      // default_endpt_changed_cb -> set_sink(assigned_sink)) must not touch the
+      // format again. The bit-depth reference below is the CURRENT default
+      // device, i.e. exactly the endpoint that just stole the default -- a
+      // bridged DualSense/DualShock 4 publishes a 16-bit UAC1 one -- so matching
+      // it would reformat the very sink this session is capturing:
+      // SetDeviceFormat on the pinned loopback device invalidates the client
+      // (AUDCLNT_E_DEVICE_INVALIDATED -> capture_e::reinit, an audible gap) and
+      // pegs the stream's depth to the pad. The format was applied when this
+      // sink was first assigned; recovery only owes us the default role back.
+      {
+        std::string current_assigned_sink;
+        {
+          std::scoped_lock lock(pending_restore_mutex_ref());
+          current_assigned_sink = assigned_sink;
+        }
+        if (!assigned_device_id.empty() &&
+            assigned_device_id == virtual_sink_info->first &&
+            sink == current_assigned_sink) {
+          return virtual_sink_info->first;
+        }
+      }
+
       // When switching to a Steam virtual speaker device, try to retain the bit depth of the
       // default audio device. Switching from a 16-bit device to a 24-bit one has been known to
       // cause glitches for some users.

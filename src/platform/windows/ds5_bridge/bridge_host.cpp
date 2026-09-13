@@ -215,9 +215,19 @@ namespace platf::ds5_bridge {
               // and the touchpad click off the copy the virtual pad sees, so a
               // host-side pad reader does not act on the same finger. DS4
               // offsets: contacts at payload 34 / 38, click at payload byte 6.
+              // The DS4 batches up to THREE 9-byte touch reports (count at
+              // payload 32, packet i at 33+9*i with its contacts at +1 / +5);
+              // tpmouse reads only the newest one, so lifting just packet 0
+              // left the same finger 'down' in packets 2/3 and the count saying
+              // so -- exactly the double processing this lift prevents for a
+              // reader that honours the count (hid-sony style, count >= 2 at a
+              // low BT report rate). Zero the count AND lift every contact.
               if (tpmouse::feed_ds4_usb_report((uintptr_t) this, usb, sizeof(usb))) {
-                usb[1 + 34] |= 0x80;  // touch point 0: finger up
-                usb[1 + 38] |= 0x80;  // touch point 1: finger up
+                usb[1 + 32] = 0;  // touch report count: nothing to process
+                for (int tp = 0; tp < 3; tp++) {
+                  usb[1 + 34 + 9 * tp] |= 0x80;  // touch point 0: finger up
+                  usb[1 + 38 + 9 * tp] |= 0x80;  // touch point 1: finger up
+                }
                 usb[1 + 6] &= ~0x02;  // touchpad click
               }
               usbip_->set_input(slot_, usb);
@@ -993,7 +1003,8 @@ namespace platf::ds5_bridge {
         // silence tails included), flush = stream ends closed out with such a
         // tail, underrun = reports padded because our own ring ran dry,
         // ringdrop = PCM frames cut on a feed overflow, prime = reports sent
-        // unpaced as a stream's startup burst (8 per stream when all land),
+        // unpaced as a stream's startup burst (ds4_audio.h PRIME_REPORTS per
+        // stream when all land),
         // endidle = how many of the flushes ended because the game closed its
         // speaker endpoint rather than because it fell silent.
         if (now_ms_v - ds4a_log_ms_ >= 10000) {

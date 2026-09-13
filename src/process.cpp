@@ -1220,23 +1220,16 @@ namespace proc {
 
   class deinit_t: public platf::deinit_t {
   public:
-    deinit_t() {
-#ifdef _WIN32
-      playnite_integration_ = platf::playnite::start();
-      if (!playnite_integration_) {
-        BOOST_LOG(error) << "Playnite integration failed to initialize";
-      }
-#endif
-    }
+    // The Playnite integration is owned by main(), which starts it only when
+    // config::playnite.enabled is set. Starting it here as well ignored that
+    // gate entirely (proc::init() runs unconditionally) and, with the gate on,
+    // left a second orphaned instance whose destructor cleared the integration's
+    // g_instance out from under the live one.
+    deinit_t() = default;
 
     ~deinit_t() {
       proc.terminate();
     }
-
-  private:
-#ifdef _WIN32
-    std::unique_ptr<platf::deinit_t> playnite_integration_;
-#endif
   };
 
   std::unique_ptr<platf::deinit_t> init() {

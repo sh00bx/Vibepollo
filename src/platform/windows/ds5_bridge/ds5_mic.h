@@ -104,6 +104,12 @@ namespace platf::ds5_bridge {
     // Prebuffer: the endpoint starts draining once this much is queued, so
     // the normal arrival jitter (10 ms frames over WiFi) never runs it dry.
     static constexpr size_t PREBUFFER = (size_t) DS5_MIC_BYTES_PER_MS * 40;
+    // Latency ceiling. Concealment and post-stall bursts only ADD to the ring;
+    // nothing but the RING_CAP drop-oldest ever took that delay out again, so a
+    // handful of WiFi stalls parked the uplink at the full 200 ms for the rest
+    // of the stream (drop-oldest keeps the level AT the cap: permanently late
+    // speech). pull() sheds everything above this back down to PREBUFFER.
+    static constexpr size_t MAX_FILL = (size_t) DS5_MIC_BYTES_PER_MS * 90;
     // Arrival gap that counts as loss rather than jitter (a frame is 10 ms).
     static constexpr uint64_t PLC_GAP_US = 25000;
     // Longest run of concealment per gap; beyond it the gap is silence.

@@ -92,9 +92,17 @@ namespace platf::ds5_bridge {
       // report sequence is shared with pad state, so this is the only
       // signal for those). Take the larger, cap it: a long gap is a pause,
       // and five frames of extrapolated speech already sound like a smear.
+      // Time-based concealment only while the endpoint is actually short of
+      // audio: a stall on the TV's (reliable) control channel is followed by
+      // the late frames in a burst, so with PREBUFFER still queued there is no
+      // gap to fill and every synthesized frame would be 10 ms of delay that
+      // stays in the ring for the rest of the stream. Loss signalled by seq is
+      // delay-neutral (those frames never arrive) and stays unconditional.
       const int by_seq = (int) ((uint16_t) (seq - last_seq_)) - 1;
       const uint64_t elapsed = now - last_arrival_us_;
-      const int by_time = elapsed > PLC_GAP_US ? (int) ((elapsed - 10000) / 10000) : 0;
+      const int by_time = (elapsed > PLC_GAP_US && count_ < PREBUFFER) ?
+                            (int) ((elapsed - 10000) / 10000) :
+                            0;
       gap_frames = std::clamp(std::max(by_seq, by_time), 0, PLC_MAX_FRAMES);
     } else {
       // Idle -> live: a fresh stream. The decoder's state belongs to the old
@@ -127,6 +135,19 @@ namespace platf::ds5_bridge {
     // the next one.
     if (live_ && mic_now_us() - last_arrival_us_ > IDLE_US) {
       live_ = false;
+    }
+    // Latency servo: shed the oldest audio above MAX_FILL (whole frames) so the
+    // delay the ring carries returns to PREBUFFER instead of creeping towards
+    // RING_CAP across a series of stalls -- the endpoint drains exactly one
+    // packet per packet, so nothing else ever gives that delay back.
+    // INVARIANT: fires only above MAX_FILL and trims down to PREBUFFER, i.e.
+    // never touches the steady state (~PREBUFFER, arrival jitter included).
+    if (count_ > MAX_FILL) {
+      size_t excess = count_ - PREBUFFER;
+      excess -= excess % DS5_MIC_BYTES_PER_FRAME;
+      head_ = (head_ + excess) % RING_CAP;
+      count_ -= excess;
+      st_.drop_bytes += excess;
     }
     size_t taken = 0;
     if (primed_ && count_ > 0) {

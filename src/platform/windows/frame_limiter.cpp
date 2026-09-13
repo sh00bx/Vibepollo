@@ -287,6 +287,13 @@ namespace platf {
       g_prev_frame_limiter_provider_set = true;
       g_prev_disable_vsync = config::frame_limiter.disable_vsync;
       config::frame_limiter.enable = true;
+      // Deliberate divergence from upstream 3380f409 (DO-NOT-PORT, upstream
+      // ledger): upstream made the streaming VSYNC override follow the config
+      // preference alone. Here the frame-generation policy keeps forcing VSYNC
+      // off for the stream's duration (also want_nv_vsync_override below),
+      // because with FG active a driver-side VSYNC pins the BASE frame rate and
+      // breaks the very limiter/NVCP pacing this policy sets up. The previous
+      // value is kept in g_prev_disable_vsync and restored on stop.
       config::frame_limiter.disable_vsync = true;
       if ((capture_fix_enabled || physical_framegen_policy_enabled) && allow_framegen_default_provider) {
         config::frame_limiter.provider = "rtss";
