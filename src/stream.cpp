@@ -919,6 +919,16 @@ namespace stream {
   }
 
   bool apply_deferred_stream_start_actions_if_ready() {
+    // Negative cache for the user_session_ready() probe below; only ever touched
+    // under deferred_stream_start_mutex(). As SYSTEM before logon the payload
+    // stays queued for the whole pre-logon window, so without this the
+    // control-broadcast thread would repeat a WTSQueryUserToken syscall on every
+    // 1-15 ms iteration at critical priority. Only a FAILED probe is cached, so a
+    // ready user session is never delayed by it.
+    static std::chrono::steady_clock::time_point user_session_probe_not_before {};
+    constexpr auto user_session_probe_interval = 250ms;
+
+    const auto now = std::chrono::steady_clock::now();
     {
       // The control-broadcast thread polls this every iteration at critical priority.
       // Check the cheap flag before any syscall or the process-wide lifecycle gate so a
@@ -928,9 +938,14 @@ namespace stream {
       if (!deferred_stream_start_state()) {
         return false;
       }
+      if (now < user_session_probe_not_before) {
+        return false;
+      }
     }
 
     if (!user_session_ready()) {
+      std::lock_guard<std::mutex> lock(deferred_stream_start_mutex());
+      user_session_probe_not_before = now + user_session_probe_interval;
       return false;
     }
 
@@ -2015,7 +2030,19 @@ namespace stream {
     // drop_oldest policy: the queue then stays full and overflows on every frame
     // (2026-09-10/11: packet queue latency never below ~185 ms, 30-45 overflows/s).
     // Set it on the instance this thread keeps for the whole broadcast.
-    packets->set_overflow_policy(safe::queue_t<video::packet_t>::overflow_e::drain_to_newest);
+    //
+    // Invariant: drain_to_newest is only safe while exactly one session feeds
+    // this queue. The queue is process-wide (every session raises into the same
+    // instance) while consume_overflow() is a check-and-clear that hands the
+    // recovery IDR to exactly ONE encode loop, so with a second session the
+    // clear costs every other session up to 31 frames of reference chain
+    // without giving it the re-key signal. Degrade to drop_oldest (one frame,
+    // the upstream default) while more than one session runs; the single-session
+    // default path keeps drain_to_newest. Adjusted below on this instance
+    // because only this thread holds the queue strongly (see above).
+    using video_overflow_e = safe::queue_t<video::packet_t>::overflow_e;
+    auto applied_overflow_policy = video_overflow_e::drain_to_newest;
+    packets->set_overflow_policy(applied_overflow_policy);
     auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread. The send pacer (pacing_max_bitrate_kbps)
@@ -2070,6 +2097,20 @@ namespace stream {
     while (auto packet = packets->pop()) {
       if (shutdown_event->peek()) {
         break;
+      }
+
+      // stream::session:: qualified: a local named `session` is declared further
+      // down in this same block. Producers, not RTSP joins: an input-only
+      // session never feeds the queue, a WebRTC capture feeds the same queue
+      // without an RTSP join.
+      const unsigned video_producers = stream::session::video_sessions.load(std::memory_order_relaxed) +
+                                       (webrtc_stream::has_capture_active() ? 1u : 0u);
+      const auto desired_overflow_policy = video_producers > 1
+                                             ? video_overflow_e::drop_oldest
+                                             : video_overflow_e::drain_to_newest;
+      if (desired_overflow_policy != applied_overflow_policy) {
+        packets->set_overflow_policy(desired_overflow_policy);
+        applied_overflow_policy = desired_overflow_policy;
       }
 
       frame_network_latency_logger.first_point_now();
@@ -3014,6 +3055,12 @@ namespace stream {
     // INVARIANT: incremented/decremented exactly for role_e::game sessions, in
     // lockstep with running_sessions (session_t::remote_role never changes).
     std::atomic_uint game_sessions;
+    // RTSP sessions that actually produce video (not input_only). Together with
+    // the WebRTC capture this is the number of producers feeding the ONE
+    // process-wide video packet queue; the overflow policy keys on it.
+    // INVARIANT: ++/-- exactly for !config.monitor.input_only sessions, in
+    // lockstep with running_sessions.
+    std::atomic_uint video_sessions;
     std::atomic_uint teardown_sessions;
     std::atomic_uint cleanup_reservations;
     bool shared_platform_started;
@@ -3401,6 +3448,9 @@ namespace stream {
       teardown_reservation.disable();
 
       const bool last_rtsp_session = --running_sessions == 0;
+      if (!session.config.monitor.input_only) {
+        --video_sessions;
+      }
       // Mirror of the start side: the frame limiter belongs to the game
       // session's lifetime. Releasing it only with the last RTSP session left
       // RTSS/NVCP on the dead game's cadence while a Remote Monitor session
@@ -3576,6 +3626,9 @@ namespace stream {
 
       // If this is the first session, invoke the platform callbacks
       const bool first_rtsp_session = (++running_sessions == 1);
+      if (!session.config.monitor.input_only) {
+        ++video_sessions;
+      }
       // The frame limiter and the deferred stream-start actions hang off the
       // first GAME session instead, which is not necessarily the first RTSP
       // session (see game_sessions above); role_e::game also implies

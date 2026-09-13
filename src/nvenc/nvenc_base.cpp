@@ -170,7 +170,14 @@ namespace nvenc {
       hdr_metadata_valid = false;
       hdr_metadata = {};
     }
-    auto fail_guard = util::fail_guard([this] {
+    // Set when a failed nvEncDestroyEncoder deliberately kept the handle (see
+    // destroy_api_attempt below and the explicit-config retry). Invariant: such a
+    // quarantined handle must not receive a second destroy/unregister.
+    bool encoder_preserved_after_destroy_failure = false;
+    auto fail_guard = util::fail_guard([this, &encoder_preserved_after_destroy_failure] {
+      if (encoder_preserved_after_destroy_failure) {
+        return;
+      }
       destroy_encoder();
     });
 
@@ -195,6 +202,8 @@ namespace nvenc {
           // Native backends may keep the handle to quarantine their resources.
           if (!preserve_encoder_on_destroy_failure()) {
             encoder = nullptr;
+          } else {
+            encoder_preserved_after_destroy_failure = true;
           }
           return false;
         }
@@ -795,6 +804,8 @@ namespace nvenc {
           // same as destroy_api_attempt: no second destroy from the fail guard
           if (!preserve_encoder_on_destroy_failure()) {
             encoder = nullptr;
+          } else {
+            encoder_preserved_after_destroy_failure = true;
           }
           return false;
         }

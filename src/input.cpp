@@ -112,7 +112,15 @@ namespace input {
   }
 
   static task_pool_util::TaskPool::task_id_t key_press_repeat_id {};
+  // Client whose key the pending repeat chain belongs to (key_press_owner of the
+  // repeating kpid). reset() must not cancel another client's auto-repeat.
+  static input_t *key_press_repeat_owner {};
   static std::unordered_map<key_press_id_t, bool> key_press {};
+  // Which client holds each pressed key. key_press itself is process-wide, so
+  // without this a disconnecting session's reset() would release the keys every
+  // other session is still holding (same reason as mouse_press_owner below).
+  // Invariant: an entry exists exactly while key_press[kpid] is true.
+  static std::unordered_map<key_press_id_t, input_t *> key_press_owner {};
   static std::array<std::uint8_t, 5> mouse_press {};
   // The logical release may precede the host release by 10 ms. Keep ownership
   // until the host receives the release, including during session cleanup.
@@ -1010,7 +1018,8 @@ namespace input {
       }
     }
 
-    auto &pressed = key_press[make_kpid(keyCode, packet->flags)];
+    const auto kpid = make_kpid(keyCode, packet->flags);
+    auto &pressed = key_press[kpid];
     if (!pressed) {
       if (!release) {
         // A new key has been pressed down, we need to check for key combo's
@@ -1025,6 +1034,7 @@ namespace input {
 
         if (config::input.key_repeat_delay.count() > 0) {
           key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, keyCode, packet->flags, synthetic_modifiers).task_id;
+          key_press_repeat_owner = input.get();
         }
       } else {
         // Already released
@@ -1036,6 +1046,11 @@ namespace input {
     }
 
     pressed = !release;
+    if (release) {
+      key_press_owner.erase(kpid);
+    } else {
+      key_press_owner[kpid] = input.get();
+    }
 
     send_key_and_modifiers(keyCode, release, packet->flags, synthetic_modifiers);
 
@@ -2016,7 +2031,13 @@ namespace input {
     // Cancellation and release share the single input worker with passthrough
     // and timer callbacks. A callback already running finishes before cleanup.
     task_pool.push([input]() {
-      task_pool.cancel(key_press_repeat_id);
+      // Only this client's repeat chain: a foreign client's held key keeps
+      // auto-repeating (its key stays down below for the same reason).
+      if (key_press_repeat_owner == input.get()) {
+        task_pool.cancel(key_press_repeat_id);
+        key_press_repeat_id = nullptr;
+        key_press_repeat_owner = nullptr;
+      }
       task_pool.cancel(input->mouse_left_button_timeout);
       input->mouse_left_button_timeout = nullptr;
 
@@ -2043,11 +2064,19 @@ namespace input {
           // already released
           continue;
         }
+        // Only this session's keys: a key another client is still holding must
+        // stay down, otherwise its later real KEY_UP is dropped as "already
+        // released" and its own modifier_state keeps the modifier set.
+        auto owner = key_press_owner.find(kp.first);
+        if (owner == std::end(key_press_owner) || owner->second != input.get()) {
+          continue;
+        }
         // key_press is keyed on the client's unmapped virtual-key code, but the press was
         // emitted through map_keycode(). Release the host key that actually went down,
         // otherwise a remapped key stays latched after the client disconnects.
         platf::keyboard_update(platf_input, map_keycode(vk_from_kpid(kp.first) & 0x00FF), true, flags_from_kpid(kp.first));
         key_press[kp.first] = false;
+        key_press_owner.erase(owner);
       }
     });
   }

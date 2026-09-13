@@ -692,6 +692,36 @@ TEST(DisplayHelperV2RecoveryEngine, KeepsGoldenPendingWhenBaselineDeviceIsMissin
   EXPECT_TRUE(harness.storage.exists(display_helper::v2::SnapshotTier::Golden));
 }
 
+// ... but the pending golden baseline must not keep recovery armed forever: a
+// baseline device that is gone for good (TV switched off) has to be answered by
+// accepting the confirmed session fallback after the bounded retry budget, so
+// the helper disarms instead of re-applying the snapshot on every display event.
+TEST(DisplayHelperV2RecoveryEngine, GoldenFirstAcceptsSessionFallbackAfterRetryBudget) {
+  RecoveryHarness harness;
+  harness.add_device("A");
+
+  harness.state.always_restore_from_golden.store(true);
+  ASSERT_TRUE(harness.storage.save(display_helper::v2::SnapshotTier::Golden, make_snapshot({{"A"}, {"B"}})));
+  ASSERT_TRUE(harness.storage.save(display_helper::v2::SnapshotTier::Current, make_snapshot({{"A"}})));
+
+  constexpr auto threshold = display_helper::v2::RecoveryOperation::kGoldenFallbackCompletionThreshold;
+  for (std::size_t attempt = 1; attempt < threshold; ++attempt) {
+    harness.display.current = make_snapshot({{"X"}});
+    const auto outcome = harness.recovery.run(harness.cancellation.token());
+    EXPECT_FALSE(outcome.success);
+    EXPECT_EQ(harness.state.golden_pending_session_fallbacks.load(), attempt);
+  }
+
+  harness.display.current = make_snapshot({{"X"}});
+  const auto final_outcome = harness.recovery.run(harness.cancellation.token());
+  EXPECT_TRUE(final_outcome.success);
+  ASSERT_TRUE(final_outcome.snapshot.has_value());
+  EXPECT_EQ(EngineDisplayFake::first_id(*final_outcome.snapshot), "A");
+  // Counter reset, golden kept for the next APPLY/EXPORT.
+  EXPECT_EQ(harness.state.golden_pending_session_fallbacks.load(), 0u);
+  EXPECT_TRUE(harness.storage.exists(display_helper::v2::SnapshotTier::Golden));
+}
+
 // --- rotation reassert on the matching fast path (Vibepollo #406 class) ---
 
 // The OS can report a fully matching layout while the driver's pointer

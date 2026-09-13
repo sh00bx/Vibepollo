@@ -90,18 +90,26 @@ struct input_t {
 std::array<std::uint8_t, 5> mouse_press {};
 std::array<input_t *, 5> mouse_press_owner {};
 worker_t::task_id_t key_press_repeat_id {};
+input_t *key_press_repeat_owner {};
 std::unordered_map<int, bool> key_press;
+std::unordered_map<int, input_t *> key_press_owner {};
 int platf_input;
 int vk_from_kpid(int x) { return x; }
 int flags_from_kpid(int) { return 0; }
+int map_keycode(int code) { return code; }
 struct event_t {
   int button; bool release;
   bool operator==(const event_t &) const = default;
 };
 std::vector<event_t> events;
+struct key_event_t {
+  int code; bool release;
+  bool operator==(const key_event_t &) const = default;
+};
+std::vector<key_event_t> key_events;
 namespace platf {
   void button_mouse(int, int button, bool release) { events.push_back({button, release}); }
-  void keyboard_update(int, int, bool, int) {}
+  void keyboard_update(int, int code, bool release, int) { key_events.push_back({code, release}); }
 }
 '''
 
@@ -227,6 +235,26 @@ int main(int argc, char **argv) {
     expect({{1, false}});
     button(a, 1, true); expect({{1, false}, {1, true}});
     assert(task_pool.timers.empty());
+  } else if (test == "foreign_key_survives_disconnect") {
+    // The keyboard passthrough is not part of this harness, so model exactly the
+    // bookkeeping it leaves behind: client b holds W.
+    key_press[0x57] = true; key_press_owner[0x57] = b.get();
+    reset(a); task_pool.drain();
+    assert(key_events.empty());
+    assert(key_press[0x57] && key_press_owner[0x57] == b.get());
+    reset(b); task_pool.drain();
+    assert((key_events == std::vector<key_event_t> {{0x57, true}}));
+    assert(!key_press[0x57] && key_press_owner.empty());
+  } else if (test == "own_key_released_on_disconnect") {
+    key_press[0x57] = true; key_press_owner[0x57] = a.get();
+    reset(a); task_pool.drain();
+    assert((key_events == std::vector<key_event_t> {{0x57, true}}));
+    assert(!key_press[0x57] && key_press_owner.empty());
+  } else if (test == "unowned_key_is_left_alone") {
+    // No owner recorded (never pressed through passthrough): nobody releases it.
+    key_press[0x57] = true;
+    reset(a); task_pool.drain();
+    assert(key_events.empty() && key_press[0x57]);
   } else if (test == "foreign_right_release") {
     button(a, BUTTON_RIGHT, false); button(b, BUTTON_RIGHT, false);
     button(b, BUTTON_RIGHT, true); expect({{3, false}});
@@ -256,7 +284,8 @@ def main():
         'overlapping_client_releases_first', 'overlapping_client_disconnects_first',
         'overlapping_owner_disconnects_first', 'overlapping_owner_releases_first',
         'foreign_release_after_newer_press', 'foreign_relative_release',
-        'foreign_right_release',
+        'foreign_right_release', 'foreign_key_survives_disconnect',
+        'own_key_released_on_disconnect', 'unowned_key_is_left_alone',
     ]
     failures = []
     with tempfile.TemporaryDirectory(prefix='delayed-mouse-release-') as temp:

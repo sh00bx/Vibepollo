@@ -202,6 +202,19 @@ namespace display_helper::v2 {
    */
   class RecoveryOperation {
   public:
+    /**
+     * @brief Number of consecutive golden-first attempts whose confirmed session
+     *        fallback is accepted as the completion of the restore.
+     *
+     * Invariant: golden-first recovery must terminate. A baseline device can be
+     * absent for good (a TV drops its HDMI target when powered off), so
+     * golden_restore_is_pending() would stay true forever and leave the helper
+     * armed, re-applying the already confirmed session snapshot on every display
+     * event. Kept well above the attempt counts that only bridge a transient
+     * absence (see the restore-engine tests).
+     */
+    static constexpr std::size_t kGoldenFallbackCompletionThreshold = 8;
+
     RecoveryOperation(
       IDisplaySettings &display,
       ISnapshotStorage &storage,
