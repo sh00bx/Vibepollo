@@ -75,6 +75,8 @@ namespace stream {
 
   namespace session {
     extern std::atomic_uint running_sessions;
+    // RTSP sessions that produce video (!input_only); see stream.cpp.
+    extern std::atomic_uint video_sessions;
     // Counts RTSP joins through their complete post-session cleanup tail.
     // Observers use this instead of entering blocking session cleanup.
     extern std::atomic_uint teardown_sessions;
